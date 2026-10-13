@@ -89,7 +89,10 @@ impl AgentState {
                 if let Ok(env_content) = fs::read_to_string(&env_file) {
                     for line in env_content.lines() {
                         if line.starts_with("OPENROUTER_API_KEY=") {
-                            config.api_key = line.trim_start_matches("OPENROUTER_API_KEY=").trim().to_string();
+                            config.api_key = line
+                                .trim_start_matches("OPENROUTER_API_KEY=")
+                                .trim()
+                                .to_string();
                         }
                     }
                 }
@@ -136,16 +139,20 @@ impl AgentState {
             println!("Initializing MCP servers from mcp.json...");
             for (name, server_cfg) in &cfg.mcp_servers {
                 match McpClient::spawn(name, server_cfg).await {
-                    Ok(client) => {
-                        match client.list_tools().await {
-                            Ok(tools) => {
-                                println!("  ✓ Registered {} MCP tools from server '{}'", tools.len(), name);
-                                self.mcp_tools.extend(tools);
-                                self.mcp_clients.push(client);
-                            }
-                            Err(e) => println!("  ⚠️ Failed to list tools for server '{}': {}", name, e),
+                    Ok(client) => match client.list_tools().await {
+                        Ok(tools) => {
+                            println!(
+                                "  ✓ Registered {} MCP tools from server '{}'",
+                                tools.len(),
+                                name
+                            );
+                            self.mcp_tools.extend(tools);
+                            self.mcp_clients.push(client);
                         }
-                    }
+                        Err(e) => {
+                            println!("  ⚠️ Failed to list tools for server '{}': {}", name, e)
+                        }
+                    },
                     Err(e) => println!("  ⚠️ Failed to start MCP server '{}': {}", name, e),
                 }
             }
@@ -195,7 +202,9 @@ impl AgentState {
             prompt.push_str("\nTo call an MCP tool, use:\n```tool:mcp\nserver: <server_name>\ntool: <tool_name>\narguments: <json_object>\n```\n\n");
         }
 
-        prompt.push_str("Keep all responses direct, technical, direct, and concise in GitHub markdown.");
+        prompt.push_str(
+            "Keep all responses direct, technical, direct, and concise in GitHub markdown.",
+        );
         prompt
     }
 
@@ -218,8 +227,11 @@ impl AgentState {
             return;
         }
 
-        println!("Active Model: {}\n", self.config.active_model.bold().green());
-        println!("{:<4} {:<45} {:<15} {}", "ID", "MODEL SLUG", "CONTEXT", "NAME");
+        println!(
+            "Active Model: {}\n",
+            self.config.active_model.bold().green()
+        );
+        println!("{:<4} {:<45} {:<15} NAME", "ID", "MODEL SLUG", "CONTEXT");
         println!("{}", "-".repeat(85));
 
         for (idx, m) in filtered.iter().take(30).enumerate() {
@@ -227,7 +239,11 @@ impl AgentState {
                 .context_length
                 .map(|c| format!("{}k", c / 1024))
                 .unwrap_or_else(|| "N/A".to_string());
-            let marker = if m.id == self.config.active_model { "*" } else { " " };
+            let marker = if m.id == self.config.active_model {
+                "*"
+            } else {
+                " "
+            };
             println!(
                 "{}{:<3} {:<45} {:<15} {}",
                 marker.bold().green(),
@@ -239,7 +255,10 @@ impl AgentState {
         }
 
         if filtered.len() > 30 {
-            println!("\n... and {} more models. Use `/model <search>` to filter.", filtered.len() - 30);
+            println!(
+                "\n... and {} more models. Use `/model <search>` to filter.",
+                filtered.len() - 30
+            );
         }
     }
 
@@ -249,25 +268,41 @@ impl AgentState {
             if idx > 0 && idx <= self.available_models.len() {
                 self.config.active_model = self.available_models[idx - 1].id.clone();
                 let _ = self.save_config();
-                println!("✅ Switched model to: {}", self.config.active_model.bold().green());
+                println!(
+                    "✅ Switched model to: {}",
+                    self.config.active_model.bold().green()
+                );
                 return true;
             }
         }
-        if let Some(m) = self.available_models.iter().find(|m| m.id == arg || m.id.ends_with(arg)) {
+        if let Some(m) = self
+            .available_models
+            .iter()
+            .find(|m| m.id == arg || m.id.ends_with(arg))
+        {
             self.config.active_model = m.id.clone();
             let _ = self.save_config();
-            println!("✅ Switched model to: {}", self.config.active_model.bold().green());
+            println!(
+                "✅ Switched model to: {}",
+                self.config.active_model.bold().green()
+            );
             return true;
         }
         self.config.active_model = arg.to_string();
         let _ = self.save_config();
-        println!("✅ Set custom model slug: {}", self.config.active_model.bold().green());
+        println!(
+            "✅ Set custom model slug: {}",
+            self.config.active_model.bold().green()
+        );
         true
     }
 }
 
 async fn execute_tool(tool_name: &str, body: &str, state: &AgentState) -> String {
-    println!("\n{}", format!("⚙️ Executing Tool: {}", tool_name).bold().yellow());
+    println!(
+        "\n{}",
+        format!("⚙️ Executing Tool: {}", tool_name).bold().yellow()
+    );
     match tool_name {
         "run_command" => {
             let cmd = body.trim();
@@ -278,7 +313,10 @@ async fn execute_tool(tool_name: &str, body: &str, state: &AgentState) -> String
                     let stdout = String::from_utf8_lossy(&out.stdout);
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     let code = out.status.code().unwrap_or(-1);
-                    format!("Exit Code: {}\nSTDOUT:\n{}\nSTDERR:\n{}", code, stdout, stderr)
+                    format!(
+                        "Exit Code: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
+                        code, stdout, stderr
+                    )
                 }
                 Err(e) => format!("Failed to execute command: {}", e),
             }
@@ -289,7 +327,11 @@ async fn execute_tool(tool_name: &str, body: &str, state: &AgentState) -> String
                 Ok(content) => {
                     let lines: Vec<&str> = content.lines().collect();
                     let preview = if lines.len() > 200 {
-                        format!("{}\n... (truncated, total {} lines)", lines[..200].join("\n"), lines.len())
+                        format!(
+                            "{}\n... (truncated, total {} lines)",
+                            lines[..200].join("\n"),
+                            lines.len()
+                        )
                     } else {
                         content
                     };
@@ -329,12 +371,15 @@ async fn execute_tool(tool_name: &str, body: &str, state: &AgentState) -> String
                 return "Error: Missing prompt for subagent".to_string();
             }
 
-            let task_id = state.subagent_mgr.spawn_subagent(
-                role.clone(),
-                model.clone(),
-                prompt.clone(),
-                state.config.api_key.clone(),
-            ).await;
+            let task_id = state
+                .subagent_mgr
+                .spawn_subagent(
+                    role.clone(),
+                    model.clone(),
+                    prompt.clone(),
+                    state.config.api_key.clone(),
+                )
+                .await;
 
             format!("Subagent Task #{} spawned in background (Role: {}, Model: {}). Use /subagents to check progress.", task_id, role, model)
         }
@@ -433,10 +478,24 @@ async fn stream_completion(state: &AgentState) -> Result<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("{}", "=========================================================".cyan());
-    println!("{}", "   🛰️  ORBIT-CLI v0.2: Autonomous OpenRouter Agent (Rust)   ".bold().cyan());
-    println!("{}", "   Supports: OpenRouter Models, MCP Protocol & Subagents ".dimmed());
-    println!("{}", "=========================================================".cyan());
+    println!(
+        "{}",
+        "=========================================================".cyan()
+    );
+    println!(
+        "{}",
+        "   🛰️  ORBIT-CLI v0.2: Autonomous OpenRouter Agent (Rust)   "
+            .bold()
+            .cyan()
+    );
+    println!(
+        "{}",
+        "   Supports: OpenRouter Models, MCP Protocol & Subagents ".dimmed()
+    );
+    println!(
+        "{}",
+        "=========================================================".cyan()
+    );
 
     let mut state = AgentState::new()?;
     state.init_mcp().await;
@@ -454,18 +513,30 @@ async fn main() -> Result<()> {
     print!("Fetching available models from OpenRouter... ");
     io::stdout().flush()?;
     match state.fetch_models().await {
-        Ok(_) => println!("Loaded {} models.", state.available_models.len().to_string().green()),
+        Ok(_) => println!(
+            "Loaded {} models.",
+            state.available_models.len().to_string().green()
+        ),
         Err(e) => println!("Warning (offline/cache): {}", e),
     }
 
     println!("Active Model: {}", state.config.active_model.bold().green());
-    println!("Tools Status: {}", if state.config.tools_enabled { "ENABLED".bold().green() } else { "DISABLED".yellow() });
+    println!(
+        "Tools Status: {}",
+        if state.config.tools_enabled {
+            "ENABLED".bold().green()
+        } else {
+            "DISABLED".yellow()
+        }
+    );
     println!("Type `/help` for commands or `/model` to view/select models.\n");
 
     let mut rl = DefaultEditor::new()?;
     let _ = rl.load_history(&state.config_path.with_file_name("history.txt"));
 
-    let tool_re = Regex::new(r"```tool:(run_command|view_file|write_file|invoke_subagent|mcp)\n([\s\S]*?)```")?;
+    let tool_re = Regex::new(
+        r"```tool:(run_command|view_file|write_file|invoke_subagent|mcp)\n([\s\S]*?)```",
+    )?;
 
     loop {
         let prompt = format!("{} > ", "orbit".bold().magenta());
@@ -491,12 +562,18 @@ async fn main() -> Result<()> {
                         }
                         "/help" => {
                             println!("{}", "=== ORBIT-CLI COMMANDS ===".bold().cyan());
-                            println!("  /model                 - List top models & active selection");
+                            println!(
+                                "  /model                 - List top models & active selection"
+                            );
                             println!("  /model <search|id|num> - Filter or switch active OpenRouter model");
-                            println!("  /subagents             - List active & completed subagent tasks");
+                            println!(
+                                "  /subagents             - List active & completed subagent tasks"
+                            );
                             println!("  /mcp                   - List loaded MCP servers and available tools");
                             println!("  /file <path>           - Attach file content into context");
-                            println!("  /tools                 - Toggle auto tool execution ON/OFF");
+                            println!(
+                                "  /tools                 - Toggle auto tool execution ON/OFF"
+                            );
                             println!("  /clear                 - Clear chat history");
                             println!("  /key <sk-or-v1-...>    - Update OpenRouter API Key");
                             println!("  /help                  - Show this help menu");
@@ -513,13 +590,24 @@ async fn main() -> Result<()> {
                                     let status_str = match &t.status {
                                         SubagentStatus::Running => "RUNNING".bold().yellow(),
                                         SubagentStatus::Completed => "COMPLETED".bold().green(),
-                                        SubagentStatus::Failed(err) => format!("FAILED ({})", err).bold().red(),
+                                        SubagentStatus::Failed(err) => {
+                                            format!("FAILED ({})", err).bold().red()
+                                        }
                                     };
-                                    println!("• Subagent #{} [{}] Status: {}", t.id, t.role.bold(), status_str);
+                                    println!(
+                                        "• Subagent #{} [{}] Status: {}",
+                                        t.id,
+                                        t.role.bold(),
+                                        status_str
+                                    );
                                     println!("  Model: {} | Prompt: {}", t.model, t.prompt);
                                     if let Some(res) = &t.result {
                                         let lines: Vec<&str> = res.lines().collect();
-                                        println!("  Result: {} ({} lines)", lines.first().unwrap_or(&""), lines.len());
+                                        println!(
+                                            "  Result: {} ({} lines)",
+                                            lines.first().unwrap_or(&""),
+                                            lines.len()
+                                        );
                                     }
                                 }
                             }
@@ -531,7 +619,12 @@ async fn main() -> Result<()> {
                                 println!("No MCP servers loaded. Add config to ~/.config/openrouter/mcp.json");
                             } else {
                                 for t in &state.mcp_tools {
-                                    println!("• [{}/{}] {}", t.server_name.bold().green(), t.name.cyan(), t.description.as_deref().unwrap_or(""));
+                                    println!(
+                                        "• [{}/{}] {}",
+                                        t.server_name.bold().green(),
+                                        t.name.cyan(),
+                                        t.description.as_deref().unwrap_or("")
+                                    );
                                 }
                             }
                             continue;
@@ -549,7 +642,14 @@ async fn main() -> Result<()> {
                         "/tools" => {
                             state.config.tools_enabled = !state.config.tools_enabled;
                             let _ = state.save_config();
-                            println!("Tools auto-execution set to: {}", if state.config.tools_enabled { "ENABLED".bold().green() } else { "DISABLED".yellow() });
+                            println!(
+                                "Tools auto-execution set to: {}",
+                                if state.config.tools_enabled {
+                                    "ENABLED".bold().green()
+                                } else {
+                                    "DISABLED".yellow()
+                                }
+                            );
                             continue;
                         }
                         "/clear" => {
@@ -578,7 +678,10 @@ async fn main() -> Result<()> {
                             continue;
                         }
                         _ => {
-                            println!("Unknown command {}. Type `/help` for options.", cmd.yellow());
+                            println!(
+                                "Unknown command {}. Type `/help` for options.",
+                                cmd.yellow()
+                            );
                             continue;
                         }
                     }
@@ -603,18 +706,25 @@ async fn main() -> Result<()> {
                                     let tool_name = &cap[1];
                                     let tool_body = &cap[2];
 
-                                    let tool_result = execute_tool(tool_name, tool_body, &state).await;
+                                    let tool_result =
+                                        execute_tool(tool_name, tool_body, &state).await;
                                     println!("{}\n{}", "Result:".dimmed(), tool_result);
 
                                     state.history.push(Message {
                                         role: "user".to_string(),
-                                        content: format!("[TOOL OUTPUT ({})]:\n{}", tool_name, tool_result),
+                                        content: format!(
+                                            "[TOOL OUTPUT ({})]:\n{}",
+                                            tool_name, tool_result
+                                        ),
                                     });
                                     tool_executed = true;
                                 }
 
                                 if tool_executed {
-                                    println!("{}", "🔄 Feeding tool execution results back to model...".cyan());
+                                    println!(
+                                        "{}",
+                                        "🔄 Feeding tool execution results back to model...".cyan()
+                                    );
                                     continue;
                                 }
                             }

@@ -2,9 +2,23 @@
 
 [![Rust](https://img.shields.io/badge/rust-2021_edition-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/dwaddle/orbit-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/dwaddle/orbit-cli/actions/workflows/ci.yml)
 [![OpenRouter](https://img.shields.io/badge/Powered%20By-OpenRouter-7928CA.svg)](https://openrouter.ai/)
 
 **Orbit** is a lightweight, high-performance autonomous AI coding agent in Rust. Powered by OpenRouter's multi-model API, Orbit delivers real-time token streaming, Model Context Protocol (MCP) integration, subagent task delegation, and direct local workspace tool execution.
+
+```text
+  ___   ____  ____  ___ _____     ____ _     ___
+ / _ \ |  _ \| __ )|_ _|_   _|   / ___| |   |_ _|
+| | | || |_) |  _ \ | |  | |    | |   | |    | |
+| |_| ||  _ <| |_) || |  | |    | |___| |___ | |
+ \___/ |_| \_\____/|___| |_|     \____|_____|___|
+
+Loaded 4 built-in workspace tools: [view_file, write_file, run_command, invoke_subagent]
+Connected to OpenRouter | Active Model: anthropic/claude-3.7-sonnet
+
+orbit >
+```
 
 ---
 

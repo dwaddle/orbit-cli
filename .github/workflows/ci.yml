@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Rust CI (Build, Test, Clippy, Format)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check Formatting
+        run: cargo fmt --check
+      - name: Clippy Linter
+        run: cargo clippy -- -D warnings
+      - name: Run Tests
+        run: cargo test --verbose

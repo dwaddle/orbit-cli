@@ -4,10 +4,10 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use std::sync::Arc;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct McpServerConfig {
@@ -51,9 +51,19 @@ impl McpClient {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::null());
 
-        let mut child = cmd.spawn().with_context(|| format!("Failed to spawn MCP server '{}'", server_name))?;
-        let stdin = Arc::new(Mutex::new(child.stdin.take().context("Failed to open stdin for MCP server")?));
-        let stdout = child.stdout.take().context("Failed to open stdout for MCP server")?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("Failed to spawn MCP server '{}'", server_name))?;
+        let stdin = Arc::new(Mutex::new(
+            child
+                .stdin
+                .take()
+                .context("Failed to open stdin for MCP server")?,
+        ));
+        let stdout = child
+            .stdout
+            .take()
+            .context("Failed to open stdout for MCP server")?;
         let reader = Arc::new(Mutex::new(BufReader::new(stdout)));
 
         let client = Self {
@@ -68,7 +78,11 @@ impl McpClient {
         Ok(client)
     }
 
-    async fn send_request(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+    async fn send_request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let mut id_guard = self.request_id.lock().await;
         let id = *id_guard;
         *id_guard += 1;
@@ -113,7 +127,11 @@ impl McpClient {
 
     pub async fn list_tools(&self) -> Result<Vec<McpTool>> {
         let res = self.send_request("tools/list", json!({})).await?;
-        let tools_arr = res.get("tools").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+        let tools_arr = res
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .cloned()
+            .unwrap_or_default();
         let mut tools = Vec::new();
         for t in tools_arr {
             let name = t["name"].as_str().unwrap_or("").to_string();
@@ -136,7 +154,10 @@ impl McpClient {
         });
         let res = self.send_request("tools/call", params).await?;
         if let Some(content) = res.get("content").and_then(|c| c.as_array()) {
-            let texts: Vec<String> = content.iter().filter_map(|item| item["text"].as_str().map(|s| s.to_string())).collect();
+            let texts: Vec<String> = content
+                .iter()
+                .filter_map(|item| item["text"].as_str().map(|s| s.to_string()))
+                .collect();
             return Ok(texts.join("\n"));
         }
         Ok(serde_json::to_string_pretty(&res)?)
@@ -144,7 +165,9 @@ impl McpClient {
 }
 
 pub fn load_mcp_config() -> Option<McpConfig> {
-    let config_dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("~/.config")).join("openrouter");
+    let config_dir = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.config"))
+        .join("openrouter");
     let mcp_path = config_dir.join("mcp.json");
     if mcp_path.exists() {
         if let Ok(data) = std::fs::read_to_string(&mcp_path) {
