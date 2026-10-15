@@ -19,6 +19,7 @@ pub mod outline;
 pub mod rules;
 pub mod search_index;
 mod subagent;
+pub mod tui;
 
 use mcp::{load_mcp_config, McpClient, McpTool};
 use subagent::{SubagentManager, SubagentStatus};
@@ -28,10 +29,10 @@ const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 const OPENROUTER_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct AppConfig {
-    api_key: String,
-    active_model: String,
-    tools_enabled: bool,
+pub struct AppConfig {
+    pub api_key: String,
+    pub active_model: String,
+    pub tools_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -45,10 +46,10 @@ impl Default for AppConfig {
 }
 
 #[derive(Deserialize, Debug, Clone)]
-struct OpenRouterModel {
-    id: String,
-    name: String,
-    context_length: Option<u64>,
+pub struct OpenRouterModel {
+    pub id: String,
+    pub name: String,
+    pub context_length: Option<u64>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -62,18 +63,18 @@ pub struct Message {
     pub content: String,
 }
 
-struct AgentState {
-    config: AppConfig,
-    config_path: PathBuf,
-    history: Vec<Message>,
-    available_models: Vec<OpenRouterModel>,
-    client: reqwest::Client,
-    subagent_mgr: SubagentManager,
-    mcp_tools: Vec<McpTool>,
-    mcp_clients: Vec<McpClient>,
-    project_rules: Option<rules::ProjectRules>,
-    code_index: search_index::CodeSearchIndex,
-    workspace_dir: PathBuf,
+pub struct AgentState {
+    pub config: AppConfig,
+    pub config_path: PathBuf,
+    pub history: Vec<Message>,
+    pub available_models: Vec<OpenRouterModel>,
+    pub client: reqwest::Client,
+    pub subagent_mgr: SubagentManager,
+    pub mcp_tools: Vec<McpTool>,
+    pub mcp_clients: Vec<McpClient>,
+    pub project_rules: Option<rules::ProjectRules>,
+    pub code_index: search_index::CodeSearchIndex,
+    pub workspace_dir: PathBuf,
 }
 
 impl AgentState {
@@ -174,7 +175,7 @@ impl AgentState {
         }
     }
 
-    fn system_prompt(&self) -> String {
+    pub fn system_prompt(&self) -> String {
         let base = "You are Orbit, an autonomous AI coding assistant paired with a developer in an interactive CLI session.\n\
         You have direct system execution tools, codebase intelligence, and subagent invocation capabilities.\n";
 
@@ -466,7 +467,7 @@ async fn execute_tool(tool_name: &str, body: &str, state: &AgentState) -> String
     }
 }
 
-async fn stream_completion(state: &AgentState) -> Result<String> {
+pub async fn stream_completion(state: &AgentState) -> Result<String> {
     let mut req_messages = vec![json!({
         "role": "system",
         "content": state.system_prompt()
@@ -551,6 +552,23 @@ async fn main() -> Result<()> {
     );
 
     let mut state = AgentState::new()?;
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--tui" || a == "-t") {
+        state.init_mcp().await;
+        if state.config.api_key.is_empty() {
+            println!("{}", "⚠️ OpenRouter API Key not configured.".yellow());
+            print!("Enter your OpenRouter API Key (sk-or-v1-...): ");
+            io::stdout().flush()?;
+            let mut input_key = String::new();
+            io::stdin().read_line(&mut input_key)?;
+            state.config.api_key = input_key.trim().to_string();
+            state.save_config()?;
+        }
+        let _ = state.fetch_models().await;
+        return tui::run_tui(&mut state).await;
+    }
+
     state.init_mcp().await;
 
     if let Some(rules) = &state.project_rules {
@@ -646,6 +664,7 @@ async fn main() -> Result<()> {
                             println!(
                                 "  /tools                 - Toggle auto tool execution ON/OFF"
                             );
+                            println!("  /tui                   - Launch Ratatui fullscreen split TUI mode");
                             println!("  /clear                 - Clear chat history");
                             println!("  /key <sk-or-v1-...>    - Update OpenRouter API Key");
                             println!("  /help                  - Show this help menu");
@@ -899,6 +918,13 @@ async fn main() -> Result<()> {
                                     "DISABLED".yellow()
                                 }
                             );
+                            continue;
+                        }
+                        "/tui" => {
+                            println!("Launching Ratatui fullscreen TUI mode...");
+                            if let Err(e) = tui::run_tui(&mut state).await {
+                                println!("TUI error: {}", e);
+                            }
                             continue;
                         }
                         "/clear" => {
