@@ -17,11 +17,13 @@ pub mod context;
 pub mod git_context;
 mod mcp;
 pub mod outline;
+pub mod review;
 pub mod routing;
 pub mod rules;
 pub mod search_index;
-mod subagent;
+pub mod subagent;
 pub mod tui;
+pub mod watcher;
 
 use mcp::{load_mcp_config, McpClient, McpTool};
 use subagent::{SubagentManager, SubagentStatus};
@@ -66,6 +68,8 @@ pub struct AppConfig {
     pub heavy_model: String,
     #[serde(default = "default_fallback_models")]
     pub fallback_models: Vec<String>,
+    #[serde(default)]
+    pub adversarial_review_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -79,6 +83,7 @@ impl Default for AppConfig {
             fast_model: default_fast_model(),
             heavy_model: default_heavy_model(),
             fallback_models: default_fallback_models(),
+            adversarial_review_enabled: false,
         }
     }
 }
@@ -113,6 +118,7 @@ pub struct AgentState {
     pub project_rules: Option<rules::ProjectRules>,
     pub code_index: Mutex<Option<Arc<search_index::CodeSearchIndex>>>,
     pub workspace_dir: PathBuf,
+    pub active_watcher: Arc<Mutex<Option<Arc<watcher::OrbitWatcher>>>>,
 }
 
 impl AgentState {
@@ -171,6 +177,7 @@ impl AgentState {
             project_rules,
             code_index: Mutex::new(None),
             workspace_dir,
+            active_watcher: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -271,6 +278,15 @@ impl AgentState {
             role: <role name>\n\
             model: <openrouter model slug>\n\
             prompt: <task description>\n\
+            ```\n\n\
+            ```tool:adversarial_review\n\
+            target: <file path or target name>\n\
+            context: <spec or focus requirements>\n\
+            content:\n\
+            <code or diff to review>\n\
+            ```\n\n\
+            ```tool:run_dag\n\
+            audit <target> OR feature <feature spec>\n\
             ```\n\n",
             base
         );
@@ -438,8 +454,97 @@ async fn execute_tool(tool_name: &str, body: &str, state: &AgentState) -> String
                 return "Error: Empty path specified for write_file".to_string();
             }
             match fs::write(path, content) {
-                Ok(_) => format!("Successfully wrote {} bytes to {}", content.len(), path),
+                Ok(_) => {
+                    let mut res = format!("Successfully wrote {} bytes to {}", content.len(), path);
+                    if state.config.adversarial_review_enabled && !state.config.api_key.is_empty() {
+                        println!("{}", "🛡️ Running automatic adversarial review...".dimmed());
+                        match review::AdversarialReviewer::review_code(
+                            path,
+                            content,
+                            "Automatic post-write safety and regression review",
+                            &state.config.api_key,
+                        )
+                        .await
+                        {
+                            Ok(report) => {
+                                println!("{}", review::format_review_banner(&report));
+                                res.push_str(&format!(
+                                    "\n\n[ADVERSARIAL REVIEW: {} (Score: {}/100)]\n{}",
+                                    report.verdict.badge(),
+                                    report.score,
+                                    report.raw_response
+                                ));
+                            }
+                            Err(e) => {
+                                println!("Adversarial review warning: {}", e);
+                            }
+                        }
+                    }
+                    res
+                }
                 Err(e) => format!("Failed to write file {}: {}", path, e),
+            }
+        }
+        "adversarial_review" => {
+            let mut target = "code_patch".to_string();
+            let mut context = "".to_string();
+            let mut content = "".to_string();
+            let mut in_content = false;
+
+            for line in body.lines() {
+                if !in_content {
+                    if let Some(val) = line.strip_prefix("target:") {
+                        target = val.trim().to_string();
+                        continue;
+                    } else if let Some(val) = line.strip_prefix("context:") {
+                        context = val.trim().to_string();
+                        continue;
+                    } else if line.trim() == "content:" || line.trim() == "---" {
+                        in_content = true;
+                        continue;
+                    }
+                }
+                if in_content {
+                    content.push_str(line);
+                    content.push('\n');
+                }
+            }
+
+            if content.trim().is_empty() {
+                content = body.to_string();
+            }
+
+            match review::AdversarialReviewer::review_code(
+                &target,
+                &content,
+                &context,
+                &state.config.api_key,
+            )
+            .await
+            {
+                Ok(report) => review::format_review_banner(&report),
+                Err(e) => format!("Adversarial Review failed: {}", e),
+            }
+        }
+        "run_dag" => {
+            let trimmed = body.trim();
+            if trimmed.starts_with("audit") {
+                let target = trimmed.strip_prefix("audit").unwrap_or("").trim();
+                let target = if target.is_empty() { "." } else { target };
+                let dag = subagent::create_audit_dag(target);
+                match state.subagent_mgr.run_dag(dag, &state.config.api_key).await {
+                    Ok(rep) => rep,
+                    Err(e) => format!("DAG execution error: {}", e),
+                }
+            } else if trimmed.starts_with("feature") {
+                let spec = trimmed.strip_prefix("feature").unwrap_or("").trim();
+                let dag = subagent::create_feature_dag(spec);
+                match state.subagent_mgr.run_dag(dag, &state.config.api_key).await {
+                    Ok(rep) => rep,
+                    Err(e) => format!("DAG execution error: {}", e),
+                }
+            } else {
+                "Usage: run_dag audit <target> OR run_dag feature <spec>".to_string()
             }
         }
         "code_search" => search_index::execute_code_search_tool(&state.get_code_index(), body),
@@ -698,6 +803,13 @@ async fn main() -> Result<()> {
     let mut state = AgentState::new()?;
 
     let args: Vec<String> = std::env::args().collect();
+    if args
+        .iter()
+        .any(|a| a == "watch" || a == "--watch" || a == "-w")
+    {
+        return watcher::run_watch_mode(&state.workspace_dir).await;
+    }
+
     if args.iter().any(|a| a == "--tui" || a == "-t") {
         state.init_mcp().await;
         if state.config.api_key.is_empty() {
@@ -769,13 +881,21 @@ async fn main() -> Result<()> {
         },
         state.config.fallback_models.len().to_string().cyan()
     );
+    println!(
+        "Orchestration: Adversarial Review: {} | DAG Workflows: READY | Background Watcher: READY",
+        if state.config.adversarial_review_enabled {
+            "ENABLED".green()
+        } else {
+            "DISABLED".dimmed()
+        }
+    );
     println!("Type `/help` for commands or `/model` to view/select models.\n");
 
     let mut rl = DefaultEditor::new()?;
     let _ = rl.load_history(&state.config_path.with_file_name("history.txt"));
 
     let tool_re = Regex::new(
-        r"```tool:(run_command|view_file|write_file|invoke_subagent|mcp|code_search|code_outline|git_context)\n([\s\S]*?)```",
+        r"```tool:(run_command|view_file|write_file|invoke_subagent|mcp|code_search|code_outline|git_context|adversarial_review|run_dag)\n([\s\S]*?)```",
     )?;
 
     loop {
@@ -806,6 +926,18 @@ async fn main() -> Result<()> {
                                 "  /model                 - List top models & active selection"
                             );
                             println!("  /model <search|id|num> - Filter or switch active OpenRouter model");
+                            println!(
+                                "  /dag [audit|feature]   - Orchestrate concurrent subagent DAG workflows"
+                            );
+                            println!(
+                                "  /review [file|diff]    - Run adversarial code review on diff or file"
+                            );
+                            println!(
+                                "  /adversarial           - Toggle auto adversarial review on file writes"
+                            );
+                            println!(
+                                "  /watch [start|stop|run]- Background file watcher & debounced test loop"
+                            );
                             println!(
                                 "  /subagents             - List active & completed subagent tasks"
                             );
@@ -1220,6 +1352,190 @@ async fn main() -> Result<()> {
                                         "✅ Updated fallback models chain: {}",
                                         state.config.fallback_models.join(", ").green()
                                     );
+                                }
+                            }
+                            continue;
+                        }
+                        "/dag" => {
+                            if state.config.api_key.is_empty() {
+                                println!(
+                                    "{}",
+                                    "Error: OpenRouter API key is required to run DAG subagents."
+                                        .red()
+                                );
+                                continue;
+                            }
+                            let trimmed = arg.trim();
+                            let dag = if trimmed.starts_with("audit") {
+                                let target = trimmed.strip_prefix("audit").unwrap_or("").trim();
+                                let target = if target.is_empty() { "." } else { target };
+                                subagent::create_audit_dag(target)
+                            } else if trimmed.starts_with("feature") {
+                                let spec = trimmed.strip_prefix("feature").unwrap_or("").trim();
+                                if spec.is_empty() {
+                                    println!("Usage: /dag feature <feature description>");
+                                    continue;
+                                }
+                                subagent::create_feature_dag(spec)
+                            } else {
+                                println!(
+                                    "Usage: /dag audit [path] OR /dag feature <specification>"
+                                );
+                                continue;
+                            };
+
+                            match state.subagent_mgr.run_dag(dag, &state.config.api_key).await {
+                                Ok(rep) => {
+                                    println!("\n{}", rep);
+                                    state.history.push(Message {
+                                        role: "assistant".to_string(),
+                                        content: rep,
+                                    });
+                                }
+                                Err(e) => println!("❌ DAG execution failed: {}", e),
+                            }
+                            continue;
+                        }
+                        "/review" => {
+                            if state.config.api_key.is_empty() {
+                                println!(
+                                    "{}",
+                                    "Error: OpenRouter API key is required for adversarial review."
+                                        .red()
+                                );
+                                continue;
+                            }
+                            let target = arg.trim();
+                            let (target_name, content, notes) = if target.is_empty()
+                                || target == "diff"
+                            {
+                                match git_context::get_git_diff(&state.workspace_dir, None, false) {
+                                    Ok(diff) => {
+                                        if diff.trim().is_empty() {
+                                            println!("No uncommitted git diff found. Specify a file: `/review <path>`");
+                                            continue;
+                                        }
+                                        (
+                                            "git diff (workspace)".to_string(),
+                                            diff,
+                                            "Active workspace uncommitted changes".to_string(),
+                                        )
+                                    }
+                                    Err(e) => {
+                                        println!("Failed to read git diff: {}", e);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                match fs::read_to_string(target) {
+                                    Ok(c) => {
+                                        (target.to_string(), c, format!("Review file: {}", target))
+                                    }
+                                    Err(e) => {
+                                        println!("Failed to read file '{}': {}", target, e);
+                                        continue;
+                                    }
+                                }
+                            };
+
+                            println!(
+                                "{}",
+                                format!("🛡️ Running adversarial review on '{}'...", target_name)
+                                    .dimmed()
+                            );
+                            match review::AdversarialReviewer::review_code(
+                                &target_name,
+                                &content,
+                                &notes,
+                                &state.config.api_key,
+                            )
+                            .await
+                            {
+                                Ok(rep) => {
+                                    let banner = review::format_review_banner(&rep);
+                                    println!("\n{}", banner);
+                                    state.history.push(Message {
+                                        role: "assistant".to_string(),
+                                        content: banner,
+                                    });
+                                }
+                                Err(e) => println!("❌ Adversarial review failed: {}", e),
+                            }
+                            continue;
+                        }
+                        "/adversarial" => {
+                            state.config.adversarial_review_enabled =
+                                !state.config.adversarial_review_enabled;
+                            let _ = state.save_config();
+                            println!(
+                                "Automatic Adversarial Review on file write: {}",
+                                if state.config.adversarial_review_enabled {
+                                    "ENABLED".bold().green()
+                                } else {
+                                    "DISABLED".yellow()
+                                }
+                            );
+                            continue;
+                        }
+                        "/watch" => {
+                            let subcmd = arg.trim();
+                            match subcmd {
+                                "start" => {
+                                    let mut guard = state.active_watcher.lock().unwrap();
+                                    if guard.is_some() {
+                                        println!("Background watcher is already active.");
+                                    } else {
+                                        let watcher = Arc::new(watcher::OrbitWatcher::new(
+                                            &state.workspace_dir,
+                                        ));
+                                        if let Err(e) = watcher.start_background_loop() {
+                                            println!("Failed to start watcher: {}", e);
+                                        } else {
+                                            *guard = Some(watcher);
+                                        }
+                                    }
+                                }
+                                "stop" => {
+                                    let mut guard = state.active_watcher.lock().unwrap();
+                                    if let Some(w) = guard.take() {
+                                        w.stop();
+                                        println!("✅ Background file watcher stopped.");
+                                    } else {
+                                        println!("No background watcher is currently active.");
+                                    }
+                                }
+                                "run" | "" => {
+                                    println!("Running project tests once...");
+                                    let res = watcher::run_project_tests(&state.workspace_dir);
+                                    if res.success {
+                                        println!(
+                                            "{}",
+                                            format!(
+                                                "✅ [PASS] {} (completed in {}ms)",
+                                                res.command, res.duration_ms
+                                            )
+                                            .bold()
+                                            .green()
+                                        );
+                                    } else {
+                                        println!(
+                                            "{}",
+                                            format!(
+                                                "❌ [FAIL] {} (exited with error in {}ms)",
+                                                res.command, res.duration_ms
+                                            )
+                                            .bold()
+                                            .red()
+                                        );
+                                        let lines: Vec<&str> = res.output.lines().collect();
+                                        let start = lines.len().saturating_sub(15);
+                                        for l in &lines[start..] {
+                                            println!("   {}", l.red());
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    println!("Usage: /watch [start|stop|run]");
                                 }
                             }
                             continue;

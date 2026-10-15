@@ -33,10 +33,13 @@ orbit >
 - **📋 Project Rules Auto-Discovery**: Hierarchical upward search for `.orbitrules`, `AGENTS.md`, `.agents/AGENTS.md`, and `.orbit/rules.md`, automatically injected into the system prompt.
 - **💰 OpenRouter Prompt Caching**: Injects explicit ephemeral `cache_control` headers into static system prompts, project rules, and reference files, cutting token costs by up to 90% on Claude and DeepSeek.
 - **⚡ Hybrid Model Cascading & Auto-Routing**: Dynamically routes exploration, inspection, and planning queries to fast models (`gemini-2.5-flash`), escalating to heavy reasoners (`claude-sonnet-4.5`, `deepseek-r1`) for implementation and synthesis (`/cascade`).
+- **🕸️ Subagent Directed Acyclic Graph (DAG) Orchestration**: Parallel execution of multi-agent dependency graphs via Tokio channels, with upstream task outputs automatically injected into downstream prompts (`/dag audit`, `/dag feature`, or `run_dag`).
+- **🛡️ Dual-Agent Adversarial Review**: Independent critique subagent evaluating proposed code and git diffs across 5 axes (correctness, security vulnerabilities, error handling, test coverage, and performance) with an optional automated post-write safety hook (`/review`, `/adversarial`, or `adversarial_review`).
+- **🔭 Background File Watcher & Test Loop**: Cross-platform filesystem monitoring via `notify`, 400ms debounced test runner (supporting `cargo test`, `pytest`, `bun/npm test`, and `go test`), with instantaneous pass/fail diagnostics (`orbit-cli watch` or `/watch`).
 - **🛡️ Provider Outage & Rate-Limit Auto-Failover**: Resilient multi-model retry chain that recovers from HTTP 429 rate limits or 5xx outages without dropping conversation context (`/fallback`).
 - **🌐 OpenRouter Multi-Model Flexibility**: Dynamically query, search, and switch between state-of-the-art models (`claude-sonnet-4.5`, `deepseek-r1`, `gpt-4o`, `gemini-2.5-pro`, `qwen`, etc.) via `/model`.
 - **⚡ Real-Time Streaming**: Low-latency token streaming using Server-Sent Events (SSE).
-- **🛠️ 7 Autonomous Built-in Tools**:
+- **🛠️ 9 Autonomous Built-in Tools**:
   - `run_command`: Local shell execution and stdout/stderr capture.
   - `view_file`: Workspace file exploration.
   - `write_file`: In-place code generation and editing.
@@ -44,6 +47,8 @@ orbit >
   - `code_outline`: Symbol map extraction for files or directories.
   - `git_context`: Log, blame, diff, and pickaxe search.
   - `invoke_subagent`: Background subagent task spawning.
+  - `adversarial_review`: Ruthless 5-axis security and regression critique.
+  - `run_dag`: Concurrent multi-agent workflow execution.
 - **🔌 Model Context Protocol (MCP)**: Native client support for external MCP servers, discovering and routing specialized tool schemas.
 - **💬 Interactive REPL**: Built with `rustyline` for command history, line editing, and slash command workflows.
 
@@ -89,6 +94,11 @@ cargo install --path .
    orbit-cli --tui
    ```
 
+4. **Or launch the background test runner & file watcher**:
+   ```bash
+   orbit-cli watch
+   ```
+
 ---
 
 ## ⌨️ Slash Commands
@@ -98,6 +108,10 @@ cargo install --path .
 | `/search <query>` | Search workspace code using in-memory BM25 index |
 | `/outline [path]` | Generate codebase symbol outline (Rust, Python, TS/JS, Go) |
 | `/git <subcmd> [args]` | Inspect git context (`log`, `blame`, `diff`, `search`) |
+| `/dag <audit\|feature>` | Run parallel multi-agent DAG workflow with dependency aggregation |
+| `/review [file\|diff]` | Run independent 5-axis adversarial security and quality review |
+| `/adversarial` | Toggle automatic adversarial review on file writes ON / OFF |
+| `/watch [start\|stop\|run]` | Manage background file watcher and debounced test loop |
 | `/cache` | Toggle prompt caching headers ON / OFF |
 | `/cascade` | Toggle hybrid cascading auto-routing ON / OFF |
 | `/routing` | Display active routing tiers, caching, and failover routes |
