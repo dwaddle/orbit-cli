@@ -9,10 +9,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub mod context;
+pub mod git_context;
 mod mcp;
+pub mod outline;
+pub mod rules;
+pub mod search_index;
 mod subagent;
 
 use mcp::{load_mcp_config, McpClient, McpTool};
@@ -52,9 +57,9 @@ struct ModelsResponse {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct Message {
-    role: String,
-    content: String,
+pub struct Message {
+    pub role: String,
+    pub content: String,
 }
 
 struct AgentState {
@@ -66,6 +71,9 @@ struct AgentState {
     subagent_mgr: SubagentManager,
     mcp_tools: Vec<McpTool>,
     mcp_clients: Vec<McpClient>,
+    project_rules: Option<rules::ProjectRules>,
+    code_index: search_index::CodeSearchIndex,
+    workspace_dir: PathBuf,
 }
 
 impl AgentState {
@@ -104,6 +112,10 @@ impl AgentState {
             }
         }
 
+        let workspace_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let project_rules = rules::ProjectRules::discover(&workspace_dir);
+        let code_index = search_index::CodeSearchIndex::build(&workspace_dir);
+
         Ok(Self {
             config,
             config_path,
@@ -113,6 +125,9 @@ impl AgentState {
             subagent_mgr: SubagentManager::new(),
             mcp_tools: Vec::new(),
             mcp_clients: Vec::new(),
+            project_rules,
+            code_index,
+            workspace_dir,
         })
     }
 
@@ -161,7 +176,7 @@ impl AgentState {
 
     fn system_prompt(&self) -> String {
         let base = "You are Orbit, an autonomous AI coding assistant paired with a developer in an interactive CLI session.\n\
-        You have direct system execution tools and subagent invocation capabilities.\n";
+        You have direct system execution tools, codebase intelligence, and subagent invocation capabilities.\n";
 
         if !self.config.tools_enabled {
             return base.to_string();
@@ -181,6 +196,20 @@ impl AgentState {
             <path>\n\
             <content>\n\
             ```\n\n\
+            ```tool:code_search\n\
+            query: <terms or symbol to search across codebase>\n\
+            limit: <optional max results, default 5>\n\
+            ```\n\n\
+            ```tool:code_outline\n\
+            path: <optional directory or file path>\n\
+            ```\n\n\
+            ```tool:git_context\n\
+            action: log | blame | diff | search\n\
+            path: <optional file path>\n\
+            query: <optional pickaxe query or commit query>\n\
+            range: <optional start,end lines for blame>\n\
+            limit: <optional max commits, default 15>\n\
+            ```\n\n\
             ```tool:invoke_subagent\n\
             role: <role name>\n\
             model: <openrouter model slug>\n\
@@ -188,6 +217,10 @@ impl AgentState {
             ```\n\n",
             base
         );
+
+        if let Some(rules) = &self.project_rules {
+            prompt.push_str(&rules.format_for_prompt());
+        }
 
         if !self.mcp_tools.is_empty() {
             prompt.push_str("## MCP TOOLS:\n");
@@ -352,6 +385,26 @@ async fn execute_tool(tool_name: &str, body: &str, state: &AgentState) -> String
                 Err(e) => format!("Failed to write file {}: {}", path, e),
             }
         }
+        "code_search" => search_index::execute_code_search_tool(&state.code_index, body),
+        "code_outline" => {
+            let mut target = "";
+            for line in body.lines() {
+                let trimmed = line.trim();
+                if let Some(val) = trimmed.strip_prefix("path:") {
+                    target = val.trim();
+                }
+            }
+            if target.is_empty() {
+                target = body.trim();
+            }
+            let target_path = if target.is_empty() {
+                &state.workspace_dir
+            } else {
+                Path::new(target)
+            };
+            outline::generate_codebase_outline(target_path, 2000)
+        }
+        "git_context" => git_context::execute_git_tool(&state.workspace_dir, body),
         "invoke_subagent" => {
             let mut role = "Assistant".to_string();
             let mut model = state.config.active_model.clone();
@@ -490,7 +543,7 @@ async fn main() -> Result<()> {
     );
     println!(
         "{}",
-        "   Supports: OpenRouter Models, MCP Protocol & Subagents ".dimmed()
+        "   Supports: Context Pruning, Code Search, Outline, Git & MCP ".dimmed()
     );
     println!(
         "{}",
@@ -499,6 +552,17 @@ async fn main() -> Result<()> {
 
     let mut state = AgentState::new()?;
     state.init_mcp().await;
+
+    if let Some(rules) = &state.project_rules {
+        println!(
+            "Project Rules: Loaded from {}",
+            rules.path.display().to_string().bold().cyan()
+        );
+    }
+    println!(
+        "Code Search: {} workspace files indexed.",
+        state.code_index.documents.len().to_string().cyan()
+    );
 
     if state.config.api_key.is_empty() {
         println!("{}", "⚠️ OpenRouter API Key not configured.".yellow());
@@ -535,7 +599,7 @@ async fn main() -> Result<()> {
     let _ = rl.load_history(&state.config_path.with_file_name("history.txt"));
 
     let tool_re = Regex::new(
-        r"```tool:(run_command|view_file|write_file|invoke_subagent|mcp)\n([\s\S]*?)```",
+        r"```tool:(run_command|view_file|write_file|invoke_subagent|mcp|code_search|code_outline|git_context)\n([\s\S]*?)```",
     )?;
 
     loop {
@@ -570,6 +634,14 @@ async fn main() -> Result<()> {
                                 "  /subagents             - List active & completed subagent tasks"
                             );
                             println!("  /mcp                   - List loaded MCP servers and available tools");
+                            println!("  /search <query>        - Search local codebase symbols and full-text");
+                            println!("  /outline [path]        - Generate codebase symbol map and outline");
+                            println!("  /git <log|blame|diff>  - Inspect git commit history, blame or diff");
+                            println!("  /rules                 - View or verify active project .orbitrules");
+                            println!(
+                                "  /context               - View context token usage and budget"
+                            );
+                            println!("  /prune                 - Manually compress large tool outputs & compact turns");
                             println!("  /file <path>           - Attach file content into context");
                             println!(
                                 "  /tools                 - Toggle auto tool execution ON/OFF"
@@ -580,9 +652,186 @@ async fn main() -> Result<()> {
                             println!("  /exit                  - Exit application");
                             continue;
                         }
+                        "/git" => {
+                            if !git_context::is_git_repo(&state.workspace_dir) {
+                                println!(
+                                    "Error: Workspace `{}` is not a git repository.",
+                                    state.workspace_dir.display()
+                                );
+                                continue;
+                            }
+                            let git_parts: Vec<&str> = arg.split_whitespace().collect();
+                            let action = git_parts.first().copied().unwrap_or("log");
+                            match action {
+                                "log" => {
+                                    let query = if git_parts.len() > 1 {
+                                        Some(git_parts[1..].join(" "))
+                                    } else {
+                                        None
+                                    };
+                                    match git_context::get_git_log(
+                                        &state.workspace_dir,
+                                        None,
+                                        query.as_deref(),
+                                        15,
+                                    ) {
+                                        Ok(out) => println!("{}", out),
+                                        Err(e) => println!("Error: {}", e),
+                                    }
+                                }
+                                "blame" => {
+                                    if git_parts.len() < 2 {
+                                        println!("Usage: /git blame <file_path> [start,end]");
+                                    } else {
+                                        let file = git_parts[1];
+                                        let range = if git_parts.len() > 2 {
+                                            let r_parts: Vec<&str> =
+                                                git_parts[2].split(',').collect();
+                                            if r_parts.len() == 2 {
+                                                match (
+                                                    r_parts[0].parse::<usize>(),
+                                                    r_parts[1].parse::<usize>(),
+                                                ) {
+                                                    (Ok(s), Ok(e)) => Some((s, e)),
+                                                    _ => None,
+                                                }
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        };
+                                        match git_context::get_git_blame(
+                                            &state.workspace_dir,
+                                            file,
+                                            range,
+                                        ) {
+                                            Ok(out) => println!("{}", out),
+                                            Err(e) => println!("Error: {}", e),
+                                        }
+                                    }
+                                }
+                                "diff" => {
+                                    match git_context::get_git_diff(
+                                        &state.workspace_dir,
+                                        None,
+                                        false,
+                                    ) {
+                                        Ok(out) => println!("{}", out),
+                                        Err(e) => println!("Error: {}", e),
+                                    }
+                                }
+                                "search" => {
+                                    if git_parts.len() < 2 {
+                                        println!("Usage: /git search <query>");
+                                    } else {
+                                        let q = git_parts[1..].join(" ");
+                                        match git_context::get_git_log(
+                                            &state.workspace_dir,
+                                            None,
+                                            Some(&q),
+                                            15,
+                                        ) {
+                                            Ok(out) => println!("{}", out),
+                                            Err(e) => println!("Error: {}", e),
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    println!("Usage: /git <log|blame|diff|search> [args]");
+                                }
+                            }
+                            continue;
+                        }
+                        "/search" => {
+                            if arg.is_empty() {
+                                println!("Usage: /search <query>");
+                            } else {
+                                let results = state.code_index.search(arg, 8);
+                                println!("{}", state.code_index.format_results(arg, &results));
+                            }
+                            continue;
+                        }
+                        "/outline" => {
+                            let target = if arg.is_empty() {
+                                &state.workspace_dir
+                            } else {
+                                Path::new(arg)
+                            };
+                            let outline_text = outline::generate_codebase_outline(target, 2000);
+                            println!("{}", outline_text);
+                            continue;
+                        }
+                        "/rules" => {
+                            match &state.project_rules {
+                                Some(r) => {
+                                    println!(
+                                        "=== 📜 PROJECT RULES ({}) ===\n{}",
+                                        r.path.display().to_string().cyan(),
+                                        r.content
+                                    );
+                                }
+                                None => {
+                                    println!(
+                                        "No .orbitrules or AGENTS.md found in workspace hierarchy."
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                        "/context" => {
+                            let active_limit = state
+                                .available_models
+                                .iter()
+                                .find(|m| m.id == state.config.active_model)
+                                .and_then(|m| m.context_length)
+                                .map(|c| c as usize)
+                                .unwrap_or(context::DEFAULT_CONTEXT_LIMIT);
+                            println!(
+                                "{}",
+                                context::format_context_report(
+                                    &state.history,
+                                    &state.system_prompt(),
+                                    active_limit
+                                )
+                            );
+                            continue;
+                        }
+                        "/prune" => {
+                            let active_limit = state
+                                .available_models
+                                .iter()
+                                .find(|m| m.id == state.config.active_model)
+                                .and_then(|m| m.context_length)
+                                .map(|c| c as usize)
+                                .unwrap_or(context::DEFAULT_CONTEXT_LIMIT);
+                            let sys_prompt = state.system_prompt();
+                            let res = context::auto_prune_context(
+                                &mut state.history,
+                                &sys_prompt,
+                                active_limit,
+                                0.0,
+                            );
+                            if res.pruned {
+                                println!(
+                                    "{}",
+                                    format!(
+                                        "✅ Context pruned: {} tool outputs compressed, {} turns compacted (tokens: {} -> {}).",
+                                        res.tool_outputs_compressed,
+                                        res.turns_compacted,
+                                        res.tokens_before,
+                                        res.tokens_after
+                                    )
+                                    .green()
+                                );
+                            } else {
+                                println!("Context is already compact. No items required pruning.");
+                            }
+                            continue;
+                        }
                         "/subagents" => {
                             let tasks = state.subagent_mgr.list_subagents().await;
-                            println!("{}", "=== 🤖 SUBagent TASKS ===".bold().cyan());
+                            println!("{}", "=== 🤖 SUBAGENT TASKS ===".bold().cyan());
                             if tasks.is_empty() {
                                 println!("No subagents spawned yet.");
                             } else {
@@ -693,6 +942,36 @@ async fn main() -> Result<()> {
                 });
 
                 loop {
+                    // Check and auto-prune context at 80% threshold
+                    let active_limit = state
+                        .available_models
+                        .iter()
+                        .find(|m| m.id == state.config.active_model)
+                        .and_then(|m| m.context_length)
+                        .map(|c| c as usize)
+                        .unwrap_or(context::DEFAULT_CONTEXT_LIMIT);
+
+                    let sys_prompt = state.system_prompt();
+                    let prune_res = context::auto_prune_context(
+                        &mut state.history,
+                        &sys_prompt,
+                        active_limit,
+                        context::DEFAULT_PRUNE_THRESHOLD,
+                    );
+                    if prune_res.pruned {
+                        println!(
+                            "{}",
+                            format!(
+                                "🧹 Auto-pruned context: {} tool outputs compressed, {} turns compacted (tokens: {} -> {}).",
+                                prune_res.tool_outputs_compressed,
+                                prune_res.turns_compacted,
+                                prune_res.tokens_before,
+                                prune_res.tokens_after
+                            )
+                            .cyan()
+                        );
+                    }
+
                     match stream_completion(&state).await {
                         Ok(response_text) => {
                             state.history.push(Message {
