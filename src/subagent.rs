@@ -89,39 +89,95 @@ impl SubagentManager {
 }
 
 async fn run_subagent_task(model: &str, role: &str, prompt: &str, api_key: &str) -> Result<String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()?;
+
+    let target_model = if model.is_empty() || model == "fast" {
+        "google/gemini-2.5-flash"
+    } else {
+        model
+    };
+
+    let default_fallbacks = [
+        "openai/gpt-4o".to_string(),
+        "deepseek/deepseek-r1".to_string(),
+        "google/gemini-2.5-flash".to_string(),
+    ];
+    let candidates = crate::routing::get_failover_candidates(target_model, &default_fallbacks);
+
     let sys_prompt = format!(
         "You are a subagent with role '{}'. Execute the requested task thoroughly, direct, and concisely.",
         role
     );
 
-    let payload = serde_json::json!({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.2
-    });
+    for (idx, candidate) in candidates.iter().enumerate() {
+        let payload = serde_json::json!({
+            "model": candidate,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": &sys_prompt,
+                            "cache_control": {
+                                "type": "ephemeral"
+                            }
+                        }
+                    ]
+                },
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.2
+        });
 
-    let resp = client
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&payload)
-        .send()
-        .await?;
+        let resp_res = client
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .header("HTTP-Referer", "https://github.com/dwaddle/orbit-cli")
+            .header("X-Title", "Orbit-CLI")
+            .json(&payload)
+            .send()
+            .await;
 
-    if !resp.status().is_success() {
-        let err = resp.text().await?;
-        return Err(anyhow::anyhow!("OpenRouter API error: {}", err));
+        let resp = match resp_res {
+            Ok(r) => r,
+            Err(e) => {
+                if idx + 1 < candidates.len() {
+                    continue;
+                } else {
+                    return Err(anyhow::anyhow!("Subagent network error: {}", e));
+                }
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            if crate::routing::is_retryable_status(status.as_u16()) && idx + 1 < candidates.len() {
+                continue;
+            }
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(anyhow::anyhow!(
+                "OpenRouter API error (HTTP {}): {}",
+                status.as_u16(),
+                err
+            ));
+        }
+
+        let body: serde_json::Value = resp.json().await?;
+        let content = body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        return Ok(content);
     }
 
-    let body: serde_json::Value = resp.json().await?;
-    let content = body["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-
-    Ok(content)
+    Err(anyhow::anyhow!("Subagent failover chain exhausted."))
 }

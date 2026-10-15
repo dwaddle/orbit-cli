@@ -17,6 +17,7 @@ pub mod context;
 pub mod git_context;
 mod mcp;
 pub mod outline;
+pub mod routing;
 pub mod rules;
 pub mod search_index;
 mod subagent;
@@ -29,11 +30,42 @@ const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4.5";
 const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 const OPENROUTER_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_fast_model() -> String {
+    "google/gemini-2.5-flash".to_string()
+}
+
+fn default_heavy_model() -> String {
+    DEFAULT_MODEL.to_string()
+}
+
+fn default_fallback_models() -> Vec<String> {
+    vec![
+        "anthropic/claude-sonnet-4.5".to_string(),
+        "openai/gpt-4o".to_string(),
+        "deepseek/deepseek-r1".to_string(),
+        "google/gemini-2.5-flash".to_string(),
+    ]
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AppConfig {
     pub api_key: String,
     pub active_model: String,
     pub tools_enabled: bool,
+    #[serde(default = "default_true")]
+    pub prompt_caching: bool,
+    #[serde(default)]
+    pub cascading_enabled: bool,
+    #[serde(default = "default_fast_model")]
+    pub fast_model: String,
+    #[serde(default = "default_heavy_model")]
+    pub heavy_model: String,
+    #[serde(default = "default_fallback_models")]
+    pub fallback_models: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -42,6 +74,11 @@ impl Default for AppConfig {
             api_key: String::new(),
             active_model: DEFAULT_MODEL.to_string(),
             tools_enabled: true,
+            prompt_caching: true,
+            cascading_enabled: false,
+            fast_model: default_fast_model(),
+            heavy_model: default_heavy_model(),
+            fallback_models: default_fallback_models(),
         }
     }
 }
@@ -487,66 +524,154 @@ async fn execute_tool(tool_name: &str, body: &str, state: &AgentState) -> String
 }
 
 pub async fn stream_completion(state: &AgentState) -> Result<String> {
-    let mut req_messages = vec![json!({
-        "role": "system",
-        "content": state.system_prompt()
-    })];
+    // 1. Hybrid Cascading Model Resolution:
+    let last_user_prompt = state
+        .history
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
 
-    for m in &state.history {
-        req_messages.push(json!({
-            "role": m.role,
-            "content": m.content
-        }));
-    }
+    let (target_model, tier_note) = if state.config.cascading_enabled {
+        let tier = routing::classify_prompt_tier(last_user_prompt);
+        match tier {
+            routing::ModelTier::Fast => (state.config.fast_model.clone(), " [Fast-Tier]"),
+            routing::ModelTier::Heavy => (state.config.heavy_model.clone(), " [Heavy-Tier]"),
+        }
+    } else {
+        (state.config.active_model.clone(), "")
+    };
 
-    let payload = json!({
-        "model": state.config.active_model,
-        "messages": req_messages,
-        "temperature": 0.2,
-        "stream": true
-    });
+    // 2. Prompt Caching Header Construction:
+    let req_messages = routing::build_cached_messages(
+        &state.system_prompt(),
+        &state.history,
+        state.config.prompt_caching,
+    );
 
-    let resp = state
-        .client
-        .post(OPENROUTER_COMPLETIONS_URL)
-        .header("Authorization", format!("Bearer {}", state.config.api_key))
-        .header("Content-Type", "application/json")
-        .header("HTTP-Referer", "https://github.com/dwaddle/orbit-cli")
-        .header("X-Title", "Orbit-CLI")
-        .json(&payload)
-        .send()
-        .await?;
+    // 3. Failover Candidate Chain Resolution:
+    let candidates = routing::get_failover_candidates(&target_model, &state.config.fallback_models);
 
-    if !resp.status().is_success() {
-        let err_text = resp.text().await?;
-        return Err(anyhow::anyhow!("OpenRouter API Error: {}", err_text));
-    }
+    for (candidate_idx, model_candidate) in candidates.iter().enumerate() {
+        let payload = json!({
+            "model": model_candidate,
+            "messages": req_messages,
+            "temperature": 0.2,
+            "stream": true
+        });
 
-    let mut stream = resp.bytes_stream().eventsource();
-    let mut full_text = String::new();
+        let resp_result = state
+            .client
+            .post(OPENROUTER_COMPLETIONS_URL)
+            .header("Authorization", format!("Bearer {}", state.config.api_key))
+            .header("Content-Type", "application/json")
+            .header("HTTP-Referer", "https://github.com/dwaddle/orbit-cli")
+            .header("X-Title", "Orbit-CLI")
+            .json(&payload)
+            .send()
+            .await;
 
-    print!("\n{} ", "🤖".bold());
-    io::stdout().flush()?;
-
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(evt) => {
-                if evt.data == "[DONE]" {
-                    break;
-                }
-                if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(&evt.data) {
-                    if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
-                        print!("{}", content);
-                        io::stdout().flush()?;
-                        full_text.push_str(content);
-                    }
+        let resp = match resp_result {
+            Ok(r) => r,
+            Err(e) => {
+                if candidate_idx + 1 < candidates.len() {
+                    let next = &candidates[candidate_idx + 1];
+                    println!(
+                        "\n{}",
+                        format!(
+                            "⚠️ Network error requesting model '{}': {}. Auto-failing over to fallback '{}'...",
+                            model_candidate, e, next
+                        )
+                        .yellow()
+                    );
+                    continue;
+                } else {
+                    return Err(anyhow::anyhow!("OpenRouter Network Error: {}", e));
                 }
             }
-            Err(_) => break,
+        };
+
+        let status = resp.status();
+        if !status.is_success() {
+            let err_text = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            if routing::is_retryable_status(status.as_u16()) && candidate_idx + 1 < candidates.len()
+            {
+                let next = &candidates[candidate_idx + 1];
+                println!(
+                    "\n{}",
+                    format!(
+                        "⚠️ Model '{}' returned HTTP {} ({}). Auto-failing over to fallback '{}'...",
+                        model_candidate,
+                        status.as_u16(),
+                        err_text.trim(),
+                        next
+                    )
+                    .yellow()
+                );
+                continue;
+            } else {
+                return Err(anyhow::anyhow!(
+                    "OpenRouter API Error (HTTP {}): {}",
+                    status.as_u16(),
+                    err_text
+                ));
+            }
         }
+
+        // Successfully connected to model candidate
+        let is_failover = candidate_idx > 0;
+        let failover_badge = if is_failover {
+            " [Failover Active]"
+        } else {
+            ""
+        };
+        let cache_badge = if state.config.prompt_caching {
+            " [Cached]"
+        } else {
+            ""
+        };
+
+        print!(
+            "\n{} {}{}{}{} ",
+            "🤖".bold(),
+            model_candidate.cyan(),
+            tier_note.magenta(),
+            failover_badge.yellow(),
+            cache_badge.dimmed()
+        );
+        io::stdout().flush()?;
+
+        let mut stream = resp.bytes_stream().eventsource();
+        let mut full_text = String::new();
+
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(evt) => {
+                    if evt.data == "[DONE]" {
+                        break;
+                    }
+                    if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(&evt.data) {
+                        if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
+                            print!("{}", content);
+                            io::stdout().flush()?;
+                            full_text.push_str(content);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        println!("\n");
+        return Ok(full_text);
     }
-    println!("\n");
-    Ok(full_text)
+
+    Err(anyhow::anyhow!(
+        "All candidate models in failover chain were exhausted without success."
+    ))
 }
 
 #[tokio::main]
@@ -630,6 +755,20 @@ async fn main() -> Result<()> {
             "DISABLED".yellow()
         }
     );
+    println!(
+        "Routing: Caching: {} | Cascading: {} | Auto-Failover: {} routes",
+        if state.config.prompt_caching {
+            "ENABLED".green()
+        } else {
+            "DISABLED".dimmed()
+        },
+        if state.config.cascading_enabled {
+            "ENABLED".green()
+        } else {
+            "DISABLED".dimmed()
+        },
+        state.config.fallback_models.len().to_string().cyan()
+    );
     println!("Type `/help` for commands or `/model` to view/select models.\n");
 
     let mut rl = DefaultEditor::new()?;
@@ -680,6 +819,16 @@ async fn main() -> Result<()> {
                             );
                             println!("  /prune                 - Manually compress large tool outputs & compact turns");
                             println!("  /file <path>           - Attach file content into context");
+                            println!(
+                                "  /cache                 - Toggle prompt caching headers ON/OFF"
+                            );
+                            println!(
+                                "  /cascade               - Toggle hybrid model cascading ON/OFF"
+                            );
+                            println!("  /routing               - View active routing, tiers, and failover status");
+                            println!(
+                                "  /fallback <m1,m2,...>  - Set failover model priority chain"
+                            );
                             println!(
                                 "  /tools                 - Toggle auto tool execution ON/OFF"
                             );
@@ -968,6 +1117,109 @@ async fn main() -> Result<()> {
                                         content: format!("[ATTACHED FILE: {}]\n{}", arg, content),
                                     });
                                     println!("✅ Attached file context ({})", arg.bold().green());
+                                }
+                            }
+                            continue;
+                        }
+                        "/cache" => {
+                            state.config.prompt_caching = !state.config.prompt_caching;
+                            let _ = state.save_config();
+                            println!(
+                                "Prompt Caching set to: {}",
+                                if state.config.prompt_caching {
+                                    "ENABLED (Anthropic/DeepSeek ephemeral headers active)"
+                                        .bold()
+                                        .green()
+                                } else {
+                                    "DISABLED".yellow()
+                                }
+                            );
+                            continue;
+                        }
+                        "/cascade" => {
+                            state.config.cascading_enabled = !state.config.cascading_enabled;
+                            let _ = state.save_config();
+                            println!(
+                                "Hybrid Model Cascading set to: {}",
+                                if state.config.cascading_enabled {
+                                    format!(
+                                        "ENABLED (Fast: {}, Heavy: {})",
+                                        state.config.fast_model.cyan(),
+                                        state.config.heavy_model.cyan()
+                                    )
+                                    .bold()
+                                    .green()
+                                } else {
+                                    "DISABLED (Direct active model routing)".yellow()
+                                }
+                            );
+                            continue;
+                        }
+                        "/routing" => {
+                            println!(
+                                "{}",
+                                "=== 🛰️ MULTI-MODEL ROUTING & CACHING STATUS ==="
+                                    .bold()
+                                    .cyan()
+                            );
+                            println!(
+                                "• Active Model: {}",
+                                state.config.active_model.bold().green()
+                            );
+                            println!(
+                                "• Prompt Caching: {}",
+                                if state.config.prompt_caching {
+                                    "ENABLED (up to 90% cost reduction on Claude/DeepSeek)".green()
+                                } else {
+                                    "DISABLED".yellow()
+                                }
+                            );
+                            println!(
+                                "• Hybrid Cascading: {}",
+                                if state.config.cascading_enabled {
+                                    "ENABLED (Tiered auto-routing)".green()
+                                } else {
+                                    "DISABLED (Single model mode)".yellow()
+                                }
+                            );
+                            println!(
+                                "  - Fast Tier (Exploration): {}",
+                                state.config.fast_model.cyan()
+                            );
+                            println!(
+                                "  - Heavy Tier (Synthesis):   {}",
+                                state.config.heavy_model.cyan()
+                            );
+                            println!("• Failover Recovery Chain:");
+                            let candidates = routing::get_failover_candidates(
+                                &state.config.active_model,
+                                &state.config.fallback_models,
+                            );
+                            for (i, m) in candidates.iter().enumerate() {
+                                println!("  {}. {}", i + 1, m.bold());
+                            }
+                            continue;
+                        }
+                        "/fallback" => {
+                            if arg.is_empty() {
+                                println!("Usage: /fallback <model1,model2,...>");
+                                println!(
+                                    "Current fallback chain: {}",
+                                    state.config.fallback_models.join(", ").cyan()
+                                );
+                            } else {
+                                let models: Vec<String> = arg
+                                    .split(',')
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                if !models.is_empty() {
+                                    state.config.fallback_models = models;
+                                    let _ = state.save_config();
+                                    println!(
+                                        "✅ Updated fallback models chain: {}",
+                                        state.config.fallback_models.join(", ").green()
+                                    );
                                 }
                             }
                             continue;

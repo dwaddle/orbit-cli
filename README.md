@@ -31,6 +31,9 @@ orbit >
 - **📜 Git Context Intelligence**: Built-in git history inspection with commit logs, line-range blame, unified diffs, and pickaxe search (`/git` and `git_context`).
 - **🧠 Sliding-Window Context & Tool Compression**: Smart token budgeting that compresses large tool outputs (>150 lines or >12,000 chars) and summarizes older turns to prevent context window overflow.
 - **📋 Project Rules Auto-Discovery**: Hierarchical upward search for `.orbitrules`, `AGENTS.md`, `.agents/AGENTS.md`, and `.orbit/rules.md`, automatically injected into the system prompt.
+- **💰 OpenRouter Prompt Caching**: Injects explicit ephemeral `cache_control` headers into static system prompts, project rules, and reference files, cutting token costs by up to 90% on Claude and DeepSeek.
+- **⚡ Hybrid Model Cascading & Auto-Routing**: Dynamically routes exploration, inspection, and planning queries to fast models (`gemini-2.5-flash`), escalating to heavy reasoners (`claude-sonnet-4.5`, `deepseek-r1`) for implementation and synthesis (`/cascade`).
+- **🛡️ Provider Outage & Rate-Limit Auto-Failover**: Resilient multi-model retry chain that recovers from HTTP 429 rate limits or 5xx outages without dropping conversation context (`/fallback`).
 - **🌐 OpenRouter Multi-Model Flexibility**: Dynamically query, search, and switch between state-of-the-art models (`claude-sonnet-4.5`, `deepseek-r1`, `gpt-4o`, `gemini-2.5-pro`, `qwen`, etc.) via `/model`.
 - **⚡ Real-Time Streaming**: Low-latency token streaming using Server-Sent Events (SSE).
 - **🛠️ 7 Autonomous Built-in Tools**:
@@ -95,6 +98,10 @@ cargo install --path .
 | `/search <query>` | Search workspace code using in-memory BM25 index |
 | `/outline [path]` | Generate codebase symbol outline (Rust, Python, TS/JS, Go) |
 | `/git <subcmd> [args]` | Inspect git context (`log`, `blame`, `diff`, `search`) |
+| `/cache` | Toggle prompt caching headers ON / OFF |
+| `/cascade` | Toggle hybrid cascading auto-routing ON / OFF |
+| `/routing` | Display active routing tiers, caching, and failover routes |
+| `/fallback <models>` | Set comma-separated failover model chain |
 | `/tui` | Switch into fullscreen Ratatui TUI mode |
 | `/model` | List top available models and display current selection |
 | `/model <search\|id>` | Search and switch active OpenRouter model |
