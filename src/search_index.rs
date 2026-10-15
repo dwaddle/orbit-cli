@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::outline::is_ignored_path;
+use crate::outline::{is_home_or_root, is_ignored_path};
 
 #[derive(Debug, Clone)]
 pub struct IndexedLine {
@@ -43,7 +43,7 @@ impl CodeSearchIndex {
     /// Builds the code search index by crawling `root_dir`.
     pub fn build(root_dir: &Path) -> Self {
         let mut documents = Vec::new();
-        collect_index_files(root_dir, root_dir, &mut documents);
+        collect_index_files(root_dir, root_dir, 0, &mut documents);
 
         let mut index: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
 
@@ -214,24 +214,68 @@ pub fn tokenize(input: &str) -> Vec<String> {
     tokens.into_iter().collect()
 }
 
-fn collect_index_files(current_dir: &Path, base_dir: &Path, docs: &mut Vec<IndexedDocument>) {
+const ALLOWED_INDEX_EXTENSIONS: &[&str] = &[
+    "rs", "py", "js", "ts", "tsx", "jsx", "go", "c", "cpp", "h", "hpp", "cc", "hh", "toml", "json",
+    "yaml", "yml", "md", "org", "sh", "bash", "zsh", "html", "css", "sql", "txt", "env", "conf",
+    "ini", "xml",
+];
+
+const SPECIAL_INDEX_FILES: &[&str] = &[
+    "Makefile",
+    "Dockerfile",
+    "Cargo.lock",
+    "README.md",
+    "README",
+    "AGENTS.md",
+    ".orbitrules",
+];
+
+fn collect_index_files(
+    current_dir: &Path,
+    base_dir: &Path,
+    depth: usize,
+    docs: &mut Vec<IndexedDocument>,
+) {
+    if docs.len() >= 500 {
+        return;
+    }
+    let max_depth = if is_home_or_root(base_dir) { 1 } else { 6 };
+    if depth > max_depth {
+        return;
+    }
+
     let entries = match fs::read_dir(current_dir) {
         Ok(e) => e,
         Err(_) => return,
     };
 
     for entry in entries.flatten() {
+        if docs.len() >= 500 {
+            break;
+        }
         let path = entry.path();
         if is_ignored_path(&path) {
             continue;
         }
 
         if path.is_dir() {
-            collect_index_files(&path, base_dir, docs);
+            if is_home_or_root(base_dir) && depth >= 1 {
+                continue;
+            }
+            collect_index_files(&path, base_dir, depth + 1, docs);
         } else if path.is_file() {
-            // Check file size (< 1MB)
+            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let is_allowed =
+                ALLOWED_INDEX_EXTENSIONS.contains(&ext) || SPECIAL_INDEX_FILES.contains(&filename);
+
+            if !is_allowed {
+                continue;
+            }
+
+            // Check file size (< 500KB)
             if let Ok(metadata) = path.metadata() {
-                if metadata.len() > 1_000_000 {
+                if metadata.len() > 500_000 {
                     continue;
                 }
             }

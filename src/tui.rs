@@ -15,7 +15,7 @@ use ratatui::{
 use std::io::{self, Stdout};
 use std::path::Path;
 
-use crate::outline::is_ignored_path;
+use crate::outline::{is_home_or_root, is_ignored_path};
 use crate::subagent::SubagentStatus;
 use crate::AgentState;
 
@@ -40,7 +40,7 @@ pub struct TuiApp {
 impl TuiApp {
     pub fn new(workspace_dir: &Path) -> Self {
         let mut file_tree = Vec::new();
-        collect_file_tree(workspace_dir, workspace_dir, &mut file_tree);
+        collect_file_tree(workspace_dir, workspace_dir, 0, &mut file_tree);
         file_tree.sort();
 
         Self {
@@ -65,20 +65,34 @@ impl TuiApp {
     }
 }
 
-fn collect_file_tree(current_dir: &Path, base_dir: &Path, out: &mut Vec<String>) {
+fn collect_file_tree(current_dir: &Path, base_dir: &Path, depth: usize, out: &mut Vec<String>) {
+    if out.len() >= 150 {
+        return;
+    }
+    let max_depth = if is_home_or_root(base_dir) { 1 } else { 3 };
+    if depth > max_depth {
+        return;
+    }
+
     let entries = match std::fs::read_dir(current_dir) {
         Ok(e) => e,
         Err(_) => return,
     };
 
     for entry in entries.flatten() {
+        if out.len() >= 150 {
+            break;
+        }
         let path = entry.path();
         if is_ignored_path(&path) {
             continue;
         }
 
         if path.is_dir() {
-            collect_file_tree(&path, base_dir, out);
+            if is_home_or_root(base_dir) && depth >= 1 {
+                continue;
+            }
+            collect_file_tree(&path, base_dir, depth + 1, out);
         } else if path.is_file() {
             let relative = path
                 .strip_prefix(base_dir)

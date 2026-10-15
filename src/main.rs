@@ -11,6 +11,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 pub mod context;
 pub mod git_context;
@@ -73,7 +74,7 @@ pub struct AgentState {
     pub mcp_tools: Vec<McpTool>,
     pub mcp_clients: Vec<McpClient>,
     pub project_rules: Option<rules::ProjectRules>,
-    pub code_index: search_index::CodeSearchIndex,
+    pub code_index: Mutex<Option<Arc<search_index::CodeSearchIndex>>>,
     pub workspace_dir: PathBuf,
 }
 
@@ -113,23 +114,41 @@ impl AgentState {
             }
         }
 
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()?;
+
         let workspace_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let project_rules = rules::ProjectRules::discover(&workspace_dir);
-        let code_index = search_index::CodeSearchIndex::build(&workspace_dir);
 
         Ok(Self {
             config,
             config_path,
             history: Vec::new(),
             available_models: Vec::new(),
-            client: reqwest::Client::new(),
+            client,
             subagent_mgr: SubagentManager::new(),
             mcp_tools: Vec::new(),
             mcp_clients: Vec::new(),
             project_rules,
-            code_index,
+            code_index: Mutex::new(None),
             workspace_dir,
         })
+    }
+
+    pub fn get_code_index(&self) -> Arc<search_index::CodeSearchIndex> {
+        let mut guard = self.code_index.lock().unwrap();
+        if guard.is_none() {
+            println!("{}", "Building codebase search index...".dimmed());
+            let idx = search_index::CodeSearchIndex::build(&self.workspace_dir);
+            println!(
+                "Code Search: {} workspace files indexed.",
+                idx.documents.len().to_string().cyan()
+            );
+            *guard = Some(Arc::new(idx));
+        }
+        guard.as_ref().unwrap().clone()
     }
 
     fn save_config(&self) -> Result<()> {
@@ -386,7 +405,7 @@ async fn execute_tool(tool_name: &str, body: &str, state: &AgentState) -> String
                 Err(e) => format!("Failed to write file {}: {}", path, e),
             }
         }
-        "code_search" => search_index::execute_code_search_tool(&state.code_index, body),
+        "code_search" => search_index::execute_code_search_tool(&state.get_code_index(), body),
         "code_outline" => {
             let mut target = "";
             for line in body.lines() {
@@ -578,8 +597,8 @@ async fn main() -> Result<()> {
         );
     }
     println!(
-        "Code Search: {} workspace files indexed.",
-        state.code_index.documents.len().to_string().cyan()
+        "Workspace: {}",
+        state.workspace_dir.display().to_string().cyan()
     );
 
     if state.config.api_key.is_empty() {
@@ -766,8 +785,9 @@ async fn main() -> Result<()> {
                             if arg.is_empty() {
                                 println!("Usage: /search <query>");
                             } else {
-                                let results = state.code_index.search(arg, 8);
-                                println!("{}", state.code_index.format_results(arg, &results));
+                                let idx = state.get_code_index();
+                                let results = idx.search(arg, 8);
+                                println!("{}", idx.format_results(arg, &results));
                             }
                             continue;
                         }

@@ -253,7 +253,22 @@ impl SymbolExtractor {
     }
 }
 
+pub fn is_home_or_root(dir: &Path) -> bool {
+    if dir == Path::new("/") {
+        return true;
+    }
+    if let Some(home) = dirs::home_dir() {
+        if dir == home {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn is_ignored_path(path: &Path) -> bool {
+    if path.is_symlink() {
+        return true;
+    }
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     name.starts_with('.')
         || name == "target"
@@ -262,13 +277,19 @@ pub fn is_ignored_path(path: &Path) -> bool {
         || name == ".git"
         || name == "dist"
         || name == "build"
+        || name == "venv"
+        || name == ".venv"
+        || name == "__pycache__"
+        || name == "pkg"
+        || name == "out"
+        || name == "cache"
 }
 
 /// Recursively traverses `root_dir` extracting symbol maps across project source files.
 pub fn generate_codebase_outline(root_dir: &Path, max_tokens: usize) -> String {
     let extractor = SymbolExtractor::new();
     let mut files = Vec::new();
-    collect_source_files(root_dir, root_dir, &mut files);
+    collect_source_files(root_dir, root_dir, 0, &mut files);
 
     // Sort files alphabetically for stable output
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
@@ -296,20 +317,39 @@ struct SourceFileInfo {
     relative_path: String,
 }
 
-fn collect_source_files(current_dir: &Path, base_dir: &Path, out: &mut Vec<SourceFileInfo>) {
+fn collect_source_files(
+    current_dir: &Path,
+    base_dir: &Path,
+    depth: usize,
+    out: &mut Vec<SourceFileInfo>,
+) {
+    if out.len() >= 300 {
+        return;
+    }
+    let max_depth = if is_home_or_root(base_dir) { 1 } else { 6 };
+    if depth > max_depth {
+        return;
+    }
+
     let entries = match fs::read_dir(current_dir) {
         Ok(e) => e,
         Err(_) => return,
     };
 
     for entry in entries.flatten() {
+        if out.len() >= 300 {
+            break;
+        }
         let path = entry.path();
         if is_ignored_path(&path) {
             continue;
         }
 
         if path.is_dir() {
-            collect_source_files(&path, base_dir, out);
+            if is_home_or_root(base_dir) && depth >= 1 {
+                continue;
+            }
+            collect_source_files(&path, base_dir, depth + 1, out);
         } else if path.is_file() {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if matches!(ext, "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "go") {
