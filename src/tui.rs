@@ -33,6 +33,9 @@ pub struct TuiApp {
     pub file_tree: Vec<String>,
     pub selected_file: usize,
     pub chat_scroll: u16,
+    pub max_chat_scroll: u16,
+    pub auto_scroll: bool,
+    pub streaming_reply: String,
     pub should_quit: bool,
     pub status_message: String,
 }
@@ -49,6 +52,9 @@ impl TuiApp {
             file_tree,
             selected_file: 0,
             chat_scroll: 0,
+            max_chat_scroll: 0,
+            auto_scroll: true,
+            streaming_reply: String::new(),
             should_quit: false,
             status_message: "Press [Tab] to switch panes, [Enter] to submit, [Esc] to exit."
                 .to_string(),
@@ -107,9 +113,15 @@ fn collect_file_tree(current_dir: &Path, base_dir: &Path, depth: usize, out: &mu
 pub async fn run_tui(state: &mut AgentState) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        crossterm::cursor::Hide,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
     let mut app = TuiApp::new(&state.workspace_dir);
 
@@ -117,7 +129,11 @@ pub async fn run_tui(state: &mut AgentState) -> Result<()> {
 
     // Restore terminal safely
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )?;
     terminal.show_cursor()?;
 
     res
@@ -153,10 +169,6 @@ async fn tui_event_loop(
                                     content: input.clone(),
                                 });
 
-                                app.status_message =
-                                    format!("Generating response for `{}`...", input);
-                                terminal.draw(|frame| render_ui(frame, app, state))?;
-
                                 // Run auto-pruning
                                 let active_limit = state
                                     .available_models
@@ -174,18 +186,73 @@ async fn tui_event_loop(
                                     crate::context::DEFAULT_PRUNE_THRESHOLD,
                                 );
 
-                                match crate::stream_completion(state).await {
-                                    Ok(reply) => {
+                                app.auto_scroll = true;
+                                app.streaming_reply.clear();
+                                app.status_message = format!(
+                                    "Generating response with {}...",
+                                    state.config.active_model
+                                );
+                                terminal.draw(|frame| render_ui(frame, app, state))?;
+
+                                let full_result = {
+                                    let (tx, mut rx) =
+                                        tokio::sync::mpsc::unbounded_channel::<String>();
+                                    let stream_fut = crate::stream_completion_channel(state, tx);
+                                    tokio::pin!(stream_fut);
+
+                                    let mut res: Option<Result<String>> = None;
+                                    while res.is_none() {
+                                        tokio::select! {
+                                            result = &mut stream_fut => {
+                                                res = Some(result);
+                                            }
+                                            Some(chunk) = rx.recv() => {
+                                                app.streaming_reply.push_str(&chunk);
+                                                terminal.draw(|frame| render_ui(frame, app, state))?;
+                                            }
+                                            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                                                if event::poll(std::time::Duration::from_millis(0))? {
+                                                    if let Event::Key(key) = event::read()? {
+                                                        if key.kind == KeyEventKind::Press && (key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))) {
+                                                            app.status_message = "Generation interrupted by user.".to_string();
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    res
+                                };
+
+                                match full_result {
+                                    Some(Ok(full_reply)) => {
                                         state.history.push(crate::Message {
                                             role: "assistant".to_string(),
-                                            content: reply,
+                                            content: full_reply,
                                         });
-                                        app.status_message = "Ready.".to_string();
+                                        app.streaming_reply.clear();
+                                        app.status_message = "Ready. [Tab] switch panes | [Up/Down] scroll | [Esc] exit".to_string();
                                     }
-                                    Err(e) => {
+                                    Some(Err(e)) => {
                                         app.status_message = format!("Error: {}", e);
+                                        if !app.streaming_reply.is_empty() {
+                                            state.history.push(crate::Message {
+                                                role: "assistant".to_string(),
+                                                content: std::mem::take(&mut app.streaming_reply),
+                                            });
+                                        }
+                                    }
+                                    None => {
+                                        if !app.streaming_reply.is_empty() {
+                                            state.history.push(crate::Message {
+                                                role: "assistant".to_string(),
+                                                content: std::mem::take(&mut app.streaming_reply),
+                                            });
+                                        }
                                     }
                                 }
+                                terminal.draw(|frame| render_ui(frame, app, state))?;
                             }
                         }
                         KeyCode::Char(c) if app.active_pane == ActivePane::Input => {
@@ -198,8 +265,13 @@ async fn tui_event_loop(
                             ActivePane::FileTree if app.selected_file > 0 => {
                                 app.selected_file -= 1;
                             }
-                            ActivePane::Chat if app.chat_scroll > 0 => {
-                                app.chat_scroll = app.chat_scroll.saturating_sub(1);
+                            ActivePane::Chat => {
+                                if app.auto_scroll {
+                                    app.auto_scroll = false;
+                                    app.chat_scroll = app.max_chat_scroll.saturating_sub(1);
+                                } else {
+                                    app.chat_scroll = app.chat_scroll.saturating_sub(1);
+                                }
                             }
                             _ => {}
                         },
@@ -209,9 +281,26 @@ async fn tui_event_loop(
                             }
                             ActivePane::Chat => {
                                 app.chat_scroll = app.chat_scroll.saturating_add(1);
+                                if app.chat_scroll >= app.max_chat_scroll {
+                                    app.auto_scroll = true;
+                                }
                             }
                             _ => {}
                         },
+                        KeyCode::PageUp if app.active_pane == ActivePane::Chat => {
+                            if app.auto_scroll {
+                                app.auto_scroll = false;
+                                app.chat_scroll = app.max_chat_scroll.saturating_sub(10);
+                            } else {
+                                app.chat_scroll = app.chat_scroll.saturating_sub(10);
+                            }
+                        }
+                        KeyCode::PageDown if app.active_pane == ActivePane::Chat => {
+                            app.chat_scroll = app.chat_scroll.saturating_add(10);
+                            if app.chat_scroll >= app.max_chat_scroll {
+                                app.auto_scroll = true;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -222,7 +311,7 @@ async fn tui_event_loop(
     Ok(())
 }
 
-fn render_ui(frame: &mut ratatui::Frame, app: &TuiApp, state: &AgentState) {
+fn render_ui(frame: &mut ratatui::Frame, app: &mut TuiApp, state: &AgentState) {
     let size = frame.area();
 
     // Main layout: Header, Content, Footer
@@ -276,7 +365,12 @@ fn render_header(frame: &mut ratatui::Frame, area: Rect, state: &AgentState) {
     frame.render_widget(header, area);
 }
 
-fn render_main_content(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp, state: &AgentState) {
+fn render_main_content(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &mut TuiApp,
+    state: &AgentState,
+) {
     // Horizontal Split: Left Sidebar (30%), Right Workspace (70%)
     let horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -389,7 +483,46 @@ fn render_subagents(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp, state:
     frame.render_widget(list, area);
 }
 
-fn render_chat_pane(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp, state: &AgentState) {
+fn format_message_lines(lines: &mut Vec<Line>, content: &str, default_style: Style) {
+    let mut in_code_fence = false;
+    for line in content.lines() {
+        if line.starts_with("```tool:") || line.starts_with("[TOOL OUTPUT") {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", line),
+                Style::default().fg(Color::Yellow),
+            )));
+        } else if line.starts_with("```") {
+            in_code_fence = !in_code_fence;
+            lines.push(Line::from(Span::styled(
+                format!("  {}", line),
+                Style::default().fg(Color::Cyan).bold(),
+            )));
+        } else if in_code_fence {
+            let trimmed = line.trim_start();
+            let code_style = if trimmed.starts_with("//") || trimmed.starts_with('#') {
+                Style::default().fg(Color::DarkGray)
+            } else if trimmed.starts_with("fn ")
+                || trimmed.starts_with("pub ")
+                || trimmed.starts_with("let ")
+                || trimmed.starts_with("def ")
+                || trimmed.starts_with("class ")
+                || trimmed.starts_with("import ")
+            {
+                Style::default().fg(Color::LightMagenta)
+            } else {
+                Style::default().fg(Color::LightCyan)
+            };
+            lines.push(Line::from(Span::styled(format!("  {}", line), code_style)));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", line),
+                default_style,
+            )));
+        }
+    }
+}
+
+fn render_chat_pane(frame: &mut ratatui::Frame, area: Rect, app: &mut TuiApp, state: &AgentState) {
     let border_color = if app.active_pane == ActivePane::Chat {
         Color::Yellow
     } else {
@@ -397,7 +530,7 @@ fn render_chat_pane(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp, state:
     };
 
     let mut lines = Vec::new();
-    if state.history.is_empty() {
+    if state.history.is_empty() && app.streaming_reply.is_empty() {
         lines.push(Line::from(Span::styled(
             "Welcome to Orbit TUI! Type your prompt below and press [Enter].",
             Style::default().fg(Color::DarkGray),
@@ -424,36 +557,51 @@ fn render_chat_pane(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp, state:
             };
 
             lines.push(Line::from(role_span));
-            for line in msg.content.lines() {
-                if line.starts_with("```tool:") || line.starts_with("[TOOL OUTPUT") {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {}", line),
-                        Style::default().fg(Color::Yellow),
-                    )));
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {}", line),
-                        content_style,
-                    )));
-                }
-            }
+            format_message_lines(&mut lines, &msg.content, content_style);
+            lines.push(Line::from(""));
+        }
+
+        if !app.streaming_reply.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "🤖 Orbit: ",
+                Style::default().fg(Color::Green).bold(),
+            )));
+            format_message_lines(
+                &mut lines,
+                &app.streaming_reply,
+                Style::default().fg(Color::Gray),
+            );
             lines.push(Line::from(""));
         }
     }
+
+    let total_lines = lines.len();
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let max_scroll = total_lines.saturating_sub(inner_height) as u16;
+    app.max_chat_scroll = max_scroll;
+
+    let scroll_pos = if app.auto_scroll {
+        max_scroll
+    } else {
+        app.chat_scroll.min(max_scroll)
+    };
+
+    let title_text = if app.auto_scroll {
+        " 💬 Conversation & Output [Auto-Scroll] "
+    } else {
+        " 💬 Conversation & Output [Scrolled] "
+    };
 
     let paragraph = Paragraph::new(Text::from(lines))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(Span::styled(
-                    " 💬 Conversation & Output ",
-                    Style::default().bold(),
-                ))
+                .title(Span::styled(title_text, Style::default().bold()))
                 .border_style(Style::default().fg(border_color)),
         )
         .wrap(Wrap { trim: false })
-        .scroll((app.chat_scroll, 0));
+        .scroll((scroll_pos, 0));
 
     frame.render_widget(paragraph, area);
 }

@@ -779,7 +779,33 @@ async fn execute_tool(tool_name: &str, body: &str, state: &AgentState) -> String
     }
 }
 
+pub enum StreamOutputMode {
+    TerminalRepl { syntax_highlighting: bool },
+    Channel(tokio::sync::mpsc::UnboundedSender<String>),
+    Silent,
+}
+
 pub async fn stream_completion(state: &AgentState) -> Result<String> {
+    stream_completion_internal(
+        state,
+        StreamOutputMode::TerminalRepl {
+            syntax_highlighting: state.config.syntax_highlighting,
+        },
+    )
+    .await
+}
+
+pub async fn stream_completion_channel(
+    state: &AgentState,
+    sender: tokio::sync::mpsc::UnboundedSender<String>,
+) -> Result<String> {
+    stream_completion_internal(state, StreamOutputMode::Channel(sender)).await
+}
+
+pub async fn stream_completion_internal(
+    state: &AgentState,
+    mode: StreamOutputMode,
+) -> Result<String> {
     // 1. Hybrid Cascading Model Resolution:
     let last_user_prompt = state
         .history
@@ -808,6 +834,7 @@ pub async fn stream_completion(state: &AgentState) -> Result<String> {
 
     // 3. Failover Candidate Chain Resolution:
     let candidates = routing::get_failover_candidates(&target_model, &state.config.fallback_models);
+    let is_terminal = matches!(mode, StreamOutputMode::TerminalRepl { .. });
 
     for (candidate_idx, model_candidate) in candidates.iter().enumerate() {
         let payload = json!({
@@ -833,14 +860,16 @@ pub async fn stream_completion(state: &AgentState) -> Result<String> {
             Err(e) => {
                 if candidate_idx + 1 < candidates.len() {
                     let next = &candidates[candidate_idx + 1];
-                    println!(
-                        "\n{}",
-                        format!(
-                            "⚠️ Network error requesting model '{}': {}. Auto-failing over to fallback '{}'...",
-                            model_candidate, e, next
-                        )
-                        .yellow()
-                    );
+                    if is_terminal {
+                        println!(
+                            "\n{}",
+                            format!(
+                                "⚠️ Network error requesting model '{}': {}. Auto-failing over to fallback '{}'...",
+                                model_candidate, e, next
+                            )
+                            .yellow()
+                        );
+                    }
                     continue;
                 } else {
                     return Err(anyhow::anyhow!("OpenRouter Network Error: {}", e));
@@ -857,17 +886,19 @@ pub async fn stream_completion(state: &AgentState) -> Result<String> {
             if routing::is_retryable_status(status.as_u16()) && candidate_idx + 1 < candidates.len()
             {
                 let next = &candidates[candidate_idx + 1];
-                println!(
-                    "\n{}",
-                    format!(
-                        "⚠️ Model '{}' returned HTTP {} ({}). Auto-failing over to fallback '{}'...",
-                        model_candidate,
-                        status.as_u16(),
-                        err_text.trim(),
-                        next
-                    )
-                    .yellow()
-                );
+                if is_terminal {
+                    println!(
+                        "\n{}",
+                        format!(
+                            "⚠️ Model '{}' returned HTTP {} ({}). Auto-failing over to fallback '{}'...",
+                            model_candidate,
+                            status.as_u16(),
+                            err_text.trim(),
+                            next
+                        )
+                        .yellow()
+                    );
+                }
                 continue;
             } else {
                 return Err(anyhow::anyhow!(
@@ -891,20 +922,26 @@ pub async fn stream_completion(state: &AgentState) -> Result<String> {
             ""
         };
 
-        print!(
-            "\n{} {}{}{}{} ",
-            "🤖".bold(),
-            model_candidate.cyan(),
-            tier_note.magenta(),
-            failover_badge.yellow(),
-            cache_badge.dimmed()
-        );
-        io::stdout().flush()?;
+        if is_terminal {
+            print!(
+                "\n{} {}{}{}{} ",
+                "🤖".bold(),
+                model_candidate.cyan(),
+                tier_note.magenta(),
+                failover_badge.yellow(),
+                cache_badge.dimmed()
+            );
+            io::stdout().flush()?;
+        }
 
         let mut stream = resp.bytes_stream().eventsource();
         let mut full_text = String::new();
-        let mut highlighter =
-            highlight::StreamingHighlighter::new(state.config.syntax_highlighting);
+        let mut highlighter = match &mode {
+            StreamOutputMode::TerminalRepl {
+                syntax_highlighting,
+            } => Some(highlight::StreamingHighlighter::new(*syntax_highlighting)),
+            _ => None,
+        };
 
         while let Some(event) = stream.next().await {
             match event {
@@ -914,7 +951,12 @@ pub async fn stream_completion(state: &AgentState) -> Result<String> {
                     }
                     if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(&evt.data) {
                         if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
-                            highlighter.feed(content);
+                            if let Some(h) = &mut highlighter {
+                                h.feed(content);
+                            }
+                            if let StreamOutputMode::Channel(ref tx) = mode {
+                                let _ = tx.send(content.to_string());
+                            }
                             full_text.push_str(content);
                         }
                     }
@@ -922,8 +964,10 @@ pub async fn stream_completion(state: &AgentState) -> Result<String> {
                 Err(_) => break,
             }
         }
-        highlighter.flush();
-        println!("\n");
+        if let Some(mut h) = highlighter {
+            h.flush();
+            println!("\n");
+        }
         return Ok(full_text);
     }
 
