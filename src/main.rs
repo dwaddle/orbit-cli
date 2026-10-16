@@ -20,6 +20,7 @@ pub mod context;
 pub mod git_context;
 pub mod highlight;
 mod mcp;
+pub mod modal_prompt;
 pub mod outline;
 pub mod patch;
 pub mod review;
@@ -1110,30 +1111,23 @@ async fn main() -> Result<()> {
     } else {
         Config::builder().edit_mode(EditMode::Emacs).build()
     };
+    let history_file = state.config_path.with_file_name("history.txt");
+    let mut history_lines = modal_prompt::load_history_file(&history_file);
+
     let mut rl = DefaultEditor::with_config(rl_config)?;
-    let _ = rl.load_history(&state.config_path.with_file_name("history.txt"));
+    let _ = rl.load_history(&history_file);
 
     let tool_re = Regex::new(
         r"```tool:(run_command|view_file|write_file|apply_patch|tdd_cycle|invoke_subagent|mcp|code_search|code_outline|git_context|adversarial_review|run_dag)\n([\s\S]*?)```",
     )?;
 
     loop {
-        if state.config.vim_mode {
-            print!("\x1b[6 q");
-            let _ = io::stdout().flush();
-        }
-
-        let prompt = if state.config.vim_mode {
-            format!("{}{} > ", "orbit".bold().magenta(), " [vim]".yellow())
+        let readline = if state.config.vim_mode {
+            modal_prompt::read_modal_line(&mut history_lines, Some(&history_file))
         } else {
-            format!("{} > ", "orbit".bold().magenta())
+            let prompt = format!("{} > ", "orbit".bold().magenta());
+            rl.readline(&prompt)
         };
-        let readline = rl.readline(&prompt);
-
-        if state.config.vim_mode {
-            print!("\x1b[2 q");
-            let _ = io::stdout().flush();
-        }
 
         match readline {
             Ok(line) => {
@@ -1498,7 +1492,7 @@ async fn main() -> Result<()> {
                                 rl.set_edit_mode(EditMode::Vi);
                                 println!(
                                     "Vim edit mode: {}",
-                                    "ENABLED (Vi command/insert mode active in REPL & TUI)"
+                                    "ENABLED (Modal [NORMAL]/[INSERT]/[VISUAL] prompt active in REPL & TUI)"
                                         .bold()
                                         .green()
                                 );
