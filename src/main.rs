@@ -1121,17 +1121,38 @@ async fn main() -> Result<()> {
         r"```tool:(run_command|view_file|write_file|apply_patch|tdd_cycle|invoke_subagent|mcp|code_search|code_outline|git_context|adversarial_review|run_dag)\n([\s\S]*?)```",
     )?;
 
+    let mut multi_line_acc = String::new();
+
     loop {
+        let is_continuation = !multi_line_acc.is_empty();
         let readline = if state.config.vim_mode {
-            modal_prompt::read_modal_line(&mut history_lines, Some(&history_file))
+            modal_prompt::read_modal_line(&mut history_lines, Some(&history_file), is_continuation)
         } else {
-            let prompt = format!("{} > ", "orbit".bold().magenta());
+            let prompt = if is_continuation {
+                format!("{} > ", "...  ".dimmed())
+            } else {
+                format!("{} > ", "orbit".bold().magenta())
+            };
             rl.readline(&prompt)
         };
 
         match readline {
             Ok(line) => {
-                let input = line.trim();
+                if modal_prompt::is_line_continuation(&line) {
+                    let stripped = modal_prompt::strip_line_continuation(&line);
+                    multi_line_acc.push_str(stripped);
+                    multi_line_acc.push('\n');
+                    continue;
+                }
+
+                let full_input = if !multi_line_acc.is_empty() {
+                    multi_line_acc.push_str(&line);
+                    std::mem::take(&mut multi_line_acc)
+                } else {
+                    line
+                };
+
+                let input = full_input.trim();
                 if input.is_empty() {
                     continue;
                 }
@@ -1219,6 +1240,9 @@ async fn main() -> Result<()> {
                             println!("  /clear                 - Clear chat history");
                             println!("  /key <sk-or-v1-...>    - Update OpenRouter API Key");
                             println!("  /help                  - Show this help menu");
+                            println!(
+                                "  \\ (at line end)        - Continue prompt on next line (multi-line input)"
+                            );
                             println!("  /exit                  - Exit application");
                             continue;
                         }
@@ -2033,7 +2057,19 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+            Err(ReadlineError::Interrupted) => {
+                if !multi_line_acc.is_empty() {
+                    multi_line_acc.clear();
+                    println!("{}", "Multi-line input canceled.".dimmed());
+                    continue;
+                }
+                println!("Bye!");
+                break;
+            }
+            Err(ReadlineError::Eof) => {
+                if !multi_line_acc.is_empty() {
+                    multi_line_acc.clear();
+                }
                 println!("Bye!");
                 break;
             }

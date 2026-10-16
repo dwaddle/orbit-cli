@@ -157,14 +157,37 @@ pub fn next_word_boundary(s: &str, byte_idx: usize) -> usize {
     }
 }
 
+pub fn is_line_continuation(s: &str) -> bool {
+    let trimmed = s.trim_end();
+    if !trimmed.ends_with('\\') {
+        return false;
+    }
+    let num_backslashes = trimmed.chars().rev().take_while(|&c| c == '\\').count();
+    num_backslashes % 2 == 1
+}
+
+pub fn strip_line_continuation(s: &str) -> &str {
+    let trimmed = s.trim_end();
+    if is_line_continuation(trimmed) {
+        &trimmed[..trimmed.len() - 1]
+    } else {
+        s
+    }
+}
+
 pub fn render_prompt(
     mode: ModalMode,
     buffer: &str,
     cursor: usize,
     visual_anchor: Option<usize>,
+    is_continuation: bool,
 ) -> io::Result<()> {
     let mut stdout = io::stdout();
-    let prompt_prefix = "\x1b[1;35morbit\x1b[0m"; // bold magenta
+    let prompt_prefix = if is_continuation {
+        "\x1b[1;36m...  \x1b[0m" // bold cyan ellipsis matching 5-char width of "orbit"
+    } else {
+        "\x1b[1;35morbit\x1b[0m" // bold magenta
+    };
     let mode_badge = match mode {
         ModalMode::Insert => "\x1b[1;32m[INSERT]\x1b[0m", // bold green
         ModalMode::Normal => "\x1b[1;33m[NORMAL]\x1b[0m", // bold yellow
@@ -198,7 +221,7 @@ pub fn render_prompt(
         buffer.to_string()
     };
 
-    // Prompt visible width: "orbit " (6) + "[INSERT]" (8) + " > " (3) = 17 columns
+    // Prompt visible width: "orbit " or "...   " (6) + "[INSERT]" (8) + " > " (3) = 17 columns
     let prompt_vis_len = 17;
     let cursor_char_offset = buffer[..cursor.min(buffer.len())].chars().count();
     let col = prompt_vis_len + cursor_char_offset;
@@ -237,6 +260,7 @@ pub fn append_history_file(path: &Path, line: &str) -> io::Result<()> {
 pub fn read_modal_line(
     history: &mut Vec<String>,
     history_file: Option<&Path>,
+    is_continuation: bool,
 ) -> Result<String, ReadlineError> {
     let _guard = RawModeGuard::new().map_err(ReadlineError::Io)?;
     let mut state = ModalPromptState::new();
@@ -244,8 +268,14 @@ pub fn read_modal_line(
     let mut history_index = history.len();
     let mut draft_buffer = String::new();
 
-    render_prompt(state.mode, &state.buffer, state.cursor, state.visual_anchor)
-        .map_err(ReadlineError::Io)?;
+    render_prompt(
+        state.mode,
+        &state.buffer,
+        state.cursor,
+        state.visual_anchor,
+        is_continuation,
+    )
+    .map_err(ReadlineError::Io)?;
 
     loop {
         let ev = event::read().map_err(ReadlineError::Io)?;
@@ -663,14 +693,41 @@ pub fn read_modal_line(
             }
         }
 
-        render_prompt(state.mode, &state.buffer, state.cursor, state.visual_anchor)
-            .map_err(ReadlineError::Io)?;
+        render_prompt(
+            state.mode,
+            &state.buffer,
+            state.cursor,
+            state.visual_anchor,
+            is_continuation,
+        )
+        .map_err(ReadlineError::Io)?;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_line_continuation() {
+        assert!(is_line_continuation("hello \\"));
+        assert!(is_line_continuation("hello\\"));
+        assert!(is_line_continuation("hello \\   "));
+        assert!(is_line_continuation("\\"));
+        assert!(is_line_continuation("line 1 \\\\\\")); // 3 backslashes: odd -> continuation
+
+        assert!(!is_line_continuation("hello"));
+        assert!(!is_line_continuation("hello \\\\")); // 2 backslashes: even -> escaped
+        assert!(!is_line_continuation("hello \\\\   "));
+        assert!(!is_line_continuation(""));
+        assert!(!is_line_continuation("   "));
+
+        assert_eq!(strip_line_continuation("hello \\"), "hello ");
+        assert_eq!(strip_line_continuation("hello\\"), "hello");
+        assert_eq!(strip_line_continuation("hello \\   "), "hello ");
+        assert_eq!(strip_line_continuation("\\"), "");
+        assert_eq!(strip_line_continuation("hello"), "hello");
+    }
 
     #[test]
     fn test_char_boundaries() {

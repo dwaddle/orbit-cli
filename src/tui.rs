@@ -15,6 +15,7 @@ use ratatui::{
 use std::io::{self, Stdout};
 use std::path::Path;
 
+use crate::modal_prompt::{is_line_continuation, strip_line_continuation};
 use crate::outline::{is_home_or_root, is_ignored_path};
 use crate::subagent::SubagentStatus;
 use crate::AgentState;
@@ -337,7 +338,17 @@ async fn tui_event_loop(
                                 app.cycle_pane_reverse();
                             }
                             KeyCode::Enter => {
-                                submit_input(terminal, app, state).await?;
+                                if is_line_continuation(&app.input_text) {
+                                    let stripped = strip_line_continuation(&app.input_text);
+                                    app.input_text = format!("{}\n", stripped);
+                                    app.status_message = "Multi-line input: line continuation added. Press [Enter] without trailing '\\' to submit.".to_string();
+                                } else {
+                                    submit_input(terminal, app, state).await?;
+                                }
+                            }
+                            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.input_text.push('\n');
+                                app.status_message = "Multi-line input: newline added.".to_string();
                             }
                             KeyCode::Backspace => {
                                 app.input_text.pop();
@@ -577,7 +588,13 @@ async fn tui_event_loop(
                                                 format!("Attached file: {}. [Enter] submit.", file);
                                         }
                                     } else if app.active_pane == ActivePane::Input {
-                                        submit_input(terminal, app, state).await?;
+                                        if is_line_continuation(&app.input_text) {
+                                            let stripped = strip_line_continuation(&app.input_text);
+                                            app.input_text = format!("{}\n", stripped);
+                                            app.status_message = "Multi-line input: line continuation added. Press [Enter] without trailing '\\' to submit.".to_string();
+                                        } else {
+                                            submit_input(terminal, app, state).await?;
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -802,10 +819,13 @@ fn render_main_content(
     render_file_tree(frame, sidebar_chunks[0], app);
     render_subagents(frame, sidebar_chunks[1], app, state);
 
-    // Right Workspace: Chat Display (85%), Input Box (15%)
+    // Right Workspace: Chat Display, Input Box (dynamic height for multi-line)
+    let input_lines_count = app.input_text.split('\n').count() as u16;
+    let input_height = (input_lines_count + 2).clamp(3, 8);
+
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(3)])
+        .constraints([Constraint::Min(8), Constraint::Length(input_height)])
         .split(horizontal_chunks[1]);
 
     render_chat_pane(frame, right_chunks[0], app, state);
@@ -1113,13 +1133,44 @@ fn render_input_pane(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp) {
         ),
     ]);
 
-    let input_p = Paragraph::new(format!("> {}{}", app.input_text, cursor_char)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title(title_line)
-            .border_style(Style::default().fg(border_color)),
-    );
+    let lines: Vec<Line> = if app.input_text.contains('\n') {
+        let raw_lines: Vec<&str> = app.input_text.split('\n').collect();
+        let total = raw_lines.len();
+        raw_lines
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let prefix = if i == 0 { "> " } else { "... " };
+                let suffix = if i == total - 1 { cursor_char } else { "" };
+                Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(Color::Cyan).bold()),
+                    Span::raw(format!("{}{}", l, suffix)),
+                ])
+            })
+            .collect()
+    } else {
+        vec![Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan).bold()),
+            Span::raw(format!("{}{}", app.input_text, cursor_char)),
+        ])]
+    };
+
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let scroll_y = if lines.len() > inner_height {
+        (lines.len() - inner_height) as u16
+    } else {
+        0
+    };
+
+    let input_p = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(title_line)
+                .border_style(Style::default().fg(border_color)),
+        )
+        .scroll((scroll_y, 0));
 
     frame.render_widget(input_p, area);
 }
