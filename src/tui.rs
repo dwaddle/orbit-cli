@@ -23,6 +23,7 @@ use crate::AgentState;
 pub enum TuiMode {
     Normal,
     Insert,
+    Visual,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +47,9 @@ pub struct TuiApp {
     pub should_quit: bool,
     pub status_message: String,
     pub pending_key: Option<char>,
+    pub visual_start: usize,
+    pub visual_cursor: usize,
+    pub yank_buffer: String,
 }
 
 impl TuiApp {
@@ -69,6 +73,9 @@ impl TuiApp {
                 "Vim mode active. [Esc] Normal mode | [i] Insert | [Tab] Switch pane | [q] Quit"
                     .to_string(),
             pending_key: None,
+            visual_start: 0,
+            visual_cursor: 0,
+            yank_buffer: String::new(),
         }
     }
 
@@ -526,6 +533,40 @@ async fn tui_event_loop(
                                         app.chat_scroll = app.chat_scroll.saturating_sub(25);
                                     }
                                 }
+                                KeyCode::Char('v') | KeyCode::Char('V') => {
+                                    app.mode = TuiMode::Visual;
+                                    match app.active_pane {
+                                        ActivePane::Chat => {
+                                            app.visual_start = app.chat_scroll as usize;
+                                            app.visual_cursor = app.chat_scroll as usize;
+                                        }
+                                        ActivePane::FileTree => {
+                                            app.visual_start = app.selected_file;
+                                            app.visual_cursor = app.selected_file;
+                                        }
+                                        _ => {
+                                            app.visual_start = 0;
+                                            app.visual_cursor = 0;
+                                        }
+                                    }
+                                    app.status_message =
+                                        "-- VISUAL -- [j/k] Select lines | [y] Yank | [Esc] Cancel"
+                                            .to_string();
+                                }
+                                KeyCode::Char('p') | KeyCode::Char('P') => {
+                                    if !app.yank_buffer.is_empty() {
+                                        app.active_pane = ActivePane::Input;
+                                        app.input_text.push_str(&app.yank_buffer);
+                                        app.status_message = format!(
+                                            "Pasted {} chars into input.",
+                                            app.yank_buffer.len()
+                                        );
+                                    } else {
+                                        app.status_message =
+                                            "Yank buffer is empty. (Use [v] to select, [y] to yank)"
+                                                .to_string();
+                                    }
+                                }
                                 KeyCode::Enter => {
                                     if app.active_pane == ActivePane::FileTree {
                                         if let Some(file) = app.file_tree.get(app.selected_file) {
@@ -542,6 +583,136 @@ async fn tui_event_loop(
                                 _ => {}
                             }
                         }
+                        TuiMode::Visual => match key.code {
+                            KeyCode::Esc
+                            | KeyCode::Char('q')
+                            | KeyCode::Char('v')
+                            | KeyCode::Char('V') => {
+                                app.mode = TuiMode::Normal;
+                                app.status_message =
+                                    "-- NORMAL -- Visual selection canceled.".to_string();
+                            }
+                            KeyCode::Tab => {
+                                app.mode = TuiMode::Normal;
+                                app.cycle_pane();
+                            }
+                            KeyCode::BackTab => {
+                                app.mode = TuiMode::Normal;
+                                app.cycle_pane_reverse();
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => match app.active_pane {
+                                ActivePane::Chat => {
+                                    let chat_lines = build_chat_lines(state, &app.streaming_reply);
+                                    if app.visual_cursor + 1 < chat_lines.len() {
+                                        app.visual_cursor += 1;
+                                        if app.visual_cursor as u16
+                                            > app.chat_scroll.saturating_add(15)
+                                        {
+                                            app.chat_scroll = app.chat_scroll.saturating_add(1);
+                                        }
+                                    }
+                                }
+                                ActivePane::FileTree
+                                    if app.visual_cursor + 1 < app.file_tree.len() =>
+                                {
+                                    app.visual_cursor += 1;
+                                    app.selected_file = app.visual_cursor;
+                                }
+                                _ => {}
+                            },
+                            KeyCode::Char('k') | KeyCode::Up => match app.active_pane {
+                                ActivePane::Chat => {
+                                    if app.visual_cursor > 0 {
+                                        app.visual_cursor -= 1;
+                                        if (app.visual_cursor as u16) < app.chat_scroll {
+                                            app.chat_scroll = app.visual_cursor as u16;
+                                            app.auto_scroll = false;
+                                        }
+                                    }
+                                }
+                                ActivePane::FileTree if app.visual_cursor > 0 => {
+                                    app.visual_cursor -= 1;
+                                    app.selected_file = app.visual_cursor;
+                                }
+                                _ => {}
+                            },
+                            KeyCode::Char('g') => {
+                                app.visual_cursor = 0;
+                                if app.active_pane == ActivePane::Chat {
+                                    app.chat_scroll = 0;
+                                    app.auto_scroll = false;
+                                } else if app.active_pane == ActivePane::FileTree {
+                                    app.selected_file = 0;
+                                }
+                            }
+                            KeyCode::Char('G') => {
+                                if app.active_pane == ActivePane::Chat {
+                                    let chat_lines = build_chat_lines(state, &app.streaming_reply);
+                                    app.visual_cursor = chat_lines.len().saturating_sub(1);
+                                    app.chat_scroll = app.max_chat_scroll;
+                                } else if app.active_pane == ActivePane::FileTree {
+                                    app.visual_cursor = app.file_tree.len().saturating_sub(1);
+                                    app.selected_file = app.visual_cursor;
+                                }
+                            }
+                            KeyCode::Char('y') | KeyCode::Char('Y') => match app.active_pane {
+                                ActivePane::Chat => {
+                                    let chat_lines = build_chat_lines(state, &app.streaming_reply);
+                                    let sel_min = app.visual_start.min(app.visual_cursor);
+                                    let sel_max = app
+                                        .visual_start
+                                        .max(app.visual_cursor)
+                                        .min(chat_lines.len().saturating_sub(1));
+                                    if sel_min <= sel_max && !chat_lines.is_empty() {
+                                        let selected_text: Vec<String> = chat_lines
+                                            [sel_min..=sel_max]
+                                            .iter()
+                                            .map(|line| {
+                                                line.spans
+                                                    .iter()
+                                                    .map(|s| s.content.as_ref())
+                                                    .collect::<Vec<&str>>()
+                                                    .join("")
+                                            })
+                                            .collect();
+                                        let count = selected_text.len();
+                                        app.yank_buffer = selected_text.join("\n");
+                                        app.mode = TuiMode::Normal;
+                                        app.status_message = format!(
+                                                "-- NORMAL -- Yanked {} lines. Press [p] to paste into input.",
+                                                count
+                                            );
+                                    } else {
+                                        app.mode = TuiMode::Normal;
+                                        app.status_message =
+                                            "-- NORMAL -- No lines selected to yank.".to_string();
+                                    }
+                                }
+                                ActivePane::FileTree => {
+                                    let sel_min = app.visual_start.min(app.visual_cursor);
+                                    let sel_max = app
+                                        .visual_start
+                                        .max(app.visual_cursor)
+                                        .min(app.file_tree.len().saturating_sub(1));
+                                    if sel_min <= sel_max && !app.file_tree.is_empty() {
+                                        let files = &app.file_tree[sel_min..=sel_max];
+                                        let count = files.len();
+                                        app.yank_buffer = files.join("\n");
+                                        app.mode = TuiMode::Normal;
+                                        app.status_message = format!(
+                                                "-- NORMAL -- Yanked {} file paths. Press [p] to paste into input.",
+                                                count
+                                            );
+                                    } else {
+                                        app.mode = TuiMode::Normal;
+                                    }
+                                }
+                                _ => {
+                                    app.mode = TuiMode::Normal;
+                                }
+                            },
+                            _ => {}
+                        },
                     }
                 }
             }
@@ -643,17 +814,33 @@ fn render_main_content(
 
 fn render_file_tree(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp) {
     let border_color = if app.active_pane == ActivePane::FileTree {
-        Color::Yellow
+        if app.mode == TuiMode::Visual {
+            Color::Magenta
+        } else {
+            Color::Yellow
+        }
     } else {
         Color::DarkGray
     };
+
+    let sel_min = app.visual_start.min(app.visual_cursor);
+    let sel_max = app.visual_start.max(app.visual_cursor);
 
     let items: Vec<ListItem> = app
         .file_tree
         .iter()
         .enumerate()
         .map(|(idx, file)| {
-            let style = if idx == app.selected_file && app.active_pane == ActivePane::FileTree {
+            let style = if app.active_pane == ActivePane::FileTree
+                && app.mode == TuiMode::Visual
+                && idx >= sel_min
+                && idx <= sel_max
+            {
+                Style::default()
+                    .fg(Color::Magenta)
+                    .bold()
+                    .add_modifier(Modifier::REVERSED)
+            } else if idx == app.selected_file && app.active_pane == ActivePane::FileTree {
                 Style::default()
                     .fg(Color::Yellow)
                     .bold()
@@ -767,15 +954,9 @@ fn format_message_lines(lines: &mut Vec<Line>, content: &str, default_style: Sty
     }
 }
 
-fn render_chat_pane(frame: &mut ratatui::Frame, area: Rect, app: &mut TuiApp, state: &AgentState) {
-    let border_color = if app.active_pane == ActivePane::Chat {
-        Color::Yellow
-    } else {
-        Color::DarkGray
-    };
-
+pub fn build_chat_lines(state: &AgentState, streaming_reply: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    if state.history.is_empty() && app.streaming_reply.is_empty() {
+    if state.history.is_empty() && streaming_reply.is_empty() {
         lines.push(Line::from(Span::styled(
             "Welcome to Orbit TUI! Type your prompt below and press [Enter].",
             Style::default().fg(Color::DarkGray),
@@ -806,24 +987,53 @@ fn render_chat_pane(frame: &mut ratatui::Frame, area: Rect, app: &mut TuiApp, st
             lines.push(Line::from(""));
         }
 
-        if !app.streaming_reply.is_empty() {
+        if !streaming_reply.is_empty() {
             lines.push(Line::from(Span::styled(
                 "🤖 Orbit: ",
                 Style::default().fg(Color::Green).bold(),
             )));
             format_message_lines(
                 &mut lines,
-                &app.streaming_reply,
+                streaming_reply,
                 Style::default().fg(Color::Gray),
             );
             lines.push(Line::from(""));
         }
     }
+    lines
+}
+
+fn render_chat_pane(frame: &mut ratatui::Frame, area: Rect, app: &mut TuiApp, state: &AgentState) {
+    let border_color = if app.active_pane == ActivePane::Chat {
+        if app.mode == TuiMode::Visual {
+            Color::Magenta
+        } else {
+            Color::Yellow
+        }
+    } else {
+        Color::DarkGray
+    };
+
+    let mut lines = build_chat_lines(state, &app.streaming_reply);
 
     let total_lines = lines.len();
     let inner_height = area.height.saturating_sub(2) as usize;
     let max_scroll = total_lines.saturating_sub(inner_height) as u16;
     app.max_chat_scroll = max_scroll;
+
+    if app.mode == TuiMode::Visual && app.active_pane == ActivePane::Chat {
+        let sel_min = app.visual_start.min(app.visual_cursor);
+        let sel_max = app.visual_start.max(app.visual_cursor);
+        for (idx, line) in lines.iter_mut().enumerate() {
+            if idx >= sel_min && idx <= sel_max {
+                *line = line.clone().patch_style(
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::REVERSED),
+                );
+            }
+        }
+    }
 
     let scroll_pos = if app.auto_scroll {
         max_scroll
@@ -831,7 +1041,9 @@ fn render_chat_pane(frame: &mut ratatui::Frame, area: Rect, app: &mut TuiApp, st
         app.chat_scroll.min(max_scroll)
     };
 
-    let title_text = if app.auto_scroll {
+    let title_text = if app.mode == TuiMode::Visual && app.active_pane == ActivePane::Chat {
+        " 💬 Conversation & Output [VISUAL SELECTION] "
+    } else if app.auto_scroll {
         " 💬 Conversation & Output [Auto-Scroll] "
     } else {
         " 💬 Conversation & Output [Scrolled] "
@@ -861,25 +1073,41 @@ fn render_input_pane(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp) {
             Color::Yellow,
             Span::styled(" [NORMAL] ", Style::default().fg(Color::Yellow).bold()),
         ),
+        (ActivePane::Input, TuiMode::Visual) => (
+            Color::Magenta,
+            Span::styled(" [VISUAL] ", Style::default().fg(Color::Magenta).bold()),
+        ),
         _ => (
             Color::DarkGray,
-            Span::styled(" [INACTIVE] ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                match app.mode {
+                    TuiMode::Visual => " [VISUAL] ",
+                    TuiMode::Normal => " [NORMAL] ",
+                    TuiMode::Insert => " [INACTIVE] ",
+                },
+                match app.mode {
+                    TuiMode::Visual => Style::default().fg(Color::Magenta).bold(),
+                    TuiMode::Normal => Style::default().fg(Color::Yellow),
+                    TuiMode::Insert => Style::default().fg(Color::DarkGray),
+                },
+            ),
         ),
     };
 
     let cursor_char = match app.mode {
         TuiMode::Insert => "█",
         TuiMode::Normal => "▒",
+        TuiMode::Visual => "▚",
     };
 
     let title_line = Line::from(vec![
         Span::styled(" ⌨️ Input Prompt", Style::default().bold()),
         mode_badge,
         Span::styled(
-            if app.mode == TuiMode::Insert {
-                " [Enter: Send | Esc: Normal] "
-            } else {
-                " [i: Insert | j/k: Scroll | Tab: Pane] "
+            match app.mode {
+                TuiMode::Insert => " [Enter: Send | Esc: Normal] ",
+                TuiMode::Normal => " [i: Insert | v: Visual | j/k: Scroll | p: Paste | Tab: Pane] ",
+                TuiMode::Visual => " [j/k: Select lines | y: Yank | Esc: Cancel] ",
             },
             Style::default().fg(Color::DarkGray),
         ),
@@ -903,7 +1131,7 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp) {
                 " NORMAL ",
                 Style::default().bg(Color::Yellow).fg(Color::Black).bold(),
             ),
-            " | [j/k] move/scroll | [h/l] panes | [gg/G] top/bot | [i] insert | [q] quit",
+            " | [j/k] move/scroll | [h/l] panes | [v] visual | [p] paste | [i] insert | [q] quit",
         ),
         TuiMode::Insert => (
             Span::styled(
@@ -911,6 +1139,13 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp) {
                 Style::default().bg(Color::Green).fg(Color::Black).bold(),
             ),
             " | [Enter] submit prompt | [Esc] normal mode | [Tab] switch pane",
+        ),
+        TuiMode::Visual => (
+            Span::styled(
+                " VISUAL ",
+                Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
+            ),
+            " | [j/k] expand selection | [y] yank | [Esc] cancel",
         ),
     };
 
@@ -994,6 +1229,39 @@ mod tests {
         // Setting insert mode manually
         app.mode = TuiMode::Insert;
         assert_eq!(app.mode, TuiMode::Insert);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_tui_app_visual_mode_selection_and_yank_paste() {
+        let temp_dir = std::env::temp_dir().join("orbit_test_tui_visual");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(temp_dir.join("file_a.rs"), "fn a() {}").unwrap();
+        std::fs::write(temp_dir.join("file_b.rs"), "fn b() {}").unwrap();
+
+        let mut app = TuiApp::new(&temp_dir);
+        assert_eq!(app.mode, TuiMode::Insert);
+
+        // Switch to Normal mode
+        app.mode = TuiMode::Normal;
+        assert_eq!(app.mode, TuiMode::Normal);
+
+        // Switch to Visual mode
+        app.mode = TuiMode::Visual;
+        app.visual_start = 0;
+        app.visual_cursor = 1;
+        assert_eq!(app.mode, TuiMode::Visual);
+
+        // Yank simulated content
+        app.yank_buffer = "fn a() {}\nfn b() {}".to_string();
+        app.mode = TuiMode::Normal;
+
+        // Paste into input_text
+        app.active_pane = ActivePane::Input;
+        app.input_text.push_str(&app.yank_buffer);
+        assert_eq!(app.input_text, "fn a() {}\nfn b() {}");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
