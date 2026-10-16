@@ -897,6 +897,7 @@ mod tests {
 
     #[test]
     fn test_highlight_rust_keywords_and_types() {
+        colored::control::set_override(true);
         let code = "pub fn calculate_sum(a: i32, b: i32) -> Result<i32, String> {";
         let highlighted = highlight_rust(code);
         assert!(!highlighted.is_empty());
@@ -930,6 +931,7 @@ mod tests {
 
     #[test]
     fn test_highlight_markdown_headers_and_spans() {
+        colored::control::set_override(true);
         let h1 = highlight_markdown_line("# Project Orbit");
         assert!(h1.contains("\u{1b}["));
 
