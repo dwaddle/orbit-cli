@@ -17,6 +17,7 @@ pub mod checkpoint;
 pub mod compile_guard;
 pub mod context;
 pub mod git_context;
+pub mod highlight;
 mod mcp;
 pub mod outline;
 pub mod patch;
@@ -78,6 +79,8 @@ pub struct AppConfig {
     pub compile_guard_enabled: bool,
     #[serde(default = "default_true")]
     pub self_healing_enabled: bool,
+    #[serde(default = "default_true")]
+    pub syntax_highlighting: bool,
 }
 
 impl Default for AppConfig {
@@ -94,6 +97,7 @@ impl Default for AppConfig {
             adversarial_review_enabled: false,
             compile_guard_enabled: true,
             self_healing_enabled: true,
+            syntax_highlighting: true,
         }
     }
 }
@@ -899,6 +903,8 @@ pub async fn stream_completion(state: &AgentState) -> Result<String> {
 
         let mut stream = resp.bytes_stream().eventsource();
         let mut full_text = String::new();
+        let mut highlighter =
+            highlight::StreamingHighlighter::new(state.config.syntax_highlighting);
 
         while let Some(event) = stream.next().await {
             match event {
@@ -908,8 +914,7 @@ pub async fn stream_completion(state: &AgentState) -> Result<String> {
                     }
                     if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(&evt.data) {
                         if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
-                            print!("{}", content);
-                            io::stdout().flush()?;
+                            highlighter.feed(content);
                             full_text.push_str(content);
                         }
                     }
@@ -917,6 +922,7 @@ pub async fn stream_completion(state: &AgentState) -> Result<String> {
                 Err(_) => break,
             }
         }
+        highlighter.flush();
         println!("\n");
         return Ok(full_text);
     }
@@ -1141,6 +1147,9 @@ async fn main() -> Result<()> {
                             );
                             println!(
                                 "  /tools                 - Toggle auto tool execution ON/OFF"
+                            );
+                            println!(
+                                "  /highlight / /syntax   - Toggle real-time streaming syntax highlighting ON/OFF"
                             );
                             println!("  /tui                   - Launch Ratatui fullscreen split TUI mode");
                             println!("  /clear                 - Clear chat history");
@@ -1395,6 +1404,19 @@ async fn main() -> Result<()> {
                                     "ENABLED".bold().green()
                                 } else {
                                     "DISABLED".yellow()
+                                }
+                            );
+                            continue;
+                        }
+                        "/highlight" | "/syntax" => {
+                            state.config.syntax_highlighting = !state.config.syntax_highlighting;
+                            let _ = state.save_config();
+                            println!(
+                                "Real-time streaming syntax highlighting set to: {}",
+                                if state.config.syntax_highlighting {
+                                    "ENABLED (Rust, Python, TS/JS, Go, Bash, SQL, JSON, TOML, C/C++)".bold().green()
+                                } else {
+                                    "DISABLED (Raw stream)".yellow()
                                 }
                             );
                             continue;

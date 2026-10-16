@@ -43,6 +43,7 @@ orbit >
 - **🛡️ Provider Outage & Rate-Limit Auto-Failover**: Resilient multi-model retry chain that recovers from HTTP 429 rate limits or 5xx outages without dropping conversation context (`/fallback`).
 - **🌐 OpenRouter Multi-Model Flexibility**: Dynamically query, search, and switch between state-of-the-art models (`claude-sonnet-4.5`, `deepseek-r1`, `gpt-4o`, `gemini-2.5-pro`, `qwen`, etc.) via `/model`.
 - **⚡ Real-Time Streaming**: Low-latency token streaming using Server-Sent Events (SSE).
+- **🎨 Real-Time Streaming Syntax Highlighting**: Live line-buffered syntax coloring for markdown code fences (Rust, Python, TS/JS, Go, Bash, SQL, JSON, TOML, YAML, C/C++) and markdown formatting (headers, inline code, bold, bullets, quotes) with elegant visual code borders (`/highlight` or `/syntax`).
 - **🛠️ 11 Autonomous Built-in Tools**:
   - `run_command`: Local shell execution and stdout/stderr capture.
   - `view_file`: Workspace file exploration.
@@ -136,6 +137,7 @@ cargo install --path .
 | `/file <path>` | Inject an entire file into the conversation context |
 | `/tools` | Toggle autonomous tool execution ON / OFF |
 | `/clear` | Clear active conversation history |
+| `/highlight` / `/syntax` | Toggle real-time streaming syntax highlighting ON / OFF |
 | `/key <key>` | Update OpenRouter API key |
 | `/help` | Display command help |
 | `/exit` | Exit the CLI |
