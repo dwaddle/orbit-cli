@@ -33,16 +33,22 @@ orbit >
 - **📋 Project Rules Auto-Discovery**: Hierarchical upward search for `.orbitrules`, `AGENTS.md`, `.agents/AGENTS.md`, and `.orbit/rules.md`, automatically injected into the system prompt.
 - **💰 OpenRouter Prompt Caching**: Injects explicit ephemeral `cache_control` headers into static system prompts, project rules, and reference files, cutting token costs by up to 90% on Claude and DeepSeek.
 - **⚡ Hybrid Model Cascading & Auto-Routing**: Dynamically routes exploration, inspection, and planning queries to fast models (`gemini-2.5-flash`), escalating to heavy reasoners (`claude-sonnet-4.5`, `deepseek-r1`) for implementation and synthesis (`/cascade`).
+- **🎯 Search-and-Replace Surgical Patching (Aider-style)**: Targeted `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE` in-place patching that saves 80-90% tokens and eliminates whole-file hallucination regressions (`apply_patch`).
+- **🛡️ AST Compile Guard & Self-Healing Loop**: Real-time post-edit compiler check (`cargo check`, `tsc --noEmit`, `py_compile`, `go vet`) with autonomous error diagnostic feedback to self-heal code errors before user review (`/guard`, `/heal`, `/compile`).
+- **⏪ Instant Checkpoint & Time-Machine Rollback**: Automatic in-memory snapshot captured before any file modification, enabling instant single-command rollback (`/undo` and `/checkpoints`).
+- **🧪 Deterministic Test-Driven Development Loop**: Autonomous Red -> Green -> Refactor cycle driven by the local test runner (`/tdd` and `tdd_cycle`).
 - **🕸️ Subagent Directed Acyclic Graph (DAG) Orchestration**: Parallel execution of multi-agent dependency graphs via Tokio channels, with upstream task outputs automatically injected into downstream prompts (`/dag audit`, `/dag feature`, or `run_dag`).
 - **🛡️ Dual-Agent Adversarial Review**: Independent critique subagent evaluating proposed code and git diffs across 5 axes (correctness, security vulnerabilities, error handling, test coverage, and performance) with an optional automated post-write safety hook (`/review`, `/adversarial`, or `adversarial_review`).
 - **🔭 Background File Watcher & Test Loop**: Cross-platform filesystem monitoring via `notify`, 400ms debounced test runner (supporting `cargo test`, `pytest`, `bun/npm test`, and `go test`), with instantaneous pass/fail diagnostics (`orbit-cli watch` or `/watch`).
 - **🛡️ Provider Outage & Rate-Limit Auto-Failover**: Resilient multi-model retry chain that recovers from HTTP 429 rate limits or 5xx outages without dropping conversation context (`/fallback`).
 - **🌐 OpenRouter Multi-Model Flexibility**: Dynamically query, search, and switch between state-of-the-art models (`claude-sonnet-4.5`, `deepseek-r1`, `gpt-4o`, `gemini-2.5-pro`, `qwen`, etc.) via `/model`.
 - **⚡ Real-Time Streaming**: Low-latency token streaming using Server-Sent Events (SSE).
-- **🛠️ 9 Autonomous Built-in Tools**:
+- **🛠️ 11 Autonomous Built-in Tools**:
   - `run_command`: Local shell execution and stdout/stderr capture.
   - `view_file`: Workspace file exploration.
   - `write_file`: In-place code generation and editing.
+  - `apply_patch`: Aider-style surgical search/replace block patcher.
+  - `tdd_cycle`: Autonomous Red -> Green -> Refactor test-driven loop.
   - `code_search`: BM25 keyword search across workspace code.
   - `code_outline`: Symbol map extraction for files or directories.
   - `git_context`: Log, blame, diff, and pickaxe search.
@@ -108,6 +114,12 @@ cargo install --path .
 | `/search <query>` | Search workspace code using in-memory BM25 index |
 | `/outline [path]` | Generate codebase symbol outline (Rust, Python, TS/JS, Go) |
 | `/git <subcmd> [args]` | Inspect git context (`log`, `blame`, `diff`, `search`) |
+| `/undo` | Instant rollback of last file edit to previous checkpoint |
+| `/checkpoints` | List recent file checkpoints and snapshot stack |
+| `/compile` | Run instant workspace AST compile & type check |
+| `/guard` | Toggle AST Compile Guard (auto cargo check) ON / OFF |
+| `/heal` | Toggle compiler diagnostic self-healing loop ON / OFF |
+| `/tdd <spec>` | Autonomous Red -> Green -> Refactor test-driven development loop |
 | `/dag <audit\|feature>` | Run parallel multi-agent DAG workflow with dependency aggregation |
 | `/review [file\|diff]` | Run independent 5-axis adversarial security and quality review |
 | `/adversarial` | Toggle automatic adversarial review on file writes ON / OFF |

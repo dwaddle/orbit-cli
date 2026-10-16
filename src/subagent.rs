@@ -363,7 +363,12 @@ pub fn create_feature_dag(feature_spec: &str) -> SubagentDag {
     dag
 }
 
-async fn run_subagent_task(model: &str, role: &str, prompt: &str, api_key: &str) -> Result<String> {
+pub async fn run_subagent_task(
+    model: &str,
+    role: &str,
+    prompt: &str,
+    api_key: &str,
+) -> Result<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(45))
         .connect_timeout(std::time::Duration::from_secs(5))

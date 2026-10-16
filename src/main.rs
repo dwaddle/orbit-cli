@@ -13,15 +13,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
+pub mod checkpoint;
+pub mod compile_guard;
 pub mod context;
 pub mod git_context;
 mod mcp;
 pub mod outline;
+pub mod patch;
 pub mod review;
 pub mod routing;
 pub mod rules;
 pub mod search_index;
 pub mod subagent;
+pub mod tdd;
 pub mod tui;
 pub mod watcher;
 
@@ -70,6 +74,10 @@ pub struct AppConfig {
     pub fallback_models: Vec<String>,
     #[serde(default)]
     pub adversarial_review_enabled: bool,
+    #[serde(default = "default_true")]
+    pub compile_guard_enabled: bool,
+    #[serde(default = "default_true")]
+    pub self_healing_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -84,6 +92,8 @@ impl Default for AppConfig {
             heavy_model: default_heavy_model(),
             fallback_models: default_fallback_models(),
             adversarial_review_enabled: false,
+            compile_guard_enabled: true,
+            self_healing_enabled: true,
         }
     }
 }
@@ -119,6 +129,8 @@ pub struct AgentState {
     pub code_index: Mutex<Option<Arc<search_index::CodeSearchIndex>>>,
     pub workspace_dir: PathBuf,
     pub active_watcher: Arc<Mutex<Option<Arc<watcher::OrbitWatcher>>>>,
+    pub checkpoint_mgr: checkpoint::CheckpointManager,
+    pub compile_guard: compile_guard::CompileGuard,
 }
 
 impl AgentState {
@@ -164,6 +176,8 @@ impl AgentState {
 
         let workspace_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let project_rules = rules::ProjectRules::discover(&workspace_dir);
+        let checkpoint_mgr = checkpoint::CheckpointManager::new();
+        let compile_guard = compile_guard::CompileGuard::new(&workspace_dir);
 
         Ok(Self {
             config,
@@ -178,6 +192,8 @@ impl AgentState {
             code_index: Mutex::new(None),
             workspace_dir,
             active_watcher: Arc::new(Mutex::new(None)),
+            checkpoint_mgr,
+            compile_guard,
         })
     }
 
@@ -287,6 +303,17 @@ impl AgentState {
             ```\n\n\
             ```tool:run_dag\n\
             audit <target> OR feature <feature spec>\n\
+            ```\n\n\
+            ```tool:apply_patch\n\
+            path: <file path>\n\
+            <<<<<<< SEARCH\n\
+            <exact code to find>\n\
+            =======\n\
+            <replacement code>\n\
+            >>>>>>> REPLACE\n\
+            ```\n\n\
+            ```tool:tdd_cycle\n\
+            <feature specification>\n\
             ```\n\n",
             base
         );
@@ -453,9 +480,34 @@ async fn execute_tool(tool_name: &str, body: &str, state: &AgentState) -> String
             if path.is_empty() {
                 return "Error: Empty path specified for write_file".to_string();
             }
+
+            // Snapshot before write
+            state
+                .checkpoint_mgr
+                .record_before_modify(Path::new(path), "write_file");
+
             match fs::write(path, content) {
                 Ok(_) => {
                     let mut res = format!("Successfully wrote {} bytes to {}", content.len(), path);
+
+                    // Compile Guard check
+                    if state.config.compile_guard_enabled {
+                        let comp = state.compile_guard.check();
+                        println!("{}", compile_guard::format_compile_banner(&comp));
+                        res.push_str(&format!(
+                            "\n\n{}",
+                            compile_guard::format_compile_banner(&comp)
+                        ));
+                        if !comp.success && state.config.self_healing_enabled {
+                            println!(
+                                "{}",
+                                "🩹 Compile Guard detected error. Self-healing triggered..."
+                                    .yellow()
+                            );
+                            res.push_str("\n\n[SELF-HEALING REQUIRED]: Compilation failed. Please emit a corrected ```tool:write_file or ```tool:apply_patch immediately to resolve these compiler errors.");
+                        }
+                    }
+
                     if state.config.adversarial_review_enabled && !state.config.api_key.is_empty() {
                         println!("{}", "🛡️ Running automatic adversarial review...".dimmed());
                         match review::AdversarialReviewer::review_code(
@@ -483,6 +535,101 @@ async fn execute_tool(tool_name: &str, body: &str, state: &AgentState) -> String
                     res
                 }
                 Err(e) => format!("Failed to write file {}: {}", path, e),
+            }
+        }
+        "apply_patch" => {
+            let mut parts = body.trim_start().splitn(2, '\n');
+            let first_line = parts.next().unwrap_or("").trim();
+            let (target_path, patch_payload) = if first_line.starts_with("path:") {
+                let p = first_line.strip_prefix("path:").unwrap().trim();
+                (p.to_string(), parts.next().unwrap_or("").to_string())
+            } else if first_line.starts_with("file:") {
+                let p = first_line.strip_prefix("file:").unwrap().trim();
+                (p.to_string(), parts.next().unwrap_or("").to_string())
+            } else {
+                ("".to_string(), body.to_string())
+            };
+
+            // Snapshot target file before patch
+            if !target_path.is_empty() {
+                state
+                    .checkpoint_mgr
+                    .record_before_modify(Path::new(&target_path), "apply_patch");
+            }
+
+            match patch::apply_patch_to_file(&target_path, &patch_payload) {
+                Ok(patch_res) => {
+                    let mut res = format!(
+                        "Successfully applied {} search/replace block(s) to {} (bytes: {} -> {})",
+                        patch_res.blocks_applied,
+                        patch_res.path,
+                        patch_res.original_len,
+                        patch_res.new_len
+                    );
+
+                    // Compile Guard check
+                    if state.config.compile_guard_enabled {
+                        let comp = state.compile_guard.check();
+                        println!("{}", compile_guard::format_compile_banner(&comp));
+                        res.push_str(&format!(
+                            "\n\n{}",
+                            compile_guard::format_compile_banner(&comp)
+                        ));
+                        if !comp.success && state.config.self_healing_enabled {
+                            println!(
+                                "{}",
+                                "🩹 Compile Guard detected error. Self-healing triggered..."
+                                    .yellow()
+                            );
+                            res.push_str("\n\n[SELF-HEALING REQUIRED]: Compilation failed. Please emit a corrected ```tool:apply_patch immediately to fix these compiler errors.");
+                        }
+                    }
+
+                    // Optional Adversarial Review
+                    if state.config.adversarial_review_enabled && !state.config.api_key.is_empty() {
+                        if let Ok(content) = fs::read_to_string(&patch_res.path) {
+                            match review::AdversarialReviewer::review_code(
+                                &patch_res.path,
+                                &content,
+                                "Automatic post-patch safety review",
+                                &state.config.api_key,
+                            )
+                            .await
+                            {
+                                Ok(report) => {
+                                    println!("{}", review::format_review_banner(&report));
+                                    res.push_str(&format!(
+                                        "\n\n[ADVERSARIAL REVIEW: {} (Score: {}/100)]\n{}",
+                                        report.verdict.badge(),
+                                        report.score,
+                                        report.raw_response
+                                    ));
+                                }
+                                Err(e) => println!("Adversarial review warning: {}", e),
+                            }
+                        }
+                    }
+                    res
+                }
+                Err(e) => format!("Failed to apply patch: {}", e),
+            }
+        }
+        "tdd_cycle" => {
+            let spec = body.trim();
+            if spec.is_empty() {
+                "Error: Missing feature specification for tdd_cycle".to_string()
+            } else {
+                match tdd::TddOrchestrator::run_tdd_cycle(
+                    spec,
+                    &state.workspace_dir,
+                    &state.config.api_key,
+                    &state.config.active_model,
+                )
+                .await
+                {
+                    Ok(rep) => tdd::format_tdd_banner(&rep),
+                    Err(e) => format!("TDD cycle execution error: {}", e),
+                }
             }
         }
         "adversarial_review" => {
@@ -889,13 +1036,26 @@ async fn main() -> Result<()> {
             "DISABLED".dimmed()
         }
     );
+    println!(
+        "Engine: Compile Guard: {} | Self-Healing: {} | Checkpoints: READY | Patching: SURGICAL (Aider-style)",
+        if state.config.compile_guard_enabled {
+            "ENABLED".green()
+        } else {
+            "DISABLED".dimmed()
+        },
+        if state.config.self_healing_enabled {
+            "ENABLED".green()
+        } else {
+            "DISABLED".dimmed()
+        }
+    );
     println!("Type `/help` for commands or `/model` to view/select models.\n");
 
     let mut rl = DefaultEditor::new()?;
     let _ = rl.load_history(&state.config_path.with_file_name("history.txt"));
 
     let tool_re = Regex::new(
-        r"```tool:(run_command|view_file|write_file|invoke_subagent|mcp|code_search|code_outline|git_context|adversarial_review|run_dag)\n([\s\S]*?)```",
+        r"```tool:(run_command|view_file|write_file|apply_patch|tdd_cycle|invoke_subagent|mcp|code_search|code_outline|git_context|adversarial_review|run_dag)\n([\s\S]*?)```",
     )?;
 
     loop {
@@ -926,6 +1086,24 @@ async fn main() -> Result<()> {
                                 "  /model                 - List top models & active selection"
                             );
                             println!("  /model <search|id|num> - Filter or switch active OpenRouter model");
+                            println!(
+                                "  /undo                  - Instant checkpoint rollback of last modified file"
+                            );
+                            println!(
+                                "  /checkpoints           - List recent file checkpoints and snapshot stack"
+                            );
+                            println!(
+                                "  /compile / /check      - Run instant workspace compile & AST type check"
+                            );
+                            println!(
+                                "  /guard                 - Toggle AST Compile Guard (auto cargo check) ON/OFF"
+                            );
+                            println!(
+                                "  /heal                  - Toggle compiler diagnostic self-healing loop ON/OFF"
+                            );
+                            println!(
+                                "  /tdd <spec>            - Autonomous Red -> Green -> Refactor test-driven loop"
+                            );
                             println!(
                                 "  /dag [audit|feature]   - Orchestrate concurrent subagent DAG workflows"
                             );
@@ -1537,6 +1715,125 @@ async fn main() -> Result<()> {
                                 _ => {
                                     println!("Usage: /watch [start|stop|run]");
                                 }
+                            }
+                            continue;
+                        }
+                        "/undo" => {
+                            match state.checkpoint_mgr.rollback_last() {
+                                Ok(res) => {
+                                    if res.was_deleted {
+                                        println!(
+                                            "{}",
+                                            format!(
+                                                "⏪ [UNDO] Removed newly created file: {}",
+                                                res.path.display()
+                                            )
+                                            .bold()
+                                            .green()
+                                        );
+                                    } else {
+                                        println!(
+                                            "{}",
+                                            format!(
+                                                "⏪ [UNDO] Restored {} bytes to {} (undid '{}')",
+                                                res.restored_bytes,
+                                                res.path.display(),
+                                                res.action
+                                            )
+                                            .bold()
+                                            .green()
+                                        );
+                                    }
+                                }
+                                Err(e) => println!("{}", format!("❌ Undo failed: {}", e).red()),
+                            }
+                            continue;
+                        }
+                        "/checkpoints" => {
+                            let snapshots = state.checkpoint_mgr.list_checkpoints();
+                            println!("{}", "=== ⏱️ CHECKPOINTS & UNDO STACK ===".bold().cyan());
+                            if snapshots.is_empty() {
+                                println!("No checkpoints recorded yet.");
+                            } else {
+                                for s in snapshots.iter().rev().take(10) {
+                                    println!(
+                                        "• Snapshot #{} [{}] {} (has previous content: {})",
+                                        s.id,
+                                        s.action.yellow(),
+                                        s.path.display().to_string().bold(),
+                                        s.previous_content.is_some()
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                        "/guard" => {
+                            state.config.compile_guard_enabled =
+                                !state.config.compile_guard_enabled;
+                            let _ = state.save_config();
+                            println!(
+                                "AST Compile Guard set to: {}",
+                                if state.config.compile_guard_enabled {
+                                    "ENABLED (automatic compile check after edits)"
+                                        .bold()
+                                        .green()
+                                } else {
+                                    "DISABLED".yellow()
+                                }
+                            );
+                            continue;
+                        }
+                        "/heal" => {
+                            state.config.self_healing_enabled = !state.config.self_healing_enabled;
+                            let _ = state.save_config();
+                            println!(
+                                "Compiler Diagnostic Self-Healing loop set to: {}",
+                                if state.config.self_healing_enabled {
+                                    "ENABLED (automatic self-repair on compiler errors)"
+                                        .bold()
+                                        .green()
+                                } else {
+                                    "DISABLED".yellow()
+                                }
+                            );
+                            continue;
+                        }
+                        "/compile" | "/check" => {
+                            println!("Running workspace AST compile & type check...");
+                            let res = state.compile_guard.check();
+                            println!("{}", compile_guard::format_compile_banner(&res));
+                            continue;
+                        }
+                        "/tdd" => {
+                            if state.config.api_key.is_empty() {
+                                println!(
+                                    "{}",
+                                    "Error: OpenRouter API key is required to run TDD cycle.".red()
+                                );
+                                continue;
+                            }
+                            let spec = arg.trim();
+                            if spec.is_empty() {
+                                println!("Usage: /tdd <feature specification>");
+                                continue;
+                            }
+                            match tdd::TddOrchestrator::run_tdd_cycle(
+                                spec,
+                                &state.workspace_dir,
+                                &state.config.api_key,
+                                &state.config.active_model,
+                            )
+                            .await
+                            {
+                                Ok(rep) => {
+                                    let banner = tdd::format_tdd_banner(&rep);
+                                    println!("\n{}", banner);
+                                    state.history.push(Message {
+                                        role: "assistant".to_string(),
+                                        content: banner,
+                                    });
+                                }
+                                Err(e) => println!("❌ TDD cycle failed: {}", e),
                             }
                             continue;
                         }
