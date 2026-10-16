@@ -20,6 +20,12 @@ use crate::subagent::SubagentStatus;
 use crate::AgentState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiMode {
+    Normal,
+    Insert,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivePane {
     Input,
     FileTree,
@@ -29,6 +35,7 @@ pub enum ActivePane {
 
 pub struct TuiApp {
     pub active_pane: ActivePane,
+    pub mode: TuiMode,
     pub input_text: String,
     pub file_tree: Vec<String>,
     pub selected_file: usize,
@@ -38,6 +45,7 @@ pub struct TuiApp {
     pub streaming_reply: String,
     pub should_quit: bool,
     pub status_message: String,
+    pub pending_key: Option<char>,
 }
 
 impl TuiApp {
@@ -48,6 +56,7 @@ impl TuiApp {
 
         Self {
             active_pane: ActivePane::Input,
+            mode: TuiMode::Insert,
             input_text: String::new(),
             file_tree,
             selected_file: 0,
@@ -56,8 +65,10 @@ impl TuiApp {
             auto_scroll: true,
             streaming_reply: String::new(),
             should_quit: false,
-            status_message: "Press [Tab] to switch panes, [Enter] to submit, [Esc] to exit."
-                .to_string(),
+            status_message:
+                "Vim mode active. [Esc] Normal mode | [i] Insert | [Tab] Switch pane | [q] Quit"
+                    .to_string(),
+            pending_key: None,
         }
     }
 
@@ -68,6 +79,21 @@ impl TuiApp {
             ActivePane::Subagents => ActivePane::Chat,
             ActivePane::Chat => ActivePane::Input,
         };
+        if self.active_pane != ActivePane::Input {
+            self.mode = TuiMode::Normal;
+        }
+    }
+
+    pub fn cycle_pane_reverse(&mut self) {
+        self.active_pane = match self.active_pane {
+            ActivePane::Input => ActivePane::Chat,
+            ActivePane::Chat => ActivePane::Subagents,
+            ActivePane::Subagents => ActivePane::FileTree,
+            ActivePane::FileTree => ActivePane::Input,
+        };
+        if self.active_pane != ActivePane::Input {
+            self.mode = TuiMode::Normal;
+        }
     }
 }
 
@@ -139,6 +165,129 @@ pub async fn run_tui(state: &mut AgentState) -> Result<()> {
     res
 }
 
+async fn submit_input(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut TuiApp,
+    state: &mut AgentState,
+) -> Result<()> {
+    let input = app.input_text.trim().to_string();
+    if input.is_empty() {
+        return Ok(());
+    }
+    app.input_text.clear();
+
+    if input == "/exit" || input == "/quit" {
+        app.should_quit = true;
+        return Ok(());
+    } else if input == "/clear" {
+        state.history.clear();
+        app.streaming_reply.clear();
+        app.chat_scroll = 0;
+        app.auto_scroll = true;
+        app.status_message = "Chat history cleared.".to_string();
+        return Ok(());
+    } else if input == "/help" {
+        state.history.push(crate::Message {
+            role: "system".to_string(),
+            content: "Orbit TUI Vim Keybindings:\n\
+                      - Normal Mode: [i]/[a] Insert mode | [j]/[k] Scroll/Move | [h]/[l] or [Tab] Switch Panes\n\
+                      - Motions: [gg] Jump to top | [G] Jump to bottom | [Ctrl-d]/[Ctrl-u] Half page | [q] Quit\n\
+                      - Insert Mode: Type prompt | [Enter] Submit | [Esc] or [Ctrl-[] Normal mode\n\
+                      - Commands: /clear (clear history), /help (help), /exit or /quit (quit TUI)".to_string(),
+        });
+        app.auto_scroll = true;
+        return Ok(());
+    }
+
+    state.history.push(crate::Message {
+        role: "user".to_string(),
+        content: input,
+    });
+
+    let active_limit = state
+        .available_models
+        .iter()
+        .find(|m| m.id == state.config.active_model)
+        .and_then(|m| m.context_length)
+        .map(|c| c as usize)
+        .unwrap_or(crate::context::DEFAULT_CONTEXT_LIMIT);
+
+    let sys_prompt = state.system_prompt();
+    crate::context::auto_prune_context(
+        &mut state.history,
+        &sys_prompt,
+        active_limit,
+        crate::context::DEFAULT_PRUNE_THRESHOLD,
+    );
+
+    app.auto_scroll = true;
+    app.streaming_reply.clear();
+    app.status_message = format!("Generating response with {}...", state.config.active_model);
+    terminal.draw(|frame| render_ui(frame, app, state))?;
+
+    let full_result = {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let stream_fut = crate::stream_completion_channel(state, tx);
+        tokio::pin!(stream_fut);
+
+        let mut res: Option<Result<String>> = None;
+        while res.is_none() {
+            tokio::select! {
+                result = &mut stream_fut => {
+                    res = Some(result);
+                }
+                Some(chunk) = rx.recv() => {
+                    app.streaming_reply.push_str(&chunk);
+                    terminal.draw(|frame| render_ui(frame, app, state))?;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                    if event::poll(std::time::Duration::from_millis(0))? {
+                        if let Event::Key(key) = event::read()? {
+                            if key.kind == KeyEventKind::Press && (key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))) {
+                                app.status_message = "Generation interrupted by user.".to_string();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        res
+    };
+
+    match full_result {
+        Some(Ok(full_reply)) => {
+            state.history.push(crate::Message {
+                role: "assistant".to_string(),
+                content: full_reply,
+            });
+            app.streaming_reply.clear();
+            app.mode = TuiMode::Insert;
+            app.status_message =
+                "-- INSERT -- Ready. Type prompt | [Esc] Normal mode | [Enter] Submit".to_string();
+        }
+        Some(Err(e)) => {
+            app.status_message = format!("Error: {}", e);
+            if !app.streaming_reply.is_empty() {
+                state.history.push(crate::Message {
+                    role: "assistant".to_string(),
+                    content: std::mem::take(&mut app.streaming_reply),
+                });
+            }
+        }
+        None => {
+            if !app.streaming_reply.is_empty() {
+                state.history.push(crate::Message {
+                    role: "assistant".to_string(),
+                    content: std::mem::take(&mut app.streaming_reply),
+                });
+            }
+        }
+    }
+    terminal.draw(|frame| render_ui(frame, app, state))?;
+    Ok(())
+}
+
 async fn tui_event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut TuiApp,
@@ -150,122 +299,57 @@ async fn tui_event_loop(
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Esc => {
-                            app.should_quit = true;
-                        }
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.should_quit = true;
-                        }
-                        KeyCode::Tab => {
-                            app.cycle_pane();
-                        }
-                        KeyCode::Enter if app.active_pane == ActivePane::Input => {
-                            let input = app.input_text.trim().to_string();
-                            if !input.is_empty() {
+                    // Global interrupt / quit
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        app.should_quit = true;
+                        break;
+                    }
+
+                    match app.mode {
+                        TuiMode::Insert => match key.code {
+                            KeyCode::Esc => {
+                                app.mode = TuiMode::Normal;
+                                app.status_message =
+                                    "-- NORMAL -- [i] Insert | [j/k] Navigate | [q] Quit"
+                                        .to_string();
+                            }
+                            KeyCode::Char('[') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.mode = TuiMode::Normal;
+                                app.status_message =
+                                    "-- NORMAL -- [i] Insert | [j/k] Navigate | [q] Quit"
+                                        .to_string();
+                            }
+                            KeyCode::Tab => {
+                                app.mode = TuiMode::Normal;
+                                app.cycle_pane();
+                            }
+                            KeyCode::BackTab => {
+                                app.mode = TuiMode::Normal;
+                                app.cycle_pane_reverse();
+                            }
+                            KeyCode::Enter => {
+                                submit_input(terminal, app, state).await?;
+                            }
+                            KeyCode::Backspace => {
+                                app.input_text.pop();
+                            }
+                            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 app.input_text.clear();
-                                state.history.push(crate::Message {
-                                    role: "user".to_string(),
-                                    content: input.clone(),
-                                });
-
-                                // Run auto-pruning
-                                let active_limit = state
-                                    .available_models
-                                    .iter()
-                                    .find(|m| m.id == state.config.active_model)
-                                    .and_then(|m| m.context_length)
-                                    .map(|c| c as usize)
-                                    .unwrap_or(crate::context::DEFAULT_CONTEXT_LIMIT);
-
-                                let sys_prompt = state.system_prompt();
-                                crate::context::auto_prune_context(
-                                    &mut state.history,
-                                    &sys_prompt,
-                                    active_limit,
-                                    crate::context::DEFAULT_PRUNE_THRESHOLD,
-                                );
-
-                                app.auto_scroll = true;
-                                app.streaming_reply.clear();
-                                app.status_message = format!(
-                                    "Generating response with {}...",
-                                    state.config.active_model
-                                );
-                                terminal.draw(|frame| render_ui(frame, app, state))?;
-
-                                let full_result = {
-                                    let (tx, mut rx) =
-                                        tokio::sync::mpsc::unbounded_channel::<String>();
-                                    let stream_fut = crate::stream_completion_channel(state, tx);
-                                    tokio::pin!(stream_fut);
-
-                                    let mut res: Option<Result<String>> = None;
-                                    while res.is_none() {
-                                        tokio::select! {
-                                            result = &mut stream_fut => {
-                                                res = Some(result);
-                                            }
-                                            Some(chunk) = rx.recv() => {
-                                                app.streaming_reply.push_str(&chunk);
-                                                terminal.draw(|frame| render_ui(frame, app, state))?;
-                                            }
-                                            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
-                                                if event::poll(std::time::Duration::from_millis(0))? {
-                                                    if let Event::Key(key) = event::read()? {
-                                                        if key.kind == KeyEventKind::Press && (key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))) {
-                                                            app.status_message = "Generation interrupted by user.".to_string();
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    res
-                                };
-
-                                match full_result {
-                                    Some(Ok(full_reply)) => {
-                                        state.history.push(crate::Message {
-                                            role: "assistant".to_string(),
-                                            content: full_reply,
-                                        });
-                                        app.streaming_reply.clear();
-                                        app.status_message = "Ready. [Tab] switch panes | [Up/Down] scroll | [Esc] exit".to_string();
-                                    }
-                                    Some(Err(e)) => {
-                                        app.status_message = format!("Error: {}", e);
-                                        if !app.streaming_reply.is_empty() {
-                                            state.history.push(crate::Message {
-                                                role: "assistant".to_string(),
-                                                content: std::mem::take(&mut app.streaming_reply),
-                                            });
-                                        }
-                                    }
-                                    None => {
-                                        if !app.streaming_reply.is_empty() {
-                                            state.history.push(crate::Message {
-                                                role: "assistant".to_string(),
-                                                content: std::mem::take(&mut app.streaming_reply),
-                                            });
-                                        }
-                                    }
+                            }
+                            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                let trimmed = app.input_text.trim_end();
+                                if let Some(idx) = trimmed.rfind(' ') {
+                                    app.input_text.truncate(idx + 1);
+                                } else {
+                                    app.input_text.clear();
                                 }
-                                terminal.draw(|frame| render_ui(frame, app, state))?;
                             }
-                        }
-                        KeyCode::Char(c) if app.active_pane == ActivePane::Input => {
-                            app.input_text.push(c);
-                        }
-                        KeyCode::Backspace if app.active_pane == ActivePane::Input => {
-                            app.input_text.pop();
-                        }
-                        KeyCode::Up => match app.active_pane {
-                            ActivePane::FileTree if app.selected_file > 0 => {
-                                app.selected_file -= 1;
+                            KeyCode::Char(c) => {
+                                app.input_text.push(c);
                             }
-                            ActivePane::Chat => {
+                            KeyCode::Up => {
                                 if app.auto_scroll {
                                     app.auto_scroll = false;
                                     app.chat_scroll = app.max_chat_scroll.saturating_sub(1);
@@ -273,35 +357,191 @@ async fn tui_event_loop(
                                     app.chat_scroll = app.chat_scroll.saturating_sub(1);
                                 }
                             }
-                            _ => {}
-                        },
-                        KeyCode::Down => match app.active_pane {
-                            ActivePane::FileTree if app.selected_file + 1 < app.file_tree.len() => {
-                                app.selected_file += 1;
-                            }
-                            ActivePane::Chat => {
+                            KeyCode::Down => {
                                 app.chat_scroll = app.chat_scroll.saturating_add(1);
+                                if app.chat_scroll >= app.max_chat_scroll {
+                                    app.auto_scroll = true;
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                if app.auto_scroll {
+                                    app.auto_scroll = false;
+                                    app.chat_scroll = app.max_chat_scroll.saturating_sub(10);
+                                } else {
+                                    app.chat_scroll = app.chat_scroll.saturating_sub(10);
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                app.chat_scroll = app.chat_scroll.saturating_add(10);
                                 if app.chat_scroll >= app.max_chat_scroll {
                                     app.auto_scroll = true;
                                 }
                             }
                             _ => {}
                         },
-                        KeyCode::PageUp if app.active_pane == ActivePane::Chat => {
-                            if app.auto_scroll {
-                                app.auto_scroll = false;
-                                app.chat_scroll = app.max_chat_scroll.saturating_sub(10);
-                            } else {
-                                app.chat_scroll = app.chat_scroll.saturating_sub(10);
+                        TuiMode::Normal => {
+                            let was_g_pending = app.pending_key == Some('g');
+                            app.pending_key = None;
+
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                    app.should_quit = true;
+                                }
+                                KeyCode::Char('i') | KeyCode::Char('a') => {
+                                    app.active_pane = ActivePane::Input;
+                                    app.mode = TuiMode::Insert;
+                                    app.status_message = "-- INSERT -- Type prompt | [Esc] Normal mode | [Enter] Submit".to_string();
+                                }
+                                KeyCode::Char('o') => {
+                                    app.input_text.clear();
+                                    app.active_pane = ActivePane::Input;
+                                    app.mode = TuiMode::Insert;
+                                    app.status_message =
+                                        "-- INSERT -- New prompt | [Esc] Normal mode".to_string();
+                                }
+                                KeyCode::Char('/') => {
+                                    app.active_pane = ActivePane::Input;
+                                    app.mode = TuiMode::Insert;
+                                    app.status_message =
+                                        "-- INSERT -- Search / Prompt | [Esc] Normal mode"
+                                            .to_string();
+                                }
+                                KeyCode::Char('x') => {
+                                    if app.active_pane == ActivePane::Input {
+                                        app.input_text.pop();
+                                    }
+                                }
+                                KeyCode::Tab | KeyCode::Char('w') => {
+                                    app.cycle_pane();
+                                }
+                                KeyCode::BackTab => {
+                                    app.cycle_pane_reverse();
+                                }
+                                KeyCode::Char('b')
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    app.cycle_pane_reverse();
+                                }
+                                KeyCode::Char('h') | KeyCode::Left => match app.active_pane {
+                                    ActivePane::Chat => app.active_pane = ActivePane::FileTree,
+                                    ActivePane::Input => app.active_pane = ActivePane::Subagents,
+                                    _ => app.cycle_pane_reverse(),
+                                },
+                                KeyCode::Char('l') | KeyCode::Right => match app.active_pane {
+                                    ActivePane::FileTree => app.active_pane = ActivePane::Chat,
+                                    ActivePane::Subagents => app.active_pane = ActivePane::Input,
+                                    _ => app.cycle_pane(),
+                                },
+                                KeyCode::Char('j') | KeyCode::Down => match app.active_pane {
+                                    ActivePane::FileTree
+                                        if app.selected_file + 1 < app.file_tree.len() =>
+                                    {
+                                        app.selected_file += 1;
+                                    }
+                                    ActivePane::Chat | ActivePane::Input => {
+                                        app.chat_scroll = app.chat_scroll.saturating_add(1);
+                                        if app.chat_scroll >= app.max_chat_scroll {
+                                            app.auto_scroll = true;
+                                        }
+                                    }
+                                    _ => {}
+                                },
+                                KeyCode::Char('k') | KeyCode::Up => match app.active_pane {
+                                    ActivePane::FileTree if app.selected_file > 0 => {
+                                        app.selected_file -= 1;
+                                    }
+                                    ActivePane::Chat | ActivePane::Input => {
+                                        if app.auto_scroll {
+                                            app.auto_scroll = false;
+                                            app.chat_scroll = app.max_chat_scroll.saturating_sub(1);
+                                        } else {
+                                            app.chat_scroll = app.chat_scroll.saturating_sub(1);
+                                        }
+                                    }
+                                    _ => {}
+                                },
+                                KeyCode::Char('g') => {
+                                    if was_g_pending {
+                                        if app.active_pane == ActivePane::Chat
+                                            || app.active_pane == ActivePane::Input
+                                        {
+                                            app.auto_scroll = false;
+                                            app.chat_scroll = 0;
+                                        } else if app.active_pane == ActivePane::FileTree {
+                                            app.selected_file = 0;
+                                        }
+                                        app.status_message = "Jumped to top.".to_string();
+                                    } else {
+                                        app.pending_key = Some('g');
+                                        app.status_message =
+                                            "Press 'g' again to jump to top (gg)...".to_string();
+                                    }
+                                }
+                                KeyCode::Char('G') => {
+                                    if app.active_pane == ActivePane::Chat
+                                        || app.active_pane == ActivePane::Input
+                                    {
+                                        app.auto_scroll = true;
+                                        app.chat_scroll = app.max_chat_scroll;
+                                    } else if app.active_pane == ActivePane::FileTree {
+                                        app.selected_file = app.file_tree.len().saturating_sub(1);
+                                    }
+                                    app.status_message = "Jumped to bottom.".to_string();
+                                }
+                                KeyCode::Char('d')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                                        || key.code == KeyCode::PageDown =>
+                                {
+                                    app.chat_scroll = app.chat_scroll.saturating_add(10);
+                                    if app.chat_scroll >= app.max_chat_scroll {
+                                        app.auto_scroll = true;
+                                    }
+                                }
+                                KeyCode::Char('u')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                                        || key.code == KeyCode::PageUp =>
+                                {
+                                    if app.auto_scroll {
+                                        app.auto_scroll = false;
+                                        app.chat_scroll = app.max_chat_scroll.saturating_sub(10);
+                                    } else {
+                                        app.chat_scroll = app.chat_scroll.saturating_sub(10);
+                                    }
+                                }
+                                KeyCode::Char('f')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    app.chat_scroll = app.chat_scroll.saturating_add(25);
+                                    if app.chat_scroll >= app.max_chat_scroll {
+                                        app.auto_scroll = true;
+                                    }
+                                }
+                                KeyCode::Char('b')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    if app.auto_scroll {
+                                        app.auto_scroll = false;
+                                        app.chat_scroll = app.max_chat_scroll.saturating_sub(25);
+                                    } else {
+                                        app.chat_scroll = app.chat_scroll.saturating_sub(25);
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if app.active_pane == ActivePane::FileTree {
+                                        if let Some(file) = app.file_tree.get(app.selected_file) {
+                                            app.input_text = format!("/file {}", file);
+                                            app.active_pane = ActivePane::Input;
+                                            app.mode = TuiMode::Insert;
+                                            app.status_message =
+                                                format!("Attached file: {}. [Enter] submit.", file);
+                                        }
+                                    } else if app.active_pane == ActivePane::Input {
+                                        submit_input(terminal, app, state).await?;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
-                        KeyCode::PageDown if app.active_pane == ActivePane::Chat => {
-                            app.chat_scroll = app.chat_scroll.saturating_add(10);
-                            if app.chat_scroll >= app.max_chat_scroll {
-                                app.auto_scroll = true;
-                            }
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -353,6 +593,11 @@ fn render_header(frame: &mut ratatui::Frame, area: Rect, state: &AgentState) {
                 "Rules: None"
             },
             Style::default().fg(Color::Magenta),
+        ),
+        Span::raw(" | Vim: "),
+        Span::styled(
+            if state.config.vim_mode { "ON" } else { "OFF" },
+            Style::default().fg(Color::Cyan).bold(),
         ),
     ])];
 
@@ -607,20 +852,44 @@ fn render_chat_pane(frame: &mut ratatui::Frame, area: Rect, app: &mut TuiApp, st
 }
 
 fn render_input_pane(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp) {
-    let border_color = if app.active_pane == ActivePane::Input {
-        Color::Green
-    } else {
-        Color::DarkGray
+    let (border_color, mode_badge) = match (app.active_pane, app.mode) {
+        (ActivePane::Input, TuiMode::Insert) => (
+            Color::Green,
+            Span::styled(" [INSERT] ", Style::default().fg(Color::Green).bold()),
+        ),
+        (ActivePane::Input, TuiMode::Normal) => (
+            Color::Yellow,
+            Span::styled(" [NORMAL] ", Style::default().fg(Color::Yellow).bold()),
+        ),
+        _ => (
+            Color::DarkGray,
+            Span::styled(" [INACTIVE] ", Style::default().fg(Color::DarkGray)),
+        ),
     };
 
-    let input_p = Paragraph::new(format!("> {}█", app.input_text)).block(
+    let cursor_char = match app.mode {
+        TuiMode::Insert => "█",
+        TuiMode::Normal => "▒",
+    };
+
+    let title_line = Line::from(vec![
+        Span::styled(" ⌨️ Input Prompt", Style::default().bold()),
+        mode_badge,
+        Span::styled(
+            if app.mode == TuiMode::Insert {
+                " [Enter: Send | Esc: Normal] "
+            } else {
+                " [i: Insert | j/k: Scroll | Tab: Pane] "
+            },
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    let input_p = Paragraph::new(format!("> {}{}", app.input_text, cursor_char)).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(Span::styled(
-                " ⌨️ Input Prompt [Enter: Submit] ",
-                Style::default().bold(),
-            ))
+            .title(title_line)
             .border_style(Style::default().fg(border_color)),
     );
 
@@ -628,13 +897,37 @@ fn render_input_pane(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp) {
 }
 
 fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp) {
+    let (mode_badge, mode_hint) = match app.mode {
+        TuiMode::Normal => (
+            Span::styled(
+                " NORMAL ",
+                Style::default().bg(Color::Yellow).fg(Color::Black).bold(),
+            ),
+            " | [j/k] move/scroll | [h/l] panes | [gg/G] top/bot | [i] insert | [q] quit",
+        ),
+        TuiMode::Insert => (
+            Span::styled(
+                " INSERT ",
+                Style::default().bg(Color::Green).fg(Color::Black).bold(),
+            ),
+            " | [Enter] submit prompt | [Esc] normal mode | [Tab] switch pane",
+        ),
+    };
+
     let footer = Paragraph::new(Line::from(vec![
-        Span::styled(" Status: ", Style::default().bold()),
+        mode_badge,
+        Span::raw(" "),
         Span::styled(&app.status_message, Style::default().fg(Color::Cyan)),
-        Span::raw(" | "),
+        Span::raw(mode_hint),
+        Span::raw(" | Pane: "),
         Span::styled(
-            format!("Active Pane: {:?}", app.active_pane),
-            Style::default().fg(Color::Yellow),
+            match app.active_pane {
+                ActivePane::Input => "Input",
+                ActivePane::Chat => "Chat",
+                ActivePane::FileTree => "Files",
+                ActivePane::Subagents => "Subagents",
+            },
+            Style::default().fg(Color::Yellow).bold(),
         ),
     ]));
     frame.render_widget(footer, area);
@@ -675,6 +968,32 @@ mod tests {
         assert_eq!(app.active_pane, ActivePane::Chat);
         app.cycle_pane();
         assert_eq!(app.active_pane, ActivePane::Input);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_tui_app_vim_mode_and_reverse_cycle() {
+        let temp_dir = std::env::temp_dir().join("orbit_test_tui_vim");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut app = TuiApp::new(&temp_dir);
+        assert_eq!(app.active_pane, ActivePane::Input);
+        assert_eq!(app.mode, TuiMode::Insert);
+
+        // Cycling pane away from Input transitions mode to Normal
+        app.cycle_pane();
+        assert_eq!(app.active_pane, ActivePane::FileTree);
+        assert_eq!(app.mode, TuiMode::Normal);
+
+        // Reverse cycling works
+        app.cycle_pane_reverse();
+        assert_eq!(app.active_pane, ActivePane::Input);
+
+        // Setting insert mode manually
+        app.mode = TuiMode::Insert;
+        assert_eq!(app.mode, TuiMode::Insert);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

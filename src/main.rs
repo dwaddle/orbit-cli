@@ -3,8 +3,9 @@ use colored::*;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use regex::Regex;
+use rustyline::config::Configurer;
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::{Config, DefaultEditor, EditMode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
@@ -81,6 +82,8 @@ pub struct AppConfig {
     pub self_healing_enabled: bool,
     #[serde(default = "default_true")]
     pub syntax_highlighting: bool,
+    #[serde(default = "default_true")]
+    pub vim_mode: bool,
 }
 
 impl Default for AppConfig {
@@ -98,6 +101,7 @@ impl Default for AppConfig {
             compile_guard_enabled: true,
             self_healing_enabled: true,
             syntax_highlighting: true,
+            vim_mode: true,
         }
     }
 }
@@ -1101,7 +1105,12 @@ async fn main() -> Result<()> {
     );
     println!("Type `/help` for commands or `/model` to view/select models.\n");
 
-    let mut rl = DefaultEditor::new()?;
+    let rl_config = if state.config.vim_mode {
+        Config::builder().edit_mode(EditMode::Vi).build()
+    } else {
+        Config::builder().edit_mode(EditMode::Emacs).build()
+    };
+    let mut rl = DefaultEditor::with_config(rl_config)?;
     let _ = rl.load_history(&state.config_path.with_file_name("history.txt"));
 
     let tool_re = Regex::new(
@@ -1194,6 +1203,9 @@ async fn main() -> Result<()> {
                             );
                             println!(
                                 "  /highlight / /syntax   - Toggle real-time streaming syntax highlighting ON/OFF"
+                            );
+                            println!(
+                                "  /vim                   - Toggle Vim edit mode (Normal/Insert Vi bindings) ON/OFF"
                             );
                             println!("  /tui                   - Launch Ratatui fullscreen split TUI mode");
                             println!("  /clear                 - Clear chat history");
@@ -1463,6 +1475,26 @@ async fn main() -> Result<()> {
                                     "DISABLED (Raw stream)".yellow()
                                 }
                             );
+                            continue;
+                        }
+                        "/vim" => {
+                            state.config.vim_mode = !state.config.vim_mode;
+                            let _ = state.save_config();
+                            if state.config.vim_mode {
+                                rl.set_edit_mode(EditMode::Vi);
+                                println!(
+                                    "Vim edit mode: {}",
+                                    "ENABLED (Vi command/insert mode active in REPL & TUI)"
+                                        .bold()
+                                        .green()
+                                );
+                            } else {
+                                rl.set_edit_mode(EditMode::Emacs);
+                                println!(
+                                    "Vim edit mode: {}",
+                                    "DISABLED (Standard Emacs mode)".yellow()
+                                );
+                            }
                             continue;
                         }
                         "/tui" => {
