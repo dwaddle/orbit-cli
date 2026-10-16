@@ -1118,8 +1118,22 @@ async fn main() -> Result<()> {
     )?;
 
     loop {
-        let prompt = format!("{} > ", "orbit".bold().magenta());
+        if state.config.vim_mode {
+            print!("\x1b[6 q");
+            let _ = io::stdout().flush();
+        }
+
+        let prompt = if state.config.vim_mode {
+            format!("{}{} > ", "orbit".bold().magenta(), " [vim]".yellow())
+        } else {
+            format!("{} > ", "orbit".bold().magenta())
+        };
         let readline = rl.readline(&prompt);
+
+        if state.config.vim_mode {
+            print!("\x1b[2 q");
+            let _ = io::stdout().flush();
+        }
 
         match readline {
             Ok(line) => {
