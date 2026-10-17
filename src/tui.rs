@@ -926,7 +926,7 @@ fn render_file_tree(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp) {
             Color::Yellow
         }
     } else {
-        Color::DarkGray
+        Color::Blue
     };
 
     let sel_min = app.visual_start.min(app.visual_cursor);
@@ -964,7 +964,7 @@ fn render_file_tree(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp) {
             .border_type(BorderType::Rounded)
             .title(Span::styled(
                 " 📁 Workspace Files ",
-                Style::default().bold(),
+                Style::default().fg(Color::White).bold(),
             ))
             .border_style(Style::default().fg(border_color)),
     );
@@ -976,7 +976,7 @@ fn render_subagents(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp, state:
     let border_color = if app.active_pane == ActivePane::Subagents {
         Color::Yellow
     } else {
-        Color::DarkGray
+        Color::Blue
     };
 
     let tasks = tokio::task::block_in_place(|| {
@@ -984,7 +984,7 @@ fn render_subagents(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp, state:
     });
 
     let items: Vec<ListItem> = if tasks.is_empty() {
-        vec![ListItem::new("No active subagent tasks.").style(Style::default().fg(Color::DarkGray))]
+        vec![ListItem::new("No active subagent tasks.").style(Style::default().fg(Color::Cyan))]
     } else {
         tasks
             .into_iter()
@@ -1014,7 +1014,10 @@ fn render_subagents(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp, state:
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(Span::styled(" 🤖 Subagents ", Style::default().bold()))
+            .title(Span::styled(
+                " 🤖 Subagents ",
+                Style::default().fg(Color::White).bold(),
+            ))
             .border_style(Style::default().fg(border_color)),
     );
 
@@ -1024,10 +1027,11 @@ fn render_subagents(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp, state:
 fn format_message_lines(lines: &mut Vec<Line>, content: &str, default_style: Style) {
     let mut in_code_fence = false;
     for line in content.lines() {
+        let trimmed = line.trim_start();
         if line.starts_with("```tool:") || line.starts_with("[TOOL OUTPUT") {
             lines.push(Line::from(Span::styled(
                 format!("  {}", line),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(Color::Yellow).bold(),
             )));
         } else if line.starts_with("```") {
             in_code_fence = !in_code_fence;
@@ -1036,9 +1040,8 @@ fn format_message_lines(lines: &mut Vec<Line>, content: &str, default_style: Sty
                 Style::default().fg(Color::Cyan).bold(),
             )));
         } else if in_code_fence {
-            let trimmed = line.trim_start();
             let code_style = if trimmed.starts_with("//") || trimmed.starts_with('#') {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(Color::Green)
             } else if trimmed.starts_with("fn ")
                 || trimmed.starts_with("pub ")
                 || trimmed.starts_with("let ")
@@ -1046,11 +1049,33 @@ fn format_message_lines(lines: &mut Vec<Line>, content: &str, default_style: Sty
                 || trimmed.starts_with("class ")
                 || trimmed.starts_with("import ")
             {
-                Style::default().fg(Color::LightMagenta)
+                Style::default().fg(Color::LightMagenta).bold()
             } else {
-                Style::default().fg(Color::LightCyan)
+                Style::default().fg(Color::White)
             };
             lines.push(Line::from(Span::styled(format!("  {}", line), code_style)));
+        } else if trimmed.starts_with("===")
+            || (trimmed.starts_with('[') && trimmed.ends_with("):"))
+        {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", line),
+                Style::default().fg(Color::Cyan).bold(),
+            )));
+        } else if let Some((left, right)) = trimmed.split_once(" — ") {
+            if left.starts_with("• ") {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("    {}", left),
+                        Style::default().fg(Color::LightGreen).bold(),
+                    ),
+                    Span::styled(format!(" — {}", right), Style::default().fg(Color::White)),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", line),
+                    default_style,
+                )));
+            }
         } else {
             lines.push(Line::from(Span::styled(
                 format!("  {}", line),
@@ -1065,22 +1090,22 @@ pub fn build_chat_lines(state: &AgentState, streaming_reply: &str) -> Vec<Line<'
     if state.history.is_empty() && streaming_reply.is_empty() {
         lines.push(Line::from(Span::styled(
             "Welcome to Orbit TUI! Type your prompt below and press [Enter].",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Cyan).bold(),
         )));
     } else {
         for msg in &state.history {
             let (role_span, content_style) = match msg.role.as_str() {
                 "user" => (
                     Span::styled("🧑 User: ", Style::default().fg(Color::Magenta).bold()),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(Color::White).bold(),
                 ),
                 "assistant" => (
                     Span::styled("🤖 Orbit: ", Style::default().fg(Color::Green).bold()),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(Color::White),
                 ),
                 "system" => (
                     Span::styled("⚙️ System: ", Style::default().fg(Color::Cyan).bold()),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::White),
                 ),
                 _ => (
                     Span::styled(format!("{}: ", msg.role), Style::default().bold()),
@@ -1101,7 +1126,7 @@ pub fn build_chat_lines(state: &AgentState, streaming_reply: &str) -> Vec<Line<'
             format_message_lines(
                 &mut lines,
                 streaming_reply,
-                Style::default().fg(Color::Gray),
+                Style::default().fg(Color::White),
             );
             lines.push(Line::from(""));
         }
@@ -1117,7 +1142,7 @@ fn render_chat_pane(frame: &mut ratatui::Frame, area: Rect, app: &mut TuiApp, st
             Color::Yellow
         }
     } else {
-        Color::DarkGray
+        Color::Blue
     };
 
     let mut lines = build_chat_lines(state, &app.streaming_reply);
@@ -1160,7 +1185,10 @@ fn render_chat_pane(frame: &mut ratatui::Frame, area: Rect, app: &mut TuiApp, st
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(Span::styled(title_text, Style::default().bold()))
+                .title(Span::styled(
+                    title_text,
+                    Style::default().fg(Color::White).bold(),
+                ))
                 .border_style(Style::default().fg(border_color)),
         )
         .wrap(Wrap { trim: false })
@@ -1184,7 +1212,7 @@ fn render_input_pane(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp) {
             Span::styled(" [VISUAL] ", Style::default().fg(Color::Magenta).bold()),
         ),
         _ => (
-            Color::DarkGray,
+            Color::Blue,
             Span::styled(
                 match app.mode {
                     TuiMode::Visual => " [VISUAL] ",
@@ -1194,7 +1222,7 @@ fn render_input_pane(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp) {
                 match app.mode {
                     TuiMode::Visual => Style::default().fg(Color::Magenta).bold(),
                     TuiMode::Normal => Style::default().fg(Color::Yellow),
-                    TuiMode::Insert => Style::default().fg(Color::DarkGray),
+                    TuiMode::Insert => Style::default().fg(Color::Cyan),
                 },
             ),
         ),
@@ -1207,7 +1235,7 @@ fn render_input_pane(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp) {
     };
 
     let title_line = Line::from(vec![
-        Span::styled(" ⌨️ Input Prompt", Style::default().bold()),
+        Span::styled(" ⌨️ Input Prompt", Style::default().fg(Color::White).bold()),
         mode_badge,
         Span::styled(
             match app.mode {
@@ -1215,7 +1243,7 @@ fn render_input_pane(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp) {
                 TuiMode::Normal => " [i: Insert | v: Visual | j/k: Scroll | p: Paste | Tab: Pane] ",
                 TuiMode::Visual => " [j/k: Select lines | y: Yank | Esc: Cancel] ",
             },
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Cyan),
         ),
     ]);
 
