@@ -122,6 +122,14 @@ impl McpClient {
             }
         });
         self.send_request("initialize", params).await?;
+        let notif = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        let line = format!("{}\n", serde_json::to_string(&notif)?);
+        let mut stdin_guard = self.stdin.lock().await;
+        stdin_guard.write_all(line.as_bytes()).await?;
+        stdin_guard.flush().await?;
         Ok(())
     }
 
