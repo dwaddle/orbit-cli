@@ -334,10 +334,24 @@ impl AgentState {
         if !self.mcp_tools.is_empty() {
             prompt.push_str("## MCP TOOLS:\n");
             for t in &self.mcp_tools {
+                let params_hint = t
+                    .input_schema
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+                    .map(|obj| {
+                        let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+                        if keys.is_empty() {
+                            "{}".to_string()
+                        } else {
+                            format!("{{ {} }}", keys.join(", "))
+                        }
+                    })
+                    .unwrap_or_else(|| "{}".to_string());
                 prompt.push_str(&format!(
-                    "• MCP Tool [{}/{}]: {}\n",
+                    "• MCP Tool [{}/{}] (args: {}): {}\n",
                     t.server_name,
                     t.name,
+                    params_hint,
                     t.description.as_deref().unwrap_or("No description")
                 ));
             }
@@ -440,15 +454,34 @@ impl AgentState {
     }
 }
 
+pub const TOOL_REGEX_PATTERN: &str = r"```tool:(run_command|view_file|write_file|apply_patch|tdd_cycle|invoke_subagent|mcp|code_search|code_outline|git_context|adversarial_review|run_dag)\n([\s\S]*?)```";
+
+pub async fn execute_tool_quiet(tool_name: &str, body: &str, state: &AgentState) -> String {
+    execute_tool_internal(tool_name, body, state, true).await
+}
+
 async fn execute_tool(tool_name: &str, body: &str, state: &AgentState) -> String {
-    println!(
-        "\n{}",
-        format!("⚙️ Executing Tool: {}", tool_name).bold().yellow()
-    );
+    execute_tool_internal(tool_name, body, state, false).await
+}
+
+async fn execute_tool_internal(
+    tool_name: &str,
+    body: &str,
+    state: &AgentState,
+    quiet: bool,
+) -> String {
+    if !quiet {
+        println!(
+            "\n{}",
+            format!("⚙️ Executing Tool: {}", tool_name).bold().yellow()
+        );
+    }
     match tool_name {
         "run_command" => {
             let cmd = body.trim();
-            println!("$ {}", cmd.bold().white());
+            if !quiet {
+                println!("$ {}", cmd.bold().white());
+            }
             let output = Command::new("bash").arg("-c").arg(cmd).output();
             match output {
                 Ok(out) => {

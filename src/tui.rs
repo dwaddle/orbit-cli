@@ -194,6 +194,60 @@ async fn submit_input(
         app.auto_scroll = true;
         app.status_message = "Chat history cleared.".to_string();
         return Ok(());
+    } else if input == "/mcp" {
+        let mut msg = format!(
+            "=== LOADED MCP SERVERS ({}) & TOOLS ({}) ===\n",
+            state.mcp_clients.len(),
+            state.mcp_tools.len()
+        );
+        if state.mcp_tools.is_empty() {
+            msg.push_str("No MCP servers loaded. Add config to ~/.config/openrouter/mcp.json");
+        } else {
+            for client in &state.mcp_clients {
+                let server_tools: Vec<&crate::mcp::McpTool> = state
+                    .mcp_tools
+                    .iter()
+                    .filter(|t| t.server_name == client.server_name)
+                    .collect();
+                msg.push_str(&format!(
+                    "\n[{}] ({} tools):\n",
+                    client.server_name,
+                    server_tools.len()
+                ));
+                for t in server_tools {
+                    msg.push_str(&format!(
+                        "  • {} — {}\n",
+                        t.name,
+                        t.description.as_deref().unwrap_or("")
+                    ));
+                }
+            }
+        }
+        state.history.push(crate::Message {
+            role: "system".to_string(),
+            content: msg.trim_end().to_string(),
+        });
+        app.auto_scroll = true;
+        app.status_message = format!(
+            "Listed {} MCP tools across {} servers.",
+            state.mcp_tools.len(),
+            state.mcp_clients.len()
+        );
+        return Ok(());
+    } else if input == "/tools" {
+        state.config.tools_enabled = !state.config.tools_enabled;
+        let _ = state.save_config();
+        let status = if state.config.tools_enabled {
+            "ENABLED"
+        } else {
+            "DISABLED"
+        };
+        state.history.push(crate::Message {
+            role: "system".to_string(),
+            content: format!("Tools auto-execution set to: {}", status),
+        });
+        app.auto_scroll = true;
+        return Ok(());
     } else if input == "/help" {
         state.history.push(crate::Message {
             role: "system".to_string(),
@@ -201,7 +255,7 @@ async fn submit_input(
                       - Normal Mode: [i]/[a] Insert mode | [j]/[k] Scroll/Move | [h]/[l] or [Tab] Switch Panes\n\
                       - Motions: [gg] Jump to top | [G] Jump to bottom | [Ctrl-d]/[Ctrl-u] Half page | [q] Quit\n\
                       - Insert Mode: Type prompt | [Enter] Submit | [Esc] or [Ctrl-[] Normal mode\n\
-                      - Commands: /clear (clear history), /help (help), /exit or /quit (quit TUI)".to_string(),
+                      - Commands: /mcp (list MCP servers & tools), /tools (toggle tools), /clear (clear history), /help (help), /exit or /quit (quit TUI)".to_string(),
         });
         app.auto_scroll = true;
         return Ok(());
@@ -212,83 +266,115 @@ async fn submit_input(
         content: input,
     });
 
-    let active_limit = state
-        .available_models
-        .iter()
-        .find(|m| m.id == state.config.active_model)
-        .and_then(|m| m.context_length)
-        .map(|c| c as usize)
-        .unwrap_or(crate::context::DEFAULT_CONTEXT_LIMIT);
+    let tool_re = regex::Regex::new(crate::TOOL_REGEX_PATTERN)?;
 
-    let sys_prompt = state.system_prompt();
-    crate::context::auto_prune_context(
-        &mut state.history,
-        &sys_prompt,
-        active_limit,
-        crate::context::DEFAULT_PRUNE_THRESHOLD,
-    );
+    for _step in 0..8 {
+        let active_limit = state
+            .available_models
+            .iter()
+            .find(|m| m.id == state.config.active_model)
+            .and_then(|m| m.context_length)
+            .map(|c| c as usize)
+            .unwrap_or(crate::context::DEFAULT_CONTEXT_LIMIT);
 
-    app.auto_scroll = true;
-    app.streaming_reply.clear();
-    app.status_message = format!("Generating response with {}...", state.config.active_model);
-    terminal.draw(|frame| render_ui(frame, app, state))?;
+        let sys_prompt = state.system_prompt();
+        crate::context::auto_prune_context(
+            &mut state.history,
+            &sys_prompt,
+            active_limit,
+            crate::context::DEFAULT_PRUNE_THRESHOLD,
+        );
 
-    let full_result = {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let stream_fut = crate::stream_completion_channel(state, tx);
-        tokio::pin!(stream_fut);
+        app.auto_scroll = true;
+        app.streaming_reply.clear();
+        app.status_message = format!("Generating response with {}...", state.config.active_model);
+        terminal.draw(|frame| render_ui(frame, app, state))?;
 
-        let mut res: Option<Result<String>> = None;
-        while res.is_none() {
-            tokio::select! {
-                result = &mut stream_fut => {
-                    res = Some(result);
-                }
-                Some(chunk) = rx.recv() => {
-                    app.streaming_reply.push_str(&chunk);
-                    terminal.draw(|frame| render_ui(frame, app, state))?;
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
-                    if event::poll(std::time::Duration::from_millis(0))? {
-                        if let Event::Key(key) = event::read()? {
-                            if key.kind == KeyEventKind::Press && (key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))) {
-                                app.status_message = "Generation interrupted by user.".to_string();
-                                break;
+        let full_result = {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let stream_fut = crate::stream_completion_channel(state, tx);
+            tokio::pin!(stream_fut);
+
+            let mut res: Option<Result<String>> = None;
+            while res.is_none() {
+                tokio::select! {
+                    result = &mut stream_fut => {
+                        res = Some(result);
+                    }
+                    Some(chunk) = rx.recv() => {
+                        app.streaming_reply.push_str(&chunk);
+                        terminal.draw(|frame| render_ui(frame, app, state))?;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                        if event::poll(std::time::Duration::from_millis(0))? {
+                            if let Event::Key(key) = event::read()? {
+                                if key.kind == KeyEventKind::Press && (key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))) {
+                                    app.status_message = "Generation interrupted by user.".to_string();
+                                    break;
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-        res
-    };
+            res
+        };
 
-    match full_result {
-        Some(Ok(full_reply)) => {
-            state.history.push(crate::Message {
-                role: "assistant".to_string(),
-                content: full_reply,
-            });
-            app.streaming_reply.clear();
-            app.mode = TuiMode::Insert;
-            app.status_message =
-                "-- INSERT -- Ready. Type prompt | [Esc] Normal mode | [Enter] Submit".to_string();
-        }
-        Some(Err(e)) => {
-            app.status_message = format!("Error: {}", e);
-            if !app.streaming_reply.is_empty() {
+        match full_result {
+            Some(Ok(full_reply)) => {
                 state.history.push(crate::Message {
                     role: "assistant".to_string(),
-                    content: std::mem::take(&mut app.streaming_reply),
+                    content: full_reply.clone(),
                 });
+                app.streaming_reply.clear();
+                terminal.draw(|frame| render_ui(frame, app, state))?;
+
+                if state.config.tools_enabled {
+                    let mut tool_executed = false;
+                    for cap in tool_re.captures_iter(&full_reply) {
+                        let tool_name = &cap[1];
+                        let tool_body = &cap[2];
+                        app.status_message = format!("⚙️ Executing tool: {}...", tool_name);
+                        terminal.draw(|frame| render_ui(frame, app, state))?;
+
+                        let tool_result =
+                            crate::execute_tool_quiet(tool_name, tool_body, state).await;
+                        state.history.push(crate::Message {
+                            role: "user".to_string(),
+                            content: format!("[TOOL OUTPUT ({})]:\n{}", tool_name, tool_result),
+                        });
+                        tool_executed = true;
+                    }
+                    if tool_executed {
+                        terminal.draw(|frame| render_ui(frame, app, state))?;
+                        continue;
+                    }
+                }
+
+                app.mode = TuiMode::Insert;
+                app.status_message =
+                    "-- INSERT -- Ready. Type prompt | [Esc] Normal mode | [Enter] Submit"
+                        .to_string();
+                break;
             }
-        }
-        None => {
-            if !app.streaming_reply.is_empty() {
-                state.history.push(crate::Message {
-                    role: "assistant".to_string(),
-                    content: std::mem::take(&mut app.streaming_reply),
-                });
+            Some(Err(e)) => {
+                app.status_message = format!("Error: {}", e);
+                if !app.streaming_reply.is_empty() {
+                    state.history.push(crate::Message {
+                        role: "assistant".to_string(),
+                        content: std::mem::take(&mut app.streaming_reply),
+                    });
+                }
+                break;
+            }
+            None => {
+                if !app.streaming_reply.is_empty() {
+                    state.history.push(crate::Message {
+                        role: "assistant".to_string(),
+                        content: std::mem::take(&mut app.streaming_reply),
+                    });
+                }
+                break;
             }
         }
     }
