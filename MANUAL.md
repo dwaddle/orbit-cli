@@ -274,6 +274,7 @@ Spawns an independent reviewer subagent (`src/review.rs`) that critiques diffs a
 | Command | Arguments | Description |
 |---|---|---|
 | `/help` | None | Show command summary (available in both REPL and TUI). |
+| `/sh` / `!<cmd>` | `<command>` | Execute a local shell command directly in the workspace (available in both REPL and TUI). |
 | `/model` | `[search\|id\|index]` | View active model or search/switch OpenRouter models. |
 | `/undo` | None | Roll back the last file modification to its previous checkpoint. |
 | `/checkpoints` | None | List recorded file snapshots in the current session. |

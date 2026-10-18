@@ -264,8 +264,10 @@ impl AgentState {
     }
 
     pub fn system_prompt(&self) -> String {
-        let base = "You are Orbit, an autonomous AI coding assistant paired with a developer in an interactive CLI session.\n\
-        You have direct system execution tools, codebase intelligence, and subagent invocation capabilities.\n";
+        let base = "You are Orbit, an autonomous AI coding and security engineer paired with a developer in an interactive CLI session.\n\
+        You run directly on the user's local operating system (Linux) and have full access to execute local CLI tools, scripts, binaries, and system commands via ```tool:run_command.\n\
+        When the user asks you to run a program, test an endpoint, scan a target, execute tests, or check system status, USE ```tool:run_command to execute it directly on the local machine.\n\
+        Do NOT claim you lack local machine access. You have full native terminal execution capabilities.\n";
 
         if !self.config.tools_enabled {
             return base.to_string();
@@ -276,8 +278,9 @@ impl AgentState {
             ## AVAILABLE TOOLS:\n\
             To run a tool, emit a block formatted EXACTLY like this:\n\n\
             ```tool:run_command\n\
-            <command to execute in bash>\n\
-            ```\n\n\
+            <command to execute in bash on local machine>\n\
+            ```\n\
+            Execute any local program, binary, script, test suite, or CLI utility (e.g. bash, python3, curl, nmap, nikto, sqlmap, git, cargo, docker, npm) directly on the host machine. Output (STDOUT/STDERR/exit code) is returned to you.\n\n\
             ```tool:view_file\n\
             <path>\n\
             ```\n\n\
@@ -482,12 +485,47 @@ async fn execute_tool_internal(
             if !quiet {
                 println!("$ {}", cmd.bold().white());
             }
-            let output = Command::new("bash").arg("-c").arg(cmd).output();
-            match output {
+            let mut cmd_builder = Command::new("bash");
+            cmd_builder
+                .arg("-c")
+                .arg(cmd)
+                .current_dir(&state.workspace_dir);
+
+            if let Ok(path_var) = std::env::var("PATH") {
+                let home = std::env::var("HOME").unwrap_or_default();
+                cmd_builder.env(
+                    "PATH",
+                    format!(
+                        "{}/bin:{}/.cargo/bin:/usr/local/bin:{}",
+                        home, home, path_var
+                    ),
+                );
+            }
+
+            match cmd_builder.output() {
                 Ok(out) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let mut stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    let mut stderr = String::from_utf8_lossy(&out.stderr).to_string();
                     let code = out.status.code().unwrap_or(-1);
+
+                    const MAX_LINES: usize = 300;
+                    let stdout_lines: Vec<&str> = stdout.lines().collect();
+                    if stdout_lines.len() > MAX_LINES {
+                        stdout = format!(
+                            "{}\n... (truncated, total {} lines)",
+                            stdout_lines[..MAX_LINES].join("\n"),
+                            stdout_lines.len()
+                        );
+                    }
+                    let stderr_lines: Vec<&str> = stderr.lines().collect();
+                    if stderr_lines.len() > MAX_LINES {
+                        stderr = format!(
+                            "{}\n... (truncated, total {} lines)",
+                            stderr_lines[..MAX_LINES].join("\n"),
+                            stderr_lines.len()
+                        );
+                    }
+
                     format!(
                         "Exit Code: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
                         code, stdout, stderr
@@ -1217,7 +1255,7 @@ async fn main() -> Result<()> {
                 }
                 let _ = rl.add_history_entry(input);
 
-                if input.starts_with('/') {
+                if input.starts_with('/') || input.starts_with('!') {
                     let mut parts = input.splitn(2, ' ');
                     let cmd = parts.next().unwrap_or("");
                     let arg = parts.next().unwrap_or("");
@@ -1227,8 +1265,52 @@ async fn main() -> Result<()> {
                             println!("Bye!");
                             break;
                         }
+                        cmd if cmd.starts_with('!') || cmd == "/sh" || cmd == "/exec" => {
+                            let shell_cmd = if cmd.starts_with('!') {
+                                input.strip_prefix('!').unwrap_or("").trim()
+                            } else {
+                                arg.trim()
+                            };
+                            if shell_cmd.is_empty() {
+                                println!("Usage: !<command> or /sh <command>");
+                                continue;
+                            }
+                            println!("$ {}", shell_cmd.bold().white());
+                            let mut cmd_builder = Command::new("bash");
+                            cmd_builder
+                                .arg("-c")
+                                .arg(shell_cmd)
+                                .current_dir(&state.workspace_dir);
+                            if let Ok(path_var) = std::env::var("PATH") {
+                                let home = std::env::var("HOME").unwrap_or_default();
+                                cmd_builder.env(
+                                    "PATH",
+                                    format!(
+                                        "{}/bin:{}/.cargo/bin:/usr/local/bin:{}",
+                                        home, home, path_var
+                                    ),
+                                );
+                            }
+                            match cmd_builder.output() {
+                                Ok(out) => {
+                                    let stdout = String::from_utf8_lossy(&out.stdout);
+                                    let stderr = String::from_utf8_lossy(&out.stderr);
+                                    if !stdout.is_empty() {
+                                        print!("{}", stdout);
+                                    }
+                                    if !stderr.is_empty() {
+                                        eprint!("{}", stderr.red());
+                                    }
+                                }
+                                Err(e) => println!("Failed to execute command: {}", e),
+                            }
+                            continue;
+                        }
                         "/help" => {
                             println!("{}", "=== ORBIT-CLI COMMANDS ===".bold().cyan());
+                            println!(
+                                "  /sh <cmd> / !<cmd>     - Execute local shell command directly in workspace"
+                            );
                             println!(
                                 "  /model                 - List top models & active selection"
                             );
@@ -2141,4 +2223,33 @@ async fn main() -> Result<()> {
 
     let _ = rl.save_history(&state.config_path.with_file_name("history.txt"));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_run_command_execution() {
+        let state = AgentState::new().unwrap();
+        let res = execute_tool_quiet("run_command", "echo 'orbit_local_ok'", &state).await;
+        assert!(
+            res.contains("Exit Code: 0"),
+            "Expected 0 exit code: {}",
+            res
+        );
+        assert!(
+            res.contains("orbit_local_ok"),
+            "Expected stdout output: {}",
+            res
+        );
+    }
+
+    #[tokio::test]
+    async fn test_system_prompt_includes_local_execution() {
+        let state = AgentState::new().unwrap();
+        let prompt = state.system_prompt();
+        assert!(prompt.contains("run_command"));
+        assert!(prompt.contains("local operating system"));
+    }
 }

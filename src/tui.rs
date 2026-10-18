@@ -248,6 +248,53 @@ async fn submit_input(
         });
         app.auto_scroll = true;
         return Ok(());
+    } else if input.starts_with('!') || input.starts_with("/sh ") || input.starts_with("/exec ") {
+        let shell_cmd = if input.starts_with('!') {
+            input.strip_prefix('!').unwrap_or("").trim()
+        } else if input.starts_with("/sh ") {
+            input.strip_prefix("/sh ").unwrap_or("").trim()
+        } else {
+            input.strip_prefix("/exec ").unwrap_or("").trim()
+        };
+        if !shell_cmd.is_empty() {
+            let mut cmd_builder = std::process::Command::new("bash");
+            cmd_builder
+                .arg("-c")
+                .arg(shell_cmd)
+                .current_dir(&state.workspace_dir);
+            if let Ok(path_var) = std::env::var("PATH") {
+                let home = std::env::var("HOME").unwrap_or_default();
+                cmd_builder.env(
+                    "PATH",
+                    format!(
+                        "{}/bin:{}/.cargo/bin:/usr/local/bin:{}",
+                        home, home, path_var
+                    ),
+                );
+            }
+            let result_str = match cmd_builder.output() {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let code = out.status.code().unwrap_or(-1);
+                    let mut res = format!("$ {}\nExit Code: {}\n", shell_cmd, code);
+                    if !stdout.is_empty() {
+                        res.push_str(&format!("STDOUT:\n{}\n", stdout.trim_end()));
+                    }
+                    if !stderr.is_empty() {
+                        res.push_str(&format!("STDERR:\n{}\n", stderr.trim_end()));
+                    }
+                    res
+                }
+                Err(e) => format!("Failed to execute command: {}", e),
+            };
+            state.history.push(crate::Message {
+                role: "system".to_string(),
+                content: result_str,
+            });
+            app.auto_scroll = true;
+            return Ok(());
+        }
     } else if input == "/help" {
         state.history.push(crate::Message {
             role: "system".to_string(),
@@ -255,7 +302,7 @@ async fn submit_input(
                       - Normal Mode: [i]/[a] Insert mode | [j]/[k] Scroll/Move | [h]/[l] or [Tab] Switch Panes\n\
                       - Motions: [gg] Jump to top | [G] Jump to bottom | [Ctrl-d]/[Ctrl-u] Half page | [q] Quit\n\
                       - Insert Mode: Type prompt | [Enter] Submit | [Esc] or [Ctrl-[] Normal mode\n\
-                      - Commands: /mcp (list MCP servers & tools), /tools (toggle tools), /clear (clear history), /help (help), /exit or /quit (quit TUI)".to_string(),
+                      - Commands: /sh <cmd> or !<cmd> (run local shell command), /mcp (list MCP servers & tools), /tools (toggle tools), /clear (clear history), /help (help), /exit or /quit (quit TUI)".to_string(),
         });
         app.auto_scroll = true;
         return Ok(());

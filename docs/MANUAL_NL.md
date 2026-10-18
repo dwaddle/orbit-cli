@@ -384,6 +384,7 @@ Tijdens het streamen van LLM-antwoorden vangt de `StreamingHighlighter` (`src/hi
 | Commando | Parameters | Beschrijving |
 |---|---|---|
 | `/help` | Geen | Toont het beknopte commando-overzicht (beschikbaar in REPL en TUI). |
+| `/sh` / `!<cmd>` | `<commando>` | Voert direct een lokale shell-opdracht uit in de werkdirectory (zowel in REPL als TUI). |
 | `/model` | `[search\|id\|nr]` | Toont het huidige model of zoekt en wisselt van actief model. |
 | `/undo` | Geen | Herstelt de laatste bestandswijziging direct naar het vorige checkpoint. |
 | `/checkpoints`| Geen | Geeft een overzicht van de snapshot-historie en gewijzigde bestanden. |
