@@ -1,6 +1,7 @@
 # 🛰️ Orbit CLI (`orbit-cli`)
 
 [![Rust](https://img.shields.io/badge/rust-2021_edition-orange.svg)](https://www.rust-lang.org/)
+[![Release](https://img.shields.io/github/v/release/dwaddle/orbit-cli?color=brightgreen)](https://github.com/dwaddle/orbit-cli/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/dwaddle/orbit-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/dwaddle/orbit-cli/actions/workflows/ci.yml)
 [![OpenRouter](https://img.shields.io/badge/Powered%20By-OpenRouter-7928CA.svg)](https://openrouter.ai/)
@@ -56,30 +57,37 @@ orbit >
   - `invoke_subagent`: Background subagent task spawning.
   - `adversarial_review`: Ruthless 5-axis security and regression critique.
   - `run_dag`: Concurrent multi-agent workflow execution.
-- **🔌 Model Context Protocol (MCP)**: Native client support for external MCP servers, discovering and routing specialized tool schemas.
+- **🔌 Model Context Protocol (MCP)**: Native client support for external MCP servers (`2024-11-05` JSON-RPC over stdio), discovering and routing specialized tool schemas across both REPL and TUI modes.
 - **💬 Interactive REPL**: Built with `rustyline` for command history, line editing, and slash command workflows.
 
 ---
 
-## 📦 Installation & Build
+## 📦 Installation
 
-### Prerequisites
-- [Rust & Cargo](https://rustup.rs/) (edition 2021 or newer)
-- An [OpenRouter API Key](https://openrouter.ai/keys)
+### Option 1: One-Line Installer (Linux & macOS)
+```bash
+curl -fsSL https://raw.githubusercontent.com/dwaddle/orbit-cli/main/install.sh | sh
+```
+Installs `orbit-cli` (and the `orbit` shorthand symlink) into `~/.local/bin`.
 
-### Build from source
+### Option 2: Cargo (Rust)
+```bash
+cargo install --git https://github.com/dwaddle/orbit-cli
+```
+
+### Option 3: Arch Linux (PKGBUILD)
+```bash
+git clone https://github.com/dwaddle/orbit-cli.git
+cd orbit-cli/packaging/aur && makepkg -si
+```
+
+### Option 4: Build from Source
 ```bash
 git clone https://github.com/dwaddle/orbit-cli.git
 cd orbit-cli
 cargo build --release
 ```
-
 The compiled binary will be located at `target/release/orbit-cli`.
-
-To install it directly into your local cargo path (`~/.cargo/bin`):
-```bash
-cargo install --path .
-```
 
 ---
 

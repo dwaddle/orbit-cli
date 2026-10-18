@@ -1,8 +1,15 @@
 [package]
 name = "orbit-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Lightweight, high-performance terminal AI coding agent in Rust powered by OpenRouter with MCP tool calling, subagents, and streaming REPL"
+authors = ["Rene <dwaddle@users.noreply.github.com>"]
+description = "Lightweight, high-performance terminal AI coding agent in Rust powered by OpenRouter with MCP tool calling, Vim TUI, subagents, and streaming REPL"
+license = "MIT"
+repository = "https://github.com/dwaddle/orbit-cli"
+homepage = "https://github.com/dwaddle/orbit-cli"
+readme = "README.md"
+keywords = ["ai", "agent", "mcp", "openrouter", "tui"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }

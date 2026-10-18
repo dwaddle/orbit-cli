@@ -1,0 +1,21 @@
+# Maintainer: Rene <https://github.com/dwaddle>
+pkgname=orbit-cli-bin
+_pkgname=orbit-cli
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="High-performance autonomous AI coding agent in Rust powered by OpenRouter & MCP"
+arch=('x86_64')
+url="https://github.com/dwaddle/orbit-cli"
+license=('MIT')
+provides=('orbit-cli')
+conflicts=('orbit-cli')
+depends=('gcc-libs' 'glibc' 'openssl')
+source=("${_pkgname}-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz::${url}/releases/download/v${pkgver}/${_pkgname}-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
+sha256sums=('671abe59352ed50afb844df5fe9cde3c05b1820a213bcec1379112e70b146a4b')
+
+package() {
+    install -Dm755 "${srcdir}/orbit-cli" "${pkgdir}/usr/bin/orbit-cli"
+    ln -s "/usr/bin/orbit-cli" "${pkgdir}/usr/bin/orbit"
+    install -Dm644 "${srcdir}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    install -Dm644 "${srcdir}/README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}
