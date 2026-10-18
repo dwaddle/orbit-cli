@@ -11,6 +11,10 @@
 
 > 📖 **Documentation**: Read the full [**User Manual & Technical Reference (`MANUAL.md`)**](MANUAL.md) (or [**Nederlandse Handleiding (`docs/MANUAL_NL.md`)**](docs/MANUAL_NL.md)).
 
+<p align="center">
+  <img src="assets/orbit-tui-showcase.svg" alt="Orbit CLI Fullscreen Split-Pane TUI Showcase" width="100%" />
+</p>
+
 ```text
   ___   ____  ____  ___ _____     ____ _     ___
  / _ \ |  _ \| __ )|_ _|_   _|   / ___| |   |_ _|
@@ -18,10 +22,10 @@
 | |_| ||  _ <| |_) || |  | |    | |___| |___ | |
  \___/ |_| \_\____/|___| |_|     \____|_____|___|
 
-Loaded 7 built-in workspace tools: [run_command, view_file, write_file, code_search, code_outline, git_context, invoke_subagent]
+Loaded 11 built-in workspace tools + 7 MCP servers (31 tools)
 Connected to OpenRouter | Active Model: anthropic/claude-sonnet-4.5
 
-orbit >
+orbit [INSERT] >
 ```
 
 ---
