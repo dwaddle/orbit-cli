@@ -536,24 +536,30 @@ async fn execute_tool_internal(
                     if state.config.compile_guard_enabled {
                         let comp = state.compile_guard.check_for_path(Path::new(path));
                         if comp.command != "none" {
-                            println!("{}", compile_guard::format_compile_banner(&comp));
+                            if !quiet {
+                                println!("{}", compile_guard::format_compile_banner(&comp));
+                            }
                             res.push_str(&format!(
                                 "\n\n{}",
                                 compile_guard::format_compile_banner(&comp)
                             ));
                             if !comp.success && state.config.self_healing_enabled {
-                                println!(
-                                    "{}",
-                                    "🩹 Compile Guard detected error. Self-healing triggered..."
-                                        .yellow()
-                                );
+                                if !quiet {
+                                    println!(
+                                        "{}",
+                                        "🩹 Compile Guard detected error. Self-healing triggered..."
+                                            .yellow()
+                                    );
+                                }
                                 res.push_str("\n\n[SELF-HEALING REQUIRED]: Compilation failed. Please emit a corrected ```tool:write_file or ```tool:apply_patch immediately to resolve these compiler errors.");
                             }
                         }
                     }
 
                     if state.config.adversarial_review_enabled && !state.config.api_key.is_empty() {
-                        println!("{}", "🛡️ Running automatic adversarial review...".dimmed());
+                        if !quiet {
+                            println!("{}", "🛡️ Running automatic adversarial review...".dimmed());
+                        }
                         match review::AdversarialReviewer::review_code(
                             path,
                             content,
@@ -563,7 +569,9 @@ async fn execute_tool_internal(
                         .await
                         {
                             Ok(report) => {
-                                println!("{}", review::format_review_banner(&report));
+                                if !quiet {
+                                    println!("{}", review::format_review_banner(&report));
+                                }
                                 res.push_str(&format!(
                                     "\n\n[ADVERSARIAL REVIEW: {} (Score: {}/100)]\n{}",
                                     report.verdict.badge(),
@@ -572,7 +580,9 @@ async fn execute_tool_internal(
                                 ));
                             }
                             Err(e) => {
-                                println!("Adversarial review warning: {}", e);
+                                if !quiet {
+                                    println!("Adversarial review warning: {}", e);
+                                }
                             }
                         }
                     }
@@ -615,17 +625,21 @@ async fn execute_tool_internal(
                     if state.config.compile_guard_enabled {
                         let comp = state.compile_guard.check_for_path(Path::new(&patch_res.path));
                         if comp.command != "none" {
-                            println!("{}", compile_guard::format_compile_banner(&comp));
+                            if !quiet {
+                                println!("{}", compile_guard::format_compile_banner(&comp));
+                            }
                             res.push_str(&format!(
                                 "\n\n{}",
                                 compile_guard::format_compile_banner(&comp)
                             ));
                             if !comp.success && state.config.self_healing_enabled {
-                                println!(
-                                    "{}",
-                                    "🩹 Compile Guard detected error. Self-healing triggered..."
-                                        .yellow()
-                                );
+                                if !quiet {
+                                    println!(
+                                        "{}",
+                                        "🩹 Compile Guard detected error. Self-healing triggered..."
+                                            .yellow()
+                                    );
+                                }
                                 res.push_str("\n\n[SELF-HEALING REQUIRED]: Compilation failed. Please emit a corrected ```tool:apply_patch immediately to fix these compiler errors.");
                             }
                         }
@@ -643,7 +657,9 @@ async fn execute_tool_internal(
                             .await
                             {
                                 Ok(report) => {
-                                    println!("{}", review::format_review_banner(&report));
+                                    if !quiet {
+                                        println!("{}", review::format_review_banner(&report));
+                                    }
                                     res.push_str(&format!(
                                         "\n\n[ADVERSARIAL REVIEW: {} (Score: {}/100)]\n{}",
                                         report.verdict.badge(),
@@ -651,7 +667,11 @@ async fn execute_tool_internal(
                                         report.raw_response
                                     ));
                                 }
-                                Err(e) => println!("Adversarial review warning: {}", e),
+                                Err(e) => {
+                                    if !quiet {
+                                        println!("Adversarial review warning: {}", e);
+                                    }
+                                }
                             }
                         }
                     }
