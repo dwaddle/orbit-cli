@@ -39,11 +39,12 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
           ARCHIVE="orbit-cli-${TAG}-${{ matrix.target }}.tar.gz"
-          mkdir -p dist
+          mkdir -p dist/docs
           cp "target/${{ matrix.target }}/release/orbit-cli" dist/orbit-cli
           ln -s orbit-cli dist/orbit
-          cp README.md LICENSE dist/
-          tar -C dist -czf "${ARCHIVE}" orbit-cli orbit README.md LICENSE
+          cp README.md MANUAL.md LICENSE dist/
+          cp docs/MANUAL_NL.md dist/docs/
+          tar -C dist -czf "${ARCHIVE}" orbit-cli orbit README.md MANUAL.md LICENSE docs/MANUAL_NL.md
           sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256" || shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
 
       - name: Upload assets to GitHub Release

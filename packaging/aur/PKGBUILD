@@ -11,11 +11,13 @@ provides=('orbit-cli')
 conflicts=('orbit-cli')
 depends=('gcc-libs' 'glibc' 'openssl')
 source=("${_pkgname}-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz::${url}/releases/download/v${pkgver}/${_pkgname}-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
-sha256sums=('671abe59352ed50afb844df5fe9cde3c05b1820a213bcec1379112e70b146a4b')
+sha256sums=('ea560e83c527c8e6f095a420a3fe2c9bcb93e574df51e4ad08c785917f0772dc')
 
 package() {
     install -Dm755 "${srcdir}/orbit-cli" "${pkgdir}/usr/bin/orbit-cli"
     ln -s "/usr/bin/orbit-cli" "${pkgdir}/usr/bin/orbit"
     install -Dm644 "${srcdir}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
     install -Dm644 "${srcdir}/README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+    install -Dm644 "${srcdir}/MANUAL.md" "${pkgdir}/usr/share/doc/${pkgname}/MANUAL.md"
+    install -Dm644 "${srcdir}/docs/MANUAL_NL.md" "${pkgdir}/usr/share/doc/${pkgname}/MANUAL_NL.md"
 }

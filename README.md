@@ -2,11 +2,14 @@
 
 [![Rust](https://img.shields.io/badge/rust-2021_edition-orange.svg)](https://www.rust-lang.org/)
 [![Release](https://img.shields.io/github/v/release/dwaddle/orbit-cli?color=brightgreen)](https://github.com/dwaddle/orbit-cli/releases)
+[![Manual](https://img.shields.io/badge/docs-User_Manual-00ADD8.svg)](MANUAL.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/dwaddle/orbit-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/dwaddle/orbit-cli/actions/workflows/ci.yml)
 [![OpenRouter](https://img.shields.io/badge/Powered%20By-OpenRouter-7928CA.svg)](https://openrouter.ai/)
 
 **Orbit** is a lightweight, high-performance autonomous AI coding agent in Rust. Powered by OpenRouter's multi-model API, Orbit delivers real-time token streaming, Model Context Protocol (MCP) integration, subagent task delegation, multi-language codebase indexing, git intelligence, and both a terminal REPL and a fullscreen split-pane Ratatui TUI.
+
+> 📖 **Documentation**: Read the full [**User Manual & Technical Reference (`MANUAL.md`)**](MANUAL.md) (or [**Nederlandse Handleiding (`docs/MANUAL_NL.md`)**](docs/MANUAL_NL.md)).
 
 ```text
   ___   ____  ____  ___ _____     ____ _     ___
