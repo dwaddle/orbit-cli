@@ -1081,9 +1081,7 @@ fn format_message_lines(lines: &mut Vec<Line>, content: &str, default_style: Sty
                 format!("  {}", line),
                 Style::default().fg(Color::Yellow).bold(),
             )));
-        } else if trimmed.starts_with("✅")
-            || trimmed.starts_with("PASSED")
-        {
+        } else if trimmed.starts_with("✅") || trimmed.starts_with("PASSED") {
             lines.push(Line::from(Span::styled(
                 format!("  {}", line),
                 Style::default().fg(Color::LightGreen).bold(),

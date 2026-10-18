@@ -623,7 +623,9 @@ async fn execute_tool_internal(
 
                     // Compile Guard check
                     if state.config.compile_guard_enabled {
-                        let comp = state.compile_guard.check_for_path(Path::new(&patch_res.path));
+                        let comp = state
+                            .compile_guard
+                            .check_for_path(Path::new(&patch_res.path));
                         if comp.command != "none" {
                             if !quiet {
                                 println!("{}", compile_guard::format_compile_banner(&comp));

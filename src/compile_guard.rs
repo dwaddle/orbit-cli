@@ -28,10 +28,15 @@ pub fn find_project_root(start_dir: &Path) -> Option<(PathBuf, String, Vec<Strin
             ));
         }
         if current.join("tsconfig.json").exists() {
-            let runner = if Path::new("/usr/bin/bun").exists() || Path::new("/home/rene/.bun/bin/bun").exists() {
+            let runner = if Path::new("/usr/bin/bun").exists()
+                || Path::new("/home/rene/.bun/bin/bun").exists()
+            {
                 ("bun".to_string(), vec!["check".to_string()])
             } else {
-                ("npx".to_string(), vec!["tsc".to_string(), "--noEmit".to_string()])
+                (
+                    "npx".to_string(),
+                    vec!["tsc".to_string(), "--noEmit".to_string()],
+                )
             };
             return Some((current, runner.0, runner.1));
         }
@@ -69,7 +74,8 @@ pub fn run_compile_check(workspace_dir: &Path, file_path: Option<&Path>) -> Comp
         // Known non-code document formats skip compile checks
         if let Some(ext) = fp.extension().and_then(|s| s.to_str()) {
             match ext.to_ascii_lowercase().as_str() {
-                "md" | "org" | "txt" | "log" | "csv" | "json" | "toml" | "yaml" | "yml" | "xml" | "html" | "css" => {
+                "md" | "org" | "txt" | "log" | "csv" | "json" | "toml" | "yaml" | "yml" | "xml"
+                | "html" | "css" => {
                     return CompileResult {
                         success: true,
                         command: "none".to_string(),
@@ -85,17 +91,19 @@ pub fn run_compile_check(workspace_dir: &Path, file_path: Option<&Path>) -> Comp
                         Some((
                             fp.parent().unwrap_or(workspace_dir).to_path_buf(),
                             "python3".to_string(),
-                            vec!["-m".to_string(), "py_compile".to_string(), fp.to_string_lossy().to_string()],
+                            vec![
+                                "-m".to_string(),
+                                "py_compile".to_string(),
+                                fp.to_string_lossy().to_string(),
+                            ],
                         ))
                     }
                 }
-                "sh" | "bash" => {
-                    Some((
-                        fp.parent().unwrap_or(workspace_dir).to_path_buf(),
-                        "bash".to_string(),
-                        vec!["-n".to_string(), fp.to_string_lossy().to_string()],
-                    ))
-                }
+                "sh" | "bash" => Some((
+                    fp.parent().unwrap_or(workspace_dir).to_path_buf(),
+                    "bash".to_string(),
+                    vec!["-n".to_string(), fp.to_string_lossy().to_string()],
+                )),
                 _ => find_project_root(fp).or_else(|| find_project_root(workspace_dir)),
             }
         } else {
