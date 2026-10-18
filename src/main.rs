@@ -534,19 +534,21 @@ async fn execute_tool_internal(
 
                     // Compile Guard check
                     if state.config.compile_guard_enabled {
-                        let comp = state.compile_guard.check();
-                        println!("{}", compile_guard::format_compile_banner(&comp));
-                        res.push_str(&format!(
-                            "\n\n{}",
-                            compile_guard::format_compile_banner(&comp)
-                        ));
-                        if !comp.success && state.config.self_healing_enabled {
-                            println!(
-                                "{}",
-                                "🩹 Compile Guard detected error. Self-healing triggered..."
-                                    .yellow()
-                            );
-                            res.push_str("\n\n[SELF-HEALING REQUIRED]: Compilation failed. Please emit a corrected ```tool:write_file or ```tool:apply_patch immediately to resolve these compiler errors.");
+                        let comp = state.compile_guard.check_for_path(Path::new(path));
+                        if comp.command != "none" {
+                            println!("{}", compile_guard::format_compile_banner(&comp));
+                            res.push_str(&format!(
+                                "\n\n{}",
+                                compile_guard::format_compile_banner(&comp)
+                            ));
+                            if !comp.success && state.config.self_healing_enabled {
+                                println!(
+                                    "{}",
+                                    "🩹 Compile Guard detected error. Self-healing triggered..."
+                                        .yellow()
+                                );
+                                res.push_str("\n\n[SELF-HEALING REQUIRED]: Compilation failed. Please emit a corrected ```tool:write_file or ```tool:apply_patch immediately to resolve these compiler errors.");
+                            }
                         }
                     }
 
@@ -611,19 +613,21 @@ async fn execute_tool_internal(
 
                     // Compile Guard check
                     if state.config.compile_guard_enabled {
-                        let comp = state.compile_guard.check();
-                        println!("{}", compile_guard::format_compile_banner(&comp));
-                        res.push_str(&format!(
-                            "\n\n{}",
-                            compile_guard::format_compile_banner(&comp)
-                        ));
-                        if !comp.success && state.config.self_healing_enabled {
-                            println!(
-                                "{}",
-                                "🩹 Compile Guard detected error. Self-healing triggered..."
-                                    .yellow()
-                            );
-                            res.push_str("\n\n[SELF-HEALING REQUIRED]: Compilation failed. Please emit a corrected ```tool:apply_patch immediately to fix these compiler errors.");
+                        let comp = state.compile_guard.check_for_path(Path::new(&patch_res.path));
+                        if comp.command != "none" {
+                            println!("{}", compile_guard::format_compile_banner(&comp));
+                            res.push_str(&format!(
+                                "\n\n{}",
+                                compile_guard::format_compile_banner(&comp)
+                            ));
+                            if !comp.success && state.config.self_healing_enabled {
+                                println!(
+                                    "{}",
+                                    "🩹 Compile Guard detected error. Self-healing triggered..."
+                                        .yellow()
+                                );
+                                res.push_str("\n\n[SELF-HEALING REQUIRED]: Compilation failed. Please emit a corrected ```tool:apply_patch immediately to fix these compiler errors.");
+                            }
                         }
                     }
 
