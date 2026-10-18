@@ -185,7 +185,7 @@ mod tests {
     fn test_token_estimator() {
         let text = "Hello world! This is a test sentence for estimating token counts.";
         let tokens = estimate_tokens(text);
-        assert!(tokens >= 10 && tokens <= 25);
+        assert!((10..=25).contains(&tokens));
     }
 
     #[test]
