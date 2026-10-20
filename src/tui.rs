@@ -103,6 +103,14 @@ impl TuiApp {
             self.mode = TuiMode::Normal;
         }
     }
+
+    pub fn refresh_file_tree(&mut self, workspace_dir: &Path) {
+        let mut file_tree = Vec::new();
+        collect_file_tree(workspace_dir, workspace_dir, 0, &mut file_tree);
+        file_tree.sort();
+        self.file_tree = file_tree;
+        self.selected_file = 0;
+    }
 }
 
 fn collect_file_tree(current_dir: &Path, base_dir: &Path, depth: usize, out: &mut Vec<String>) {
@@ -295,6 +303,52 @@ async fn submit_input(
             app.auto_scroll = true;
             return Ok(());
         }
+    } else if input == "/cd" || input.starts_with("/cd ") {
+        let target_str = if input == "/cd" {
+            ""
+        } else {
+            input.strip_prefix("/cd ").unwrap_or("").trim()
+        };
+        let target_path = if target_str.is_empty() || target_str == "~" {
+            std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        } else if target_str.starts_with("~/") {
+            let home = std::env::var("HOME").unwrap_or_default();
+            std::path::PathBuf::from(format!("{}{}", home, &target_str[1..]))
+        } else {
+            std::path::PathBuf::from(target_str)
+        };
+        match state.change_workspace(&target_path) {
+            Ok(new_ws) => {
+                app.refresh_file_tree(&new_ws);
+                app.status_message = format!("Workspace: {}", new_ws.display());
+                let rules_note = match &state.project_rules {
+                    Some(r) => format!("\nProject Rules: Loaded from {}", r.path.display()),
+                    None => String::new(),
+                };
+                state.history.push(crate::Message {
+                    role: "system".to_string(),
+                    content: format!("Workspace changed to: {}{}", new_ws.display(), rules_note),
+                });
+            }
+            Err(e) => {
+                app.status_message = format!("Error: {}", e);
+                state.history.push(crate::Message {
+                    role: "system".to_string(),
+                    content: format!("Failed to change directory: {}", e),
+                });
+            }
+        }
+        app.auto_scroll = true;
+        return Ok(());
+    } else if input == "/pwd" {
+        state.history.push(crate::Message {
+            role: "system".to_string(),
+            content: format!("Workspace: {}", state.workspace_dir.display()),
+        });
+        app.auto_scroll = true;
+        return Ok(());
     } else if input == "/help" {
         state.history.push(crate::Message {
             role: "system".to_string(),
@@ -302,7 +356,7 @@ async fn submit_input(
                       - Normal Mode: [i]/[a] Insert mode | [j]/[k] Scroll/Move | [h]/[l] or [Tab] Switch Panes\n\
                       - Motions: [gg] Jump to top | [G] Jump to bottom | [Ctrl-d]/[Ctrl-u] Half page | [q] Quit\n\
                       - Insert Mode: Type prompt | [Enter] Submit | [Esc] or [Ctrl-[] Normal mode\n\
-                      - Commands: /sh <cmd> or !<cmd> (run local shell command), /mcp (list MCP servers & tools), /tools (toggle tools), /clear (clear history), /help (help), /exit or /quit (quit TUI)".to_string(),
+                      - Commands: /cd <path> (change workspace), /pwd (current workspace), /sh <cmd> or !<cmd> (run local shell command), /mcp (list MCP servers & tools), /tools (toggle tools), /clear (clear history), /help (help), /exit or /quit (quit TUI)".to_string(),
         });
         app.auto_scroll = true;
         return Ok(());
@@ -1501,5 +1555,26 @@ mod tests {
         assert_eq!(app.input_text, "fn a() {}\nfn b() {}");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_tui_app_refresh_file_tree() {
+        let temp_dir_a = std::env::temp_dir().join("orbit_test_tui_dir_a");
+        let temp_dir_b = std::env::temp_dir().join("orbit_test_tui_dir_b");
+        let _ = std::fs::remove_dir_all(&temp_dir_a);
+        let _ = std::fs::remove_dir_all(&temp_dir_b);
+        std::fs::create_dir_all(&temp_dir_a).unwrap();
+        std::fs::create_dir_all(&temp_dir_b).unwrap();
+        std::fs::write(temp_dir_a.join("file_a.txt"), "A").unwrap();
+        std::fs::write(temp_dir_b.join("file_b.txt"), "B").unwrap();
+
+        let mut app = TuiApp::new(&temp_dir_a);
+        assert_eq!(app.file_tree, vec!["file_a.txt".to_string()]);
+
+        app.refresh_file_tree(&temp_dir_b);
+        assert_eq!(app.file_tree, vec!["file_b.txt".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&temp_dir_a);
+        let _ = std::fs::remove_dir_all(&temp_dir_b);
     }
 }

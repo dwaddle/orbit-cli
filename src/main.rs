@@ -143,7 +143,7 @@ pub struct AgentState {
 }
 
 impl AgentState {
-    fn new() -> Result<Self> {
+    pub fn new(initial_dir: Option<PathBuf>) -> Result<Self> {
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("~/.config"))
             .join("openrouter");
@@ -183,7 +183,24 @@ impl AgentState {
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()?;
 
-        let workspace_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let workspace_dir = match initial_dir {
+            Some(dir) => {
+                let expanded = if dir.to_string_lossy().starts_with("~/") {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    PathBuf::from(format!("{}{}", home, &dir.to_string_lossy()[1..]))
+                } else if dir.to_string_lossy() == "~" {
+                    std::env::var("HOME")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                } else {
+                    dir
+                };
+                let canonical = fs::canonicalize(&expanded).unwrap_or(expanded);
+                let _ = std::env::set_current_dir(&canonical);
+                canonical
+            }
+            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
         let project_rules = rules::ProjectRules::discover(&workspace_dir);
         let checkpoint_mgr = checkpoint::CheckpointManager::new();
         let compile_guard = compile_guard::CompileGuard::new(&workspace_dir);
@@ -204,6 +221,30 @@ impl AgentState {
             checkpoint_mgr,
             compile_guard,
         })
+    }
+
+    pub fn change_workspace(&mut self, new_path: &Path) -> Result<PathBuf> {
+        let expanded = if new_path.to_string_lossy().starts_with("~/") {
+            let home = std::env::var("HOME").unwrap_or_default();
+            PathBuf::from(format!("{}{}", home, &new_path.to_string_lossy()[1..]))
+        } else if new_path.to_string_lossy() == "~" || new_path.as_os_str().is_empty() {
+            std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("."))
+        } else {
+            new_path.to_path_buf()
+        };
+        let canonical = fs::canonicalize(&expanded)
+            .map_err(|e| anyhow::anyhow!("Directory not found `{}`: {}", new_path.display(), e))?;
+        if !canonical.is_dir() {
+            anyhow::bail!("Path `{}` is not a directory", canonical.display());
+        }
+        std::env::set_current_dir(&canonical)?;
+        self.workspace_dir = canonical.clone();
+        *self.code_index.lock().unwrap() = None;
+        self.project_rules = rules::ProjectRules::discover(&self.workspace_dir);
+        self.compile_guard = compile_guard::CompileGuard::new(&self.workspace_dir);
+        Ok(canonical)
     }
 
     pub fn get_code_index(&self) -> Arc<search_index::CodeSearchIndex> {
@@ -1099,9 +1140,33 @@ async fn main() -> Result<()> {
         "=========================================================".cyan()
     );
 
-    let mut state = AgentState::new()?;
-
     let args: Vec<String> = std::env::args().collect();
+    let mut target_dir: Option<PathBuf> = None;
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "-C" || arg == "--dir" || arg == "--workspace" {
+            if i + 1 < args.len() {
+                target_dir = Some(PathBuf::from(&args[i + 1]));
+                i += 1;
+            }
+        } else if let Some(val) = arg.strip_prefix("-C=") {
+            target_dir = Some(PathBuf::from(val));
+        } else if let Some(val) = arg.strip_prefix("--dir=") {
+            target_dir = Some(PathBuf::from(val));
+        } else if let Some(val) = arg.strip_prefix("--workspace=") {
+            target_dir = Some(PathBuf::from(val));
+        } else if !arg.starts_with('-') && arg != "watch" {
+            let p = PathBuf::from(arg);
+            if p.is_dir() {
+                target_dir = Some(p);
+            }
+        }
+        i += 1;
+    }
+
+    let mut state = AgentState::new(target_dir)?;
+
     if args
         .iter()
         .any(|a| a == "watch" || a == "--watch" || a == "-w")
@@ -1265,6 +1330,44 @@ async fn main() -> Result<()> {
                             println!("Bye!");
                             break;
                         }
+                        "/cd" => {
+                            let target_str = arg.trim();
+                            let target_path = if target_str.is_empty() || target_str == "~" {
+                                std::env::var("HOME")
+                                    .map(PathBuf::from)
+                                    .unwrap_or_else(|_| PathBuf::from("."))
+                            } else if target_str.starts_with("~/") {
+                                let home = std::env::var("HOME").unwrap_or_default();
+                                PathBuf::from(format!("{}{}", home, &target_str[1..]))
+                            } else {
+                                PathBuf::from(target_str)
+                            };
+                            match state.change_workspace(&target_path) {
+                                Ok(new_ws) => {
+                                    println!(
+                                        "Workspace changed to: {}",
+                                        new_ws.display().to_string().bold().green()
+                                    );
+                                    if let Some(r) = &state.project_rules {
+                                        println!(
+                                            "Project Rules: Loaded from {}",
+                                            r.path.display().to_string().bold().cyan()
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("{} {}", "Error changing directory:".red(), e);
+                                }
+                            }
+                            continue;
+                        }
+                        "/pwd" => {
+                            println!(
+                                "Workspace: {}",
+                                state.workspace_dir.display().to_string().cyan()
+                            );
+                            continue;
+                        }
                         cmd if cmd.starts_with('!') || cmd == "/sh" || cmd == "/exec" => {
                             let shell_cmd = if cmd.starts_with('!') {
                                 input.strip_prefix('!').unwrap_or("").trim()
@@ -1308,6 +1411,12 @@ async fn main() -> Result<()> {
                         }
                         "/help" => {
                             println!("{}", "=== ORBIT-CLI COMMANDS ===".bold().cyan());
+                            println!(
+                                "  /cd <path>             - Change active workspace directory at runtime"
+                            );
+                            println!(
+                                "  /pwd                   - Print current workspace directory"
+                            );
                             println!(
                                 "  /sh <cmd> / !<cmd>     - Execute local shell command directly in workspace"
                             );
@@ -2231,7 +2340,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_command_execution() {
-        let state = AgentState::new().unwrap();
+        let state = AgentState::new(None).unwrap();
         let res = execute_tool_quiet("run_command", "echo 'orbit_local_ok'", &state).await;
         assert!(
             res.contains("Exit Code: 0"),
@@ -2247,9 +2356,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_system_prompt_includes_local_execution() {
-        let state = AgentState::new().unwrap();
+        let state = AgentState::new(None).unwrap();
         let prompt = state.system_prompt();
         assert!(prompt.contains("run_command"));
         assert!(prompt.contains("local operating system"));
+    }
+
+    #[tokio::test]
+    async fn test_change_workspace_success_and_error() {
+        let temp_dir_1 = std::env::temp_dir().join("orbit_test_ws_1");
+        let temp_dir_2 = std::env::temp_dir().join("orbit_test_ws_2");
+        let _ = std::fs::remove_dir_all(&temp_dir_1);
+        let _ = std::fs::remove_dir_all(&temp_dir_2);
+        std::fs::create_dir_all(&temp_dir_1).unwrap();
+        std::fs::create_dir_all(&temp_dir_2).unwrap();
+
+        let mut state = AgentState::new(Some(temp_dir_1.clone())).unwrap();
+        let canonical_1 = std::fs::canonicalize(&temp_dir_1).unwrap();
+        assert_eq!(state.workspace_dir, canonical_1);
+
+        let res = state.change_workspace(&temp_dir_2).unwrap();
+        let canonical_2 = std::fs::canonicalize(&temp_dir_2).unwrap();
+        assert_eq!(res, canonical_2);
+        assert_eq!(state.workspace_dir, canonical_2);
+
+        let bad_path = std::env::temp_dir().join("orbit_non_existent_dir_12345");
+        let err = state.change_workspace(&bad_path);
+        assert!(err.is_err());
+
+        let _ = std::fs::remove_dir_all(&temp_dir_1);
+        let _ = std::fs::remove_dir_all(&temp_dir_2);
     }
 }

@@ -116,7 +116,14 @@ The compiled binary will be located at `target/release/orbit-cli`.
    orbit-cli --tui
    ```
 
-4. **Or launch the background test runner & file watcher**:
+4. **Specify a workspace directory at startup**:
+   ```bash
+   orbit-cli -C /path/to/project
+   # or with TUI:
+   orbit-cli --tui -C /path/to/project
+   ```
+
+5. **Or launch the background test runner & file watcher**:
    ```bash
    orbit-cli watch
    ```
@@ -127,6 +134,8 @@ The compiled binary will be located at `target/release/orbit-cli`.
 
 | Command | Description |
 |---|---|
+| `/cd <path>` | Switch active workspace directory at runtime (re-indexes code & updates TUI) |
+| `/pwd` | Print current workspace directory |
 | `/search <query>` | Search workspace code using in-memory BM25 index |
 | `/outline [path]` | Generate codebase symbol outline (Rust, Python, TS/JS, Go) |
 | `/git <subcmd> [args]` | Inspect git context (`log`, `blame`, `diff`, `search`) |
