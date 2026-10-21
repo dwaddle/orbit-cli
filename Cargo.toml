@@ -26,3 +26,8 @@ regex = "1.10"
 ratatui = "0.30.2"
 crossterm = "0.29.0"
 notify = "6.1"
+ignore = "0.4"
+fuzzy-matcher = "0.3"
+
+[dev-dependencies]
+tempfile = "3.10"

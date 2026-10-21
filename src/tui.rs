@@ -349,6 +349,61 @@ async fn submit_input(
         });
         app.auto_scroll = true;
         return Ok(());
+    } else if input == "/stats" || input == "/cost" {
+        let summary = state.metrics.format_summary().await;
+        state.history.push(crate::Message {
+            role: "system".to_string(),
+            content: summary,
+        });
+        app.auto_scroll = true;
+        return Ok(());
+    } else if input.starts_with("/grep ") {
+        let pattern = input.strip_prefix("/grep ").unwrap().trim();
+        let config = crate::grep::NativeGrepConfig {
+            pattern: pattern.to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            path_filter: None,
+            max_results: 50,
+        };
+        let out = match crate::grep::NativeGrep::search(&state.workspace_dir, &config) {
+            Ok(matches) => crate::grep::NativeGrep::format_results(&matches, pattern, 50),
+            Err(e) => format!("Grep error: {}", e),
+        };
+        state.history.push(crate::Message {
+            role: "system".to_string(),
+            content: out,
+        });
+        app.auto_scroll = true;
+        return Ok(());
+    } else if input == "/map" {
+        let out = match crate::repo_map::RepoMap::generate(&state.workspace_dir, 80) {
+            Ok(m) => m,
+            Err(e) => format!("Repo map error: {}", e),
+        };
+        state.history.push(crate::Message {
+            role: "system".to_string(),
+            content: out,
+        });
+        app.auto_scroll = true;
+        return Ok(());
+    } else if input.starts_with("/find ") {
+        let query = input.strip_prefix("/find ").unwrap().trim();
+        let matches = if let Some(stripped) = query.strip_prefix('@') {
+            crate::fuzzy_picker::FuzzyPicker::find_symbols(&state.workspace_dir, stripped, 15)
+        } else {
+            crate::fuzzy_picker::FuzzyPicker::find_files(&state.workspace_dir, query, 15)
+        };
+        let out = match matches {
+            Ok(m) => crate::fuzzy_picker::FuzzyPicker::format_results(&m, query),
+            Err(e) => format!("Fuzzy search error: {}", e),
+        };
+        state.history.push(crate::Message {
+            role: "system".to_string(),
+            content: out,
+        });
+        app.auto_scroll = true;
+        return Ok(());
     } else if input == "/help" {
         state.history.push(crate::Message {
             role: "system".to_string(),
@@ -431,22 +486,38 @@ async fn submit_input(
                 terminal.draw(|frame| render_ui(frame, app, state))?;
 
                 if state.config.tools_enabled {
-                    let mut tool_executed = false;
+                    let mut parsed_tools = Vec::new();
                     for cap in tool_re.captures_iter(&full_reply) {
-                        let tool_name = &cap[1];
-                        let tool_body = &cap[2];
-                        app.status_message = format!("⚙️ Executing tool: {}...", tool_name);
+                        parsed_tools.push(crate::dispatch::ParsedTool {
+                            name: cap[1].to_string(),
+                            body: cap[2].to_string(),
+                        });
+                    }
+
+                    if !parsed_tools.is_empty() {
+                        app.status_message = format!(
+                            "⚙️ Executing {} tool(s) (with parallel read-only dispatch)...",
+                            parsed_tools.len()
+                        );
                         terminal.draw(|frame| render_ui(frame, app, state))?;
 
-                        let tool_result =
-                            crate::execute_tool_quiet(tool_name, tool_body, state).await;
-                        state.history.push(crate::Message {
-                            role: "user".to_string(),
-                            content: format!("[TOOL OUTPUT ({})]:\n{}", tool_name, tool_result),
-                        });
-                        tool_executed = true;
-                    }
-                    if tool_executed {
+                        let results = {
+                            let state_ref: &crate::AgentState = &*state;
+                            crate::dispatch::ToolDispatch::execute_batch(
+                                parsed_tools,
+                                move |name, body| async move {
+                                    crate::execute_tool_quiet(&name, &body, state_ref).await
+                                },
+                            )
+                            .await
+                        };
+
+                        for (tool_name, tool_result) in results {
+                            state.history.push(crate::Message {
+                                role: "user".to_string(),
+                                content: format!("[TOOL OUTPUT ({})]:\n{}", tool_name, tool_result),
+                            });
+                        }
                         terminal.draw(|frame| render_ui(frame, app, state))?;
                         continue;
                     }

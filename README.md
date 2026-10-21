@@ -22,7 +22,7 @@
 | |_| ||  _ <| |_) || |  | |    | |___| |___ | |
  \___/ |_| \_\____/|___| |_|     \____|_____|___|
 
-Loaded 11 built-in workspace tools + 7 MCP servers (31 tools)
+Loaded 13 built-in workspace tools + 7 MCP servers (31 tools)
 Connected to OpenRouter | Active Model: anthropic/claude-sonnet-4.5
 
 orbit [INSERT] >
@@ -52,7 +52,12 @@ orbit [INSERT] >
 - **🌐 OpenRouter Multi-Model Flexibility**: Dynamically query, search, and switch between state-of-the-art models (`claude-sonnet-4.5`, `deepseek-r1`, `gpt-4o`, `gemini-2.5-pro`, `qwen`, etc.) via `/model`.
 - **⚡ Real-Time Streaming**: Low-latency token streaming using Server-Sent Events (SSE).
 - **🎨 Real-Time Streaming Syntax Highlighting**: Live line-buffered syntax coloring for markdown code fences (Rust, Python, TS/JS, Go, Bash, SQL, JSON, TOML, YAML, C/C++) and markdown formatting (headers, inline code, bold, bullets, quotes) with elegant visual code borders (`/highlight` or `/syntax`).
-- **🛠️ 11 Autonomous Built-in Tools**:
+- **⚡ Parallel Tool Execution Pipeline**: Concurrently dispatches contiguous batches of read-only tools (`view_file`, `code_search`, `code_outline`, `code_map`, `git_context`, `code_grep`) reducing multi-lookup turn latency by up to 4x while preserving strict ordering for mutating tools.
+- **🗺️ AST PageRank Architecture Repo Map**: Builds a compact, high-density graph of interface signatures and exports weighted by identifier cross-references (`/map` and `code_map`).
+- **🔎 In-Process Native Ripgrep Engine**: Blazing fast codebase searching using `ignore` + `regex`, respecting `.gitignore` without spawning shell subprocesses (`/grep` and `code_grep`).
+- **💰 Real-Time Token Economics & Cost Meter**: Live tracking of prompt tokens, completion tokens, cached prompt savings, tokens/sec speed, TTFT, and estimated USD spend per turn and session (`/stats` and `/cost`).
+- **🔍 Fuzzy File & Symbol Finder**: Instant keyboard-driven fuzzy discovery across files and language symbols powered by `fuzzy-matcher` (`/find <query>` or `/find @symbol`).
+- **🛠️ 13 Autonomous Built-in Tools**:
   - `run_command`: Local shell execution and stdout/stderr capture.
   - `view_file`: Workspace file exploration.
   - `write_file`: In-place code generation and editing.
@@ -60,6 +65,8 @@ orbit [INSERT] >
   - `tdd_cycle`: Autonomous Red -> Green -> Refactor test-driven loop.
   - `code_search`: BM25 keyword search across workspace code.
   - `code_outline`: Symbol map extraction for files or directories.
+  - `code_grep`: Native ripgrep search respecting `.gitignore`.
+  - `code_map`: AST PageRank architectural skeleton.
   - `git_context`: Log, blame, diff, and pickaxe search.
   - `invoke_subagent`: Background subagent task spawning.
   - `adversarial_review`: Ruthless 5-axis security and regression critique.

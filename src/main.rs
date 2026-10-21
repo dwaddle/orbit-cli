@@ -17,12 +17,17 @@ use std::sync::{Arc, Mutex};
 pub mod checkpoint;
 pub mod compile_guard;
 pub mod context;
+pub mod dispatch;
+pub mod fuzzy_picker;
 pub mod git_context;
+pub mod grep;
 pub mod highlight;
 mod mcp;
+pub mod metrics;
 pub mod modal_prompt;
 pub mod outline;
 pub mod patch;
+pub mod repo_map;
 pub mod review;
 pub mod routing;
 pub mod rules;
@@ -107,11 +112,35 @@ impl Default for AppConfig {
     }
 }
 
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ModelPricing {
+    pub prompt: Option<String>,
+    pub completion: Option<String>,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct OpenRouterModel {
     pub id: String,
     pub name: String,
     pub context_length: Option<u64>,
+    #[serde(default)]
+    pub pricing: Option<ModelPricing>,
+}
+
+impl OpenRouterModel {
+    pub fn prompt_price_per_token(&self) -> Option<f64> {
+        self.pricing
+            .as_ref()
+            .and_then(|p| p.prompt.as_deref())
+            .and_then(|s| s.parse().ok())
+    }
+
+    pub fn completion_price_per_token(&self) -> Option<f64> {
+        self.pricing
+            .as_ref()
+            .and_then(|p| p.completion.as_deref())
+            .and_then(|s| s.parse().ok())
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -140,6 +169,7 @@ pub struct AgentState {
     pub active_watcher: Arc<Mutex<Option<Arc<watcher::OrbitWatcher>>>>,
     pub checkpoint_mgr: checkpoint::CheckpointManager,
     pub compile_guard: compile_guard::CompileGuard,
+    pub metrics: metrics::SessionMetrics,
 }
 
 impl AgentState {
@@ -204,6 +234,7 @@ impl AgentState {
         let project_rules = rules::ProjectRules::discover(&workspace_dir);
         let checkpoint_mgr = checkpoint::CheckpointManager::new();
         let compile_guard = compile_guard::CompileGuard::new(&workspace_dir);
+        let metrics = metrics::SessionMetrics::new();
 
         Ok(Self {
             config,
@@ -220,6 +251,7 @@ impl AgentState {
             active_watcher: Arc::new(Mutex::new(None)),
             checkpoint_mgr,
             compile_guard,
+            metrics,
         })
     }
 
@@ -498,7 +530,7 @@ impl AgentState {
     }
 }
 
-pub const TOOL_REGEX_PATTERN: &str = r"```tool:(run_command|view_file|write_file|apply_patch|tdd_cycle|invoke_subagent|mcp|code_search|code_outline|git_context|adversarial_review|run_dag)\n([\s\S]*?)```";
+pub const TOOL_REGEX_PATTERN: &str = r"```tool:(run_command|view_file|write_file|apply_patch|tdd_cycle|invoke_subagent|mcp|code_search|code_outline|git_context|adversarial_review|run_dag|code_grep|code_map)\n([\s\S]*?)```";
 
 pub async fn execute_tool_quiet(tool_name: &str, body: &str, state: &AgentState) -> String {
     execute_tool_internal(tool_name, body, state, true).await
@@ -918,6 +950,35 @@ async fn execute_tool_internal(
                 format!("Error: MCP Server '{}' not found", server)
             }
         }
+        "code_grep" => {
+            let pattern = body.trim();
+            if !quiet {
+                println!("🔎 Grepping codebase for: {}", pattern.bold().white());
+            }
+            let config = grep::NativeGrepConfig {
+                pattern: pattern.to_string(),
+                is_regex: false,
+                case_sensitive: false,
+                path_filter: None,
+                max_results: 80,
+            };
+            match grep::NativeGrep::search(&state.workspace_dir, &config) {
+                Ok(matches) => grep::NativeGrep::format_results(&matches, pattern, 80),
+                Err(e) => format!("Error searching codebase: {}", e),
+            }
+        }
+        "code_map" => {
+            if !quiet {
+                println!(
+                    "{}",
+                    "🗺️ Generating AST Architecture Repo Map...".bold().white()
+                );
+            }
+            match repo_map::RepoMap::generate(&state.workspace_dir, 80) {
+                Ok(map) => map,
+                Err(e) => format!("Error generating repo map: {}", e),
+            }
+        }
         _ => format!("Unknown tool: {}", tool_name),
     }
 }
@@ -1077,6 +1138,10 @@ pub async fn stream_completion_internal(
             io::stdout().flush()?;
         }
 
+        let start_time = std::time::Instant::now();
+        let mut ttft_ms: Option<u128> = None;
+        let mut parsed_usage: Option<metrics::TokenUsage> = None;
+
         let mut stream = resp.bytes_stream().eventsource();
         let mut full_text = String::new();
         let mut highlighter = match &mode {
@@ -1094,6 +1159,9 @@ pub async fn stream_completion_internal(
                     }
                     if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(&evt.data) {
                         if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
+                            if ttft_ms.is_none() {
+                                ttft_ms = Some(start_time.elapsed().as_millis());
+                            }
                             if let Some(h) = &mut highlighter {
                                 h.feed(content);
                             }
@@ -1102,14 +1170,68 @@ pub async fn stream_completion_internal(
                             }
                             full_text.push_str(content);
                         }
+                        if let Some(usage_val) = chunk.get("usage") {
+                            let p = usage_val["prompt_tokens"].as_u64().unwrap_or(0);
+                            let c = usage_val["completion_tokens"].as_u64().unwrap_or(0);
+                            let t = usage_val["total_tokens"].as_u64().unwrap_or(p + c);
+                            let cached = usage_val["prompt_tokens_details"]["cached_tokens"]
+                                .as_u64()
+                                .or_else(|| usage_val["cached_tokens"].as_u64())
+                                .unwrap_or(0);
+                            parsed_usage = Some(metrics::TokenUsage {
+                                prompt_tokens: p,
+                                completion_tokens: c,
+                                total_tokens: t,
+                                cached_tokens: cached,
+                            });
+                        }
                     }
                 }
                 Err(_) => break,
             }
         }
+
+        let duration_ms = start_time.elapsed().as_millis();
+        let usage = parsed_usage.unwrap_or_else(|| {
+            let p = context::estimate_tokens(&format!("{:?}", req_messages)) as u64;
+            let c = context::estimate_tokens(&full_text) as u64;
+            let cached = if state.config.prompt_caching {
+                p.saturating_mul(8) / 10
+            } else {
+                0
+            };
+            metrics::TokenUsage {
+                prompt_tokens: p,
+                completion_tokens: c,
+                total_tokens: p + c,
+                cached_tokens: cached,
+            }
+        });
+
+        let (prompt_price, comp_price) = state
+            .available_models
+            .iter()
+            .find(|m| m.id == *model_candidate)
+            .map(|m| (m.prompt_price_per_token(), m.completion_price_per_token()))
+            .unwrap_or((None, None));
+
+        state
+            .metrics
+            .record_turn(
+                model_candidate,
+                usage,
+                duration_ms,
+                ttft_ms,
+                prompt_price,
+                comp_price,
+            )
+            .await;
+
         if let Some(mut h) = highlighter {
             h.flush();
             println!("\n");
+            let badge = state.metrics.format_badge().await;
+            println!("{}", badge.dimmed());
         }
         return Ok(full_text);
     }
@@ -1458,6 +1580,18 @@ async fn main() -> Result<()> {
                                 "  /subagents             - List active & completed subagent tasks"
                             );
                             println!("  /mcp                   - List loaded MCP servers and available tools");
+                            println!(
+                                "  /stats / /cost         - View real-time token economics, latency & spend"
+                            );
+                            println!(
+                                "  /grep <pattern> [glob] - Blazing fast native ripgrep across codebase"
+                            );
+                            println!(
+                                "  /map                   - Generate compact AST PageRank architecture skeleton"
+                            );
+                            println!(
+                                "  /find <query|@symbol>  - Instant fuzzy file and symbol finder"
+                            );
                             println!("  /search <query>        - Search local codebase symbols and full-text");
                             println!("  /outline [path]        - Generate codebase symbol map and outline");
                             println!("  /git <log|blame|diff>  - Inspect git commit history, blame or diff");
@@ -2217,6 +2351,69 @@ async fn main() -> Result<()> {
                             }
                             continue;
                         }
+                        "/stats" | "/cost" => {
+                            let summary = state.metrics.format_summary().await;
+                            println!("\n{}", summary.cyan());
+                            continue;
+                        }
+                        "/grep" => {
+                            let pattern = arg.trim();
+                            if pattern.is_empty() {
+                                println!("Usage: /grep <pattern> [glob]");
+                            } else {
+                                let mut parts = pattern.splitn(2, ' ');
+                                let pat = parts.next().unwrap_or("").trim();
+                                let filter = parts.next().map(|s| s.trim().to_string());
+                                let config = grep::NativeGrepConfig {
+                                    pattern: pat.to_string(),
+                                    is_regex: false,
+                                    case_sensitive: false,
+                                    path_filter: filter,
+                                    max_results: 50,
+                                };
+                                match grep::NativeGrep::search(&state.workspace_dir, &config) {
+                                    Ok(matches) => {
+                                        println!(
+                                            "\n{}",
+                                            grep::NativeGrep::format_results(&matches, pat, 50)
+                                        );
+                                    }
+                                    Err(e) => println!("❌ Error searching: {}", e),
+                                }
+                            }
+                            continue;
+                        }
+                        "/map" => {
+                            match repo_map::RepoMap::generate(&state.workspace_dir, 100) {
+                                Ok(map) => println!("\n{}", map.cyan()),
+                                Err(e) => println!("❌ Error generating repo map: {}", e),
+                            }
+                            continue;
+                        }
+                        "/find" => {
+                            let query = arg.trim();
+                            let matches = if let Some(stripped) = query.strip_prefix('@') {
+                                fuzzy_picker::FuzzyPicker::find_symbols(
+                                    &state.workspace_dir,
+                                    stripped,
+                                    15,
+                                )
+                            } else {
+                                fuzzy_picker::FuzzyPicker::find_files(
+                                    &state.workspace_dir,
+                                    query,
+                                    15,
+                                )
+                            };
+                            match matches {
+                                Ok(m) => println!(
+                                    "\n{}",
+                                    fuzzy_picker::FuzzyPicker::format_results(&m, query)
+                                ),
+                                Err(e) => println!("❌ Error in fuzzy search: {}", e),
+                            }
+                            continue;
+                        }
                         _ => {
                             println!(
                                 "Unknown command {}. Type `/help` for options.",
@@ -2271,26 +2468,38 @@ async fn main() -> Result<()> {
                             });
 
                             if state.config.tools_enabled {
-                                let mut tool_executed = false;
+                                let mut parsed_tools = Vec::new();
                                 for cap in tool_re.captures_iter(&response_text) {
-                                    let tool_name = &cap[1];
-                                    let tool_body = &cap[2];
-
-                                    let tool_result =
-                                        execute_tool(tool_name, tool_body, &state).await;
-                                    println!("{}\n{}", "Result:".dimmed(), tool_result);
-
-                                    state.history.push(Message {
-                                        role: "user".to_string(),
-                                        content: format!(
-                                            "[TOOL OUTPUT ({})]:\n{}",
-                                            tool_name, tool_result
-                                        ),
+                                    parsed_tools.push(dispatch::ParsedTool {
+                                        name: cap[1].to_string(),
+                                        body: cap[2].to_string(),
                                     });
-                                    tool_executed = true;
                                 }
 
-                                if tool_executed {
+                                if !parsed_tools.is_empty() {
+                                    let results =
+                                        dispatch::ToolDispatch::execute_batch(
+                                            parsed_tools,
+                                            |name, body| {
+                                                let state_ref = &state;
+                                                async move {
+                                                    execute_tool(&name, &body, state_ref).await
+                                                }
+                                            },
+                                        )
+                                        .await;
+
+                                    for (tool_name, tool_result) in results {
+                                        println!("{}\n{}", "Result:".dimmed(), tool_result);
+                                        state.history.push(Message {
+                                            role: "user".to_string(),
+                                            content: format!(
+                                                "[TOOL OUTPUT ({})]:\n{}",
+                                                tool_name, tool_result
+                                            ),
+                                        });
+                                    }
+
                                     println!(
                                         "{}",
                                         "🔄 Feeding tool execution results back to model...".cyan()

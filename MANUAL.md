@@ -248,7 +248,9 @@ Spawns an independent reviewer subagent (`src/review.rs`) that critiques diffs a
 | `apply_patch` | Apply surgical `SEARCH/REPLACE` blocks in place. |
 | `tdd_cycle` | Run autonomous Red -> Green -> Refactor TDD workflows. |
 | `code_search` | Query the in-memory BM25 inverted code index (`/search`). |
+| `code_grep` | Fast regex & literal ripgrep respecting `.gitignore` and binary detection (`/grep`). |
 | `code_outline` | Extract symbol maps (`fn`, `struct`, `class`, `interface`, `trait`) (`/outline`). |
+| `code_map` | AST-aware symbol connectivity graph with PageRank ranking (`/map`). |
 | `git_context` | Inspect commit logs, line-range blame, diffs, and pickaxe search (`/git`). |
 | `invoke_subagent` | Spawn asynchronous background subagents. |
 | `adversarial_review` | Run 5-axis security and quality review on files or git diffs. |
@@ -300,9 +302,13 @@ Spawns an independent reviewer subagent (`src/review.rs`) that critiques diffs a
 | `/subagents` | None | List active and completed background subagent tasks. |
 | `/mcp` | None | List connected MCP servers and their registered tools (REPL and TUI). |
 | `/search` | `<query>` | Search workspace code using the in-memory BM25 index. |
+| `/grep` | `<pattern> [path]` | Native ripgrep search respecting `.gitignore` across the workspace. |
+| `/find` | `<pattern>` / `@symbol` | Fast interactive fuzzy file path and code symbol finder. |
+| `/map` | None | Render AST PageRank repository architecture map. |
 | `/outline` | `[path]` | Generate a multi-language symbol outline. |
 | `/git` | `<log\|blame\|diff\|search>` | Inspect git history, line blame, diffs, or pickaxe search. |
 | `/rules` | None | Display loaded `.orbitrules` / `AGENTS.md` project rules. |
+| `/stats` / `/cost` | None | Show real-time token economics, cache hit rate, TTFT, speed and USD cost. |
 | `/context` | None | Inspect current session token usage and context budget. |
 | `/prune` | None | Manually compress large tool outputs and summarize older turns. |
 | `/file` | `<path>` | Inject a local file directly into the conversation context. |
