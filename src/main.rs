@@ -17,11 +17,14 @@ use std::sync::{Arc, Mutex};
 pub mod checkpoint;
 pub mod compile_guard;
 pub mod context;
+pub mod diff_review;
 pub mod dispatch;
+pub mod export;
 pub mod fuzzy_picker;
 pub mod git_context;
 pub mod grep;
 pub mod highlight;
+pub mod lsp;
 mod mcp;
 pub mod metrics;
 pub mod modal_prompt;
@@ -36,6 +39,7 @@ pub mod subagent;
 pub mod tdd;
 pub mod tui;
 pub mod watcher;
+pub mod worktree;
 
 use mcp::{load_mcp_config, McpClient, McpTool};
 use subagent::{SubagentManager, SubagentStatus};
@@ -90,6 +94,10 @@ pub struct AppConfig {
     pub syntax_highlighting: bool,
     #[serde(default = "default_true")]
     pub vim_mode: bool,
+    #[serde(default)]
+    pub diff_approval_required: bool,
+    #[serde(default = "default_true")]
+    pub live_hud_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -108,6 +116,8 @@ impl Default for AppConfig {
             self_healing_enabled: true,
             syntax_highlighting: true,
             vim_mode: true,
+            diff_approval_required: false,
+            live_hud_enabled: true,
         }
     }
 }
@@ -170,6 +180,7 @@ pub struct AgentState {
     pub checkpoint_mgr: checkpoint::CheckpointManager,
     pub compile_guard: compile_guard::CompileGuard,
     pub metrics: metrics::SessionMetrics,
+    pub active_sandbox: Arc<Mutex<Option<worktree::WorktreeSandbox>>>,
 }
 
 impl AgentState {
@@ -252,6 +263,7 @@ impl AgentState {
             checkpoint_mgr,
             compile_guard,
             metrics,
+            active_sandbox: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -399,6 +411,19 @@ impl AgentState {
             ```\n\n\
             ```tool:tdd_cycle\n\
             <feature specification>\n\
+            ```\n\n\
+            ```tool:worktree_sandbox\n\
+            action: create | diff | apply | discard\n\
+            task: <task name for new sandbox>\n\
+            ```\n\n\
+            ```tool:lsp_query\n\
+            action: hover | definition | symbols\n\
+            path: <file path>\n\
+            line: <1-based line number>\n\
+            col: <1-based col number>\n\
+            ```\n\n\
+            ```tool:export_session\n\
+            <optional output path for Org-mode report>\n\
             ```\n\n",
             base
         );
@@ -530,7 +555,7 @@ impl AgentState {
     }
 }
 
-pub const TOOL_REGEX_PATTERN: &str = r"```tool:(run_command|view_file|write_file|apply_patch|tdd_cycle|invoke_subagent|mcp|code_search|code_outline|git_context|adversarial_review|run_dag|code_grep|code_map)\n([\s\S]*?)```";
+pub const TOOL_REGEX_PATTERN: &str = r"```tool:(run_command|view_file|write_file|apply_patch|tdd_cycle|invoke_subagent|mcp|code_search|code_outline|git_context|adversarial_review|run_dag|code_grep|code_map|worktree_sandbox|lsp_query|export_session)\n([\s\S]*?)```";
 
 pub async fn execute_tool_quiet(tool_name: &str, body: &str, state: &AgentState) -> String {
     execute_tool_internal(tool_name, body, state, true).await
@@ -632,6 +657,15 @@ async fn execute_tool_internal(
             let content = parts.next().unwrap_or("");
             if path.is_empty() {
                 return "Error: Empty path specified for write_file".to_string();
+            }
+
+            // Interactive diff approval check
+            if state.config.diff_approval_required && !quiet {
+                let existing = fs::read_to_string(path).unwrap_or_default();
+                let diff = diff_review::generate_unified_diff(&existing, content, path);
+                if !diff_review::prompt_diff_approval(&diff, path).unwrap_or(true) {
+                    return format!("Modification to {} was rejected by user.", path);
+                }
             }
 
             // Snapshot before write
@@ -979,6 +1013,127 @@ async fn execute_tool_internal(
                 Err(e) => format!("Error generating repo map: {}", e),
             }
         }
+        "worktree_sandbox" => {
+            let mut action = "status".to_string();
+            let mut task = "task".to_string();
+            for line in body.lines() {
+                if let Some(val) = line.strip_prefix("action:") {
+                    action = val.trim().to_lowercase();
+                } else if let Some(val) = line.strip_prefix("task:") {
+                    task = val.trim().to_string();
+                }
+            }
+            match action.as_str() {
+                "create" => match worktree::WorktreeSandbox::new(&state.workspace_dir, &task) {
+                    Ok(sandbox) => {
+                        let banner = worktree::format_sandbox_banner(&sandbox, "Created");
+                        let mut lock = state.active_sandbox.lock().unwrap();
+                        *lock = Some(sandbox);
+                        banner
+                    }
+                    Err(e) => format!("Failed to create worktree sandbox: {}", e),
+                },
+                "diff" => {
+                    let lock = state.active_sandbox.lock().unwrap();
+                    if let Some(sandbox) = lock.as_ref() {
+                        match sandbox.diff() {
+                            Ok(d) => {
+                                if d.trim().is_empty() {
+                                    "No changes in active sandbox.".to_string()
+                                } else {
+                                    d
+                                }
+                            }
+                            Err(e) => format!("Error getting sandbox diff: {}", e),
+                        }
+                    } else {
+                        "No active sandbox. Use action: create to start one.".to_string()
+                    }
+                }
+                "apply" => {
+                    let lock = state.active_sandbox.lock().unwrap();
+                    if let Some(sandbox) = lock.as_ref() {
+                        match sandbox.apply_to_main() {
+                            Ok(msg) => msg,
+                            Err(e) => format!("Failed to apply sandbox to main: {}", e),
+                        }
+                    } else {
+                        "No active sandbox to apply.".to_string()
+                    }
+                }
+                "discard" => {
+                    let mut lock = state.active_sandbox.lock().unwrap();
+                    if let Some(sandbox) = lock.take() {
+                        match sandbox.discard() {
+                            Ok(_) => format!("Discarded sandbox branch {}.", sandbox.branch),
+                            Err(e) => format!("Error discarding sandbox: {}", e),
+                        }
+                    } else {
+                        "No active sandbox to discard.".to_string()
+                    }
+                }
+                _ => "Usage: action: create | diff | apply | discard".to_string(),
+            }
+        }
+        "lsp_query" => {
+            let mut action = "hover".to_string();
+            let mut path_str = "".to_string();
+            let mut line: u32 = 1;
+            let mut col: u32 = 1;
+            for l in body.lines() {
+                if let Some(val) = l.strip_prefix("action:") {
+                    action = val.trim().to_lowercase();
+                } else if let Some(val) = l.strip_prefix("path:") {
+                    path_str = val.trim().to_string();
+                } else if let Some(val) = l.strip_prefix("line:") {
+                    line = val.trim().parse().unwrap_or(1);
+                } else if let Some(val) = l.strip_prefix("col:") {
+                    col = val.trim().parse().unwrap_or(1);
+                }
+            }
+            if path_str.is_empty() {
+                return "Error: Missing path: for lsp_query".to_string();
+            }
+            match lsp::execute_lsp_query(
+                &state.workspace_dir,
+                Path::new(&path_str),
+                line,
+                col,
+                &action,
+            ) {
+                Ok(res) => res,
+                Err(e) => format!("LSP Query Error: {}", e),
+            }
+        }
+        "export_session" => {
+            let target = body.trim();
+            let target_path = if target.is_empty() {
+                None
+            } else {
+                Some(Path::new(target))
+            };
+            let snap = state.metrics.snapshot().await;
+            let export_turns: Vec<export::ExportTurn> = state
+                .history
+                .iter()
+                .map(|m| export::ExportTurn {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                })
+                .collect();
+            match export::export_session_to_org(
+                &export_turns,
+                snap.total_prompt_tokens + snap.total_completion_tokens,
+                snap.total_cached_tokens,
+                snap.total_cost_usd,
+                &state.workspace_dir,
+                &state.config.active_model,
+                target_path,
+            ) {
+                Ok(p) => format!("Session exported to Org-mode: {}", p.display()),
+                Err(e) => format!("Export failed: {}", e),
+            }
+        }
         _ => format!("Unknown tool: {}", tool_name),
     }
 }
@@ -1232,6 +1387,15 @@ pub async fn stream_completion_internal(
             println!("\n");
             let badge = state.metrics.format_badge().await;
             println!("{}", badge.dimmed());
+            if state.config.live_hud_enabled {
+                let snap = state.metrics.snapshot().await;
+                if let Some(last_turn) = snap.turns.last() {
+                    println!(
+                        "{}",
+                        state.metrics.format_live_turn_hud(last_turn).await.cyan()
+                    );
+                }
+            }
         }
         return Ok(full_text);
     }
@@ -1311,7 +1475,78 @@ async fn main() -> Result<()> {
         return tui::run_tui(&mut state).await;
     }
 
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "{}",
+            "🛰️  ORBIT-CLI - Autonomous OpenRouter Coding Agent in Rust"
+                .bold()
+                .cyan()
+        );
+        println!("Usage: orbit [OPTIONS] [WORKSPACE_DIR]\n");
+        println!("Options:");
+        println!("  -C, --dir <DIR>       Set active workspace directory");
+        println!("  -t, --tui             Launch Ratatui fullscreen TUI mode");
+        println!("  -w, --watch           Start background file watcher & test runner");
+        println!(
+            "  -p, --pipe <PROMPT>   Non-interactive pipe mode (reads stdin and streams response)"
+        );
+        println!("  -h, --help            Print help information\n");
+        println!("In interactive mode, type `/help` for the full command list.");
+        return Ok(());
+    }
+
     state.init_mcp().await;
+
+    // Stdin Pipe Mode (-p / --pipe / --prompt)
+    let pipe_flag_idx = args
+        .iter()
+        .position(|a| a == "-p" || a == "--pipe" || a == "--prompt");
+    let has_pipe_flag = pipe_flag_idx.is_some();
+
+    if has_pipe_flag {
+        use std::io::IsTerminal;
+        use std::io::Read;
+        let mut stdin_content = String::new();
+        if !io::stdin().is_terminal() {
+            let _ = io::stdin().read_to_string(&mut stdin_content);
+        }
+
+        let user_prompt = if let Some(idx) = pipe_flag_idx {
+            args.get(idx + 1)
+                .cloned()
+                .unwrap_or_else(|| "Analyze and review the input.".to_string())
+        } else {
+            "Analyze and review the input.".to_string()
+        };
+
+        let combined = if !stdin_content.trim().is_empty() {
+            format!(
+                "[STDIN INPUT]:\n```\n{}\n```\n\n[INSTRUCTION]:\n{}",
+                stdin_content.trim(),
+                user_prompt
+            )
+        } else {
+            user_prompt
+        };
+
+        if state.config.api_key.is_empty() {
+            eprintln!("Error: OPENROUTER_API_KEY is not configured for non-interactive pipe mode.");
+            std::process::exit(1);
+        }
+
+        state.history.push(Message {
+            role: "user".to_string(),
+            content: combined,
+        });
+
+        match stream_completion(&state).await {
+            Ok(_) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("Pipe execution error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     if let Some(rules) = &state.project_rules {
         println!(
@@ -1401,9 +1636,7 @@ async fn main() -> Result<()> {
     let mut rl = DefaultEditor::with_config(rl_config)?;
     let _ = rl.load_history(&history_file);
 
-    let tool_re = Regex::new(
-        r"```tool:(run_command|view_file|write_file|apply_patch|tdd_cycle|invoke_subagent|mcp|code_search|code_outline|git_context|adversarial_review|run_dag)\n([\s\S]*?)```",
-    )?;
+    let tool_re = Regex::new(TOOL_REGEX_PATTERN)?;
 
     let mut multi_line_acc = String::new();
 
@@ -1595,6 +1828,24 @@ async fn main() -> Result<()> {
                             println!("  /search <query>        - Search local codebase symbols and full-text");
                             println!("  /outline [path]        - Generate codebase symbol map and outline");
                             println!("  /git <log|blame|diff>  - Inspect git commit history, blame or diff");
+                            println!(
+                                "  /worktree [new|diff|apply|discard] - Speculative Git worktree sandboxing"
+                            );
+                            println!(
+                                "  /diff [file]           - View current git diff or unified diff"
+                            );
+                            println!(
+                                "  /diff_guard            - Toggle interactive git diff approval ON/OFF"
+                            );
+                            println!(
+                                "  /lsp [status|hover|def|symbols] - Query local Language Server (rust-analyzer/pyright)"
+                            );
+                            println!(
+                                "  /hud                   - Toggle live token & USD cost HUD banner ON/OFF"
+                            );
+                            println!(
+                                "  /export [path]         - Export session conversation to Org-mode document"
+                            );
                             println!("  /rules                 - View or verify active project .orbitrules");
                             println!(
                                 "  /context               - View context token usage and budget"
@@ -1718,6 +1969,278 @@ async fn main() -> Result<()> {
                                 _ => {
                                     println!("Usage: /git <log|blame|diff|search> [args]");
                                 }
+                            }
+                            continue;
+                        }
+                        "/worktree" => {
+                            let root_opt = worktree::get_repo_root(&state.workspace_dir);
+                            let repo_root = match root_opt {
+                                Some(r) => r,
+                                None => {
+                                    println!(
+                                        "Error: Workspace `{}` is not inside a git repository.",
+                                        state.workspace_dir.display()
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let parts: Vec<&str> = arg.split_whitespace().collect();
+                            let action = parts.first().copied().unwrap_or("status");
+                            match action {
+                                "new" | "create" => {
+                                    let task = if parts.len() > 1 {
+                                        parts[1..].join("-")
+                                    } else {
+                                        "sandbox".to_string()
+                                    };
+                                    match worktree::WorktreeSandbox::new(&repo_root, &task) {
+                                        Ok(sandbox) => {
+                                            println!(
+                                                "{}",
+                                                worktree::format_sandbox_banner(
+                                                    &sandbox, "Created"
+                                                )
+                                            );
+                                            let mut lock = state.active_sandbox.lock().unwrap();
+                                            *lock = Some(sandbox);
+                                        }
+                                        Err(e) => println!("Error creating sandbox: {}", e),
+                                    }
+                                }
+                                "diff" => {
+                                    let lock = state.active_sandbox.lock().unwrap();
+                                    if let Some(sandbox) = lock.as_ref() {
+                                        match sandbox.diff() {
+                                            Ok(d) => {
+                                                if d.trim().is_empty() {
+                                                    println!("No changes in active sandbox.");
+                                                } else {
+                                                    print!(
+                                                        "{}",
+                                                        diff_review::format_colored_diff(&d)
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => println!("Error getting sandbox diff: {}", e),
+                                        }
+                                    } else {
+                                        println!(
+                                            "No active sandbox. Use `/worktree new <task>` to create one."
+                                        );
+                                    }
+                                }
+                                "apply" => {
+                                    let lock = state.active_sandbox.lock().unwrap();
+                                    if let Some(sandbox) = lock.as_ref() {
+                                        match sandbox.apply_to_main() {
+                                            Ok(msg) => println!("{}", msg.green()),
+                                            Err(e) => println!("Error applying sandbox: {}", e),
+                                        }
+                                    } else {
+                                        println!("No active sandbox to apply.");
+                                    }
+                                }
+                                "discard" => {
+                                    let mut lock = state.active_sandbox.lock().unwrap();
+                                    if let Some(sandbox) = lock.take() {
+                                        match sandbox.discard() {
+                                            Ok(_) => println!(
+                                                "Successfully discarded sandbox `{}`.",
+                                                sandbox.branch.yellow()
+                                            ),
+                                            Err(e) => println!("Error discarding sandbox: {}", e),
+                                        }
+                                    } else {
+                                        println!("No active sandbox to discard.");
+                                    }
+                                }
+                                "list" | "status" => {
+                                    let active = state.active_sandbox.lock().unwrap();
+                                    if let Some(sb) = active.as_ref() {
+                                        println!(
+                                            "{}",
+                                            worktree::format_sandbox_banner(sb, "Active")
+                                        );
+                                    } else {
+                                        println!(
+                                            "No active speculative worktree sandbox attached."
+                                        );
+                                    }
+                                    let all_sandboxes = worktree::list_active_sandboxes(&repo_root);
+                                    if !all_sandboxes.is_empty() {
+                                        println!("\nExisting sandboxes on disk:");
+                                        for sb in all_sandboxes {
+                                            println!("  • {}", sb.display());
+                                        }
+                                    }
+                                }
+                                _ => println!(
+                                    "Usage: /worktree <new <task> | diff | apply | discard | list>"
+                                ),
+                            }
+                            continue;
+                        }
+                        "/diff" => {
+                            let file_filter = if arg.trim().is_empty() {
+                                None
+                            } else {
+                                Some(arg.trim())
+                            };
+                            match diff_review::get_git_diff(&state.workspace_dir, file_filter) {
+                                Ok(d) => {
+                                    if d.trim().is_empty() {
+                                        println!("No uncommitted git changes detected.");
+                                    } else {
+                                        print!("{}", diff_review::format_colored_diff(&d));
+                                    }
+                                }
+                                Err(e) => println!("git diff error: {}", e),
+                            }
+                            continue;
+                        }
+                        "/diff_guard" => {
+                            state.config.diff_approval_required =
+                                !state.config.diff_approval_required;
+                            let _ = state.save_config();
+                            println!(
+                                "Interactive Diff Approval Guard: {}",
+                                if state.config.diff_approval_required {
+                                    "ENABLED (modifications require manual confirmation)"
+                                        .bold()
+                                        .green()
+                                } else {
+                                    "DISABLED (autonomous writes enabled)".yellow()
+                                }
+                            );
+                            continue;
+                        }
+                        "/lsp" => {
+                            let parts: Vec<&str> = arg.split_whitespace().collect();
+                            let subcmd = parts.first().copied().unwrap_or("status");
+                            match subcmd {
+                                "status" => {
+                                    match lsp::LspDetector::detect(&state.workspace_dir) {
+                                        Some((lang, bin, args)) => {
+                                            println!(
+                                                "🎯 LSP Server Detected: {} (Language: {:?}, Args: {:?})",
+                                                bin.bold().green(),
+                                                lang,
+                                                args
+                                            );
+                                        }
+                                        None => {
+                                            println!(
+                                                "⚠️ No Language Server (rust-analyzer, pyright, gopls) found in PATH or workspace."
+                                            );
+                                        }
+                                    }
+                                }
+                                "hover" => {
+                                    if parts.len() < 4 {
+                                        println!("Usage: /lsp hover <file> <line> <col>");
+                                    } else {
+                                        let file = parts[1];
+                                        let line = parts[2].parse().unwrap_or(1);
+                                        let col = parts[3].parse().unwrap_or(1);
+                                        match lsp::execute_lsp_query(
+                                            &state.workspace_dir,
+                                            Path::new(file),
+                                            line,
+                                            col,
+                                            "hover",
+                                        ) {
+                                            Ok(res) => println!("{}", res),
+                                            Err(e) => println!("LSP Hover Error: {}", e),
+                                        }
+                                    }
+                                }
+                                "def" | "definition" => {
+                                    if parts.len() < 4 {
+                                        println!("Usage: /lsp def <file> <line> <col>");
+                                    } else {
+                                        let file = parts[1];
+                                        let line = parts[2].parse().unwrap_or(1);
+                                        let col = parts[3].parse().unwrap_or(1);
+                                        match lsp::execute_lsp_query(
+                                            &state.workspace_dir,
+                                            Path::new(file),
+                                            line,
+                                            col,
+                                            "definition",
+                                        ) {
+                                            Ok(res) => println!("{}", res),
+                                            Err(e) => println!("LSP Definition Error: {}", e),
+                                        }
+                                    }
+                                }
+                                "symbols" => {
+                                    if parts.len() < 2 {
+                                        println!("Usage: /lsp symbols <file>");
+                                    } else {
+                                        let file = parts[1];
+                                        match lsp::execute_lsp_query(
+                                            &state.workspace_dir,
+                                            Path::new(file),
+                                            1,
+                                            1,
+                                            "symbols",
+                                        ) {
+                                            Ok(res) => println!("{}", res),
+                                            Err(e) => println!("LSP Symbols Error: {}", e),
+                                        }
+                                    }
+                                }
+                                _ => println!(
+                                    "Usage: /lsp <status | hover <f> <l> <c> | def <f> <l> <c> | symbols <f>>"
+                                ),
+                            }
+                            continue;
+                        }
+                        "/hud" => {
+                            state.config.live_hud_enabled = !state.config.live_hud_enabled;
+                            let _ = state.save_config();
+                            println!(
+                                "Live Token & Cost Economics HUD: {}",
+                                if state.config.live_hud_enabled {
+                                    "ENABLED".bold().green()
+                                } else {
+                                    "DISABLED".yellow()
+                                }
+                            );
+                            continue;
+                        }
+                        "/export" => {
+                            let target = arg.trim();
+                            let target_path = if target.is_empty() {
+                                None
+                            } else {
+                                Some(Path::new(target))
+                            };
+                            let snap = state.metrics.snapshot().await;
+                            let export_turns: Vec<export::ExportTurn> = state
+                                .history
+                                .iter()
+                                .map(|m| export::ExportTurn {
+                                    role: m.role.clone(),
+                                    content: m.content.clone(),
+                                })
+                                .collect();
+                            match export::export_session_to_org(
+                                &export_turns,
+                                snap.total_prompt_tokens + snap.total_completion_tokens,
+                                snap.total_cached_tokens,
+                                snap.total_cost_usd,
+                                &state.workspace_dir,
+                                &state.config.active_model,
+                                target_path,
+                            ) {
+                                Ok(p) => println!(
+                                    "{} {}",
+                                    "✅ Session successfully exported to:".bold().green(),
+                                    p.display().to_string().cyan()
+                                ),
+                                Err(e) => println!("❌ Export failed: {}", e),
                             }
                             continue;
                         }

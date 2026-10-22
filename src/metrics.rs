@@ -221,6 +221,23 @@ impl SessionMetrics {
             format!("[📊 {} tok | ${:.4}]", tok_str, lock.total_cost_usd)
         }
     }
+
+    pub async fn format_live_turn_hud(&self, turn: &TurnMetrics) -> String {
+        let lock = self.inner.lock().await;
+        let cache_ratio = if turn.usage.prompt_tokens > 0 {
+            (turn.usage.cached_tokens as f64 / turn.usage.prompt_tokens as f64) * 100.0
+        } else {
+            0.0
+        };
+        format!(
+            "💰 [Turn: {} tok ({:.0}% cached) | ${:.5} USD | Total: ${:.4} USD | {:.0} t/s]",
+            turn.usage.total_tokens,
+            cache_ratio,
+            turn.cost_usd,
+            lock.total_cost_usd,
+            turn.tokens_per_sec,
+        )
+    }
 }
 
 #[cfg(test)]
