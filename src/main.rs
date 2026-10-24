@@ -609,10 +609,10 @@ async fn execute_tool_internal(
                 println!("$ {}", cmd.bold().white());
             }
             let mut cmd_builder = Command::new("bash");
-            cmd_builder
-                .arg("-c")
-                .arg(cmd)
-                .current_dir(&state.workspace_dir);
+            cmd_builder.arg("-c").arg(cmd);
+            if state.workspace_dir.is_dir() {
+                cmd_builder.current_dir(&state.workspace_dir);
+            }
 
             if let Ok(path_var) = std::env::var("PATH") {
                 let home = std::env::var("HOME").unwrap_or_default();
@@ -3499,6 +3499,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_change_workspace_success_and_error() {
+        let orig_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let temp_dir_1 = std::env::temp_dir().join("orbit_test_ws_1");
         let temp_dir_2 = std::env::temp_dir().join("orbit_test_ws_2");
         let _ = std::fs::remove_dir_all(&temp_dir_1);
@@ -3519,6 +3520,7 @@ mod tests {
         let err = state.change_workspace(&bad_path);
         assert!(err.is_err());
 
+        let _ = std::env::set_current_dir(&orig_dir);
         let _ = std::fs::remove_dir_all(&temp_dir_1);
         let _ = std::fs::remove_dir_all(&temp_dir_2);
     }

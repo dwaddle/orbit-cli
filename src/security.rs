@@ -147,17 +147,34 @@ impl Default for SecretRedactor {
 
 impl SecretRedactor {
     pub fn redact(&self, input: &str) -> String {
+        // Fast-path heuristic: avoid regex evaluations if no token indicators exist
+        let lower = input.to_ascii_lowercase();
+        let might_contain_secret = lower.contains("bearer")
+            || lower.contains("sk-")
+            || lower.contains("ghp_")
+            || lower.contains("gho_")
+            || lower.contains("github_pat_")
+            || input.contains("AKIA")
+            || lower.contains("key")
+            || lower.contains("token");
+
+        if !might_contain_secret {
+            return input.to_string();
+        }
+
         let mut result = input.to_string();
         for pattern in &self.patterns {
-            result = pattern
-                .replace_all(&result, |caps: &regex::Captures| {
-                    if let Some(prefix) = caps.get(1) {
-                        format!("{}[REDACTED_SECRET]", prefix.as_str())
-                    } else {
-                        "[REDACTED_SECRET]".to_string()
-                    }
-                })
-                .to_string();
+            if pattern.is_match(&result) {
+                result = pattern
+                    .replace_all(&result, |caps: &regex::Captures| {
+                        if let Some(prefix) = caps.get(1) {
+                            format!("{}[REDACTED_SECRET]", prefix.as_str())
+                        } else {
+                            "[REDACTED_SECRET]".to_string()
+                        }
+                    })
+                    .to_string();
+            }
         }
         result
     }

@@ -110,23 +110,29 @@ impl NativeGrep {
                 Err(_) => continue,
             };
 
-            let reader = BufReader::new(file);
-            for (line_idx, line_res) in reader.lines().enumerate() {
-                let line = match line_res {
-                    Ok(l) => l,
-                    Err(_) => break, // Likely non-UTF8 binary file, stop reading this file
-                };
+            let mut reader = BufReader::new(file);
+            let mut line_buf = String::with_capacity(256);
+            let mut line_idx = 0;
 
-                if regex.is_match(&line) {
-                    matches.push(GrepMatch {
-                        path: rel_str.clone(),
-                        line_number: line_idx + 1,
-                        line_text: line.trim().to_string(),
-                    });
+            loop {
+                line_buf.clear();
+                match reader.read_line(&mut line_buf) {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        line_idx += 1;
+                        if regex.is_match(&line_buf) {
+                            matches.push(GrepMatch {
+                                path: rel_str.clone(),
+                                line_number: line_idx,
+                                line_text: line_buf.trim().to_string(),
+                            });
 
-                    if matches.len() >= config.max_results {
-                        break;
+                            if matches.len() >= config.max_results {
+                                break;
+                            }
+                        }
                     }
+                    Err(_) => break, // Non-UTF8 or I/O error, skip rest of file
                 }
             }
         }

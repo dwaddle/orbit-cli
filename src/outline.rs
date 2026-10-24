@@ -286,8 +286,14 @@ pub fn is_ignored_path(path: &Path) -> bool {
 }
 
 /// Recursively traverses `root_dir` extracting symbol maps across project source files.
+static SHARED_EXTRACTOR: std::sync::OnceLock<SymbolExtractor> = std::sync::OnceLock::new();
+
+pub fn get_shared_extractor() -> &'static SymbolExtractor {
+    SHARED_EXTRACTOR.get_or_init(SymbolExtractor::new)
+}
+
 pub fn generate_codebase_outline(root_dir: &Path, max_tokens: usize) -> String {
-    let extractor = SymbolExtractor::new();
+    let extractor = get_shared_extractor();
     let mut files = Vec::new();
     collect_source_files(root_dir, root_dir, 0, &mut files);
 

@@ -240,7 +240,7 @@ pub fn highlight_markdown_line(line: &str) -> String {
 
 /// Format inline markdown spans: `code` -> yellow, **bold** -> bold, *italic* -> italic.
 pub fn highlight_inline_spans(text: &str) -> String {
-    let mut result = String::new();
+    let mut result = String::with_capacity(text.len() + 16);
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
     let mut i = 0;
@@ -650,7 +650,7 @@ fn highlight_c_cpp(line: &str) -> String {
 }
 
 fn highlight_json(line: &str) -> String {
-    let mut result = String::new();
+    let mut result = String::with_capacity(line.len() * 2);
     let mut in_string = false;
     let mut is_key = true;
     let mut string_buf = String::new();
@@ -673,20 +673,27 @@ fn highlight_json(line: &str) -> String {
         } else if in_string {
             string_buf.push(ch);
         } else {
-            if ch == ':' {
-                is_key = false;
-                result.push_str(&ch.to_string().white().to_string());
-            } else if ch == ',' || ch == '{' || ch == '}' || ch == '[' || ch == ']' {
-                if ch == ',' || ch == '{' || ch == '[' {
-                    is_key = true;
+            match ch {
+                ':' => {
+                    is_key = false;
+                    result.push(':');
                 }
-                result.push_str(&ch.to_string().white().to_string());
-            } else if ch.is_ascii_digit() || ch == '.' || ch == '-' {
-                result.push_str(&ch.to_string().yellow().to_string());
-            } else if ch.is_whitespace() {
-                result.push(ch);
-            } else {
-                result.push_str(&ch.to_string().magenta().to_string());
+                ',' | '{' | '[' => {
+                    is_key = true;
+                    result.push(ch);
+                }
+                '}' | ']' => {
+                    result.push(ch);
+                }
+                '0'..='9' | '.' | '-' => {
+                    result.push_str(&ch.to_string().yellow().to_string());
+                }
+                c if c.is_whitespace() => {
+                    result.push(c);
+                }
+                _ => {
+                    result.push_str(&ch.to_string().magenta().to_string());
+                }
             }
         }
     }
@@ -739,15 +746,16 @@ fn tokenize_and_color(
     comment_marker: &str,
     allow_decorators: bool,
 ) -> String {
-    let mut result = String::new();
+    let mut result = String::with_capacity(line.len() * 2);
     let chars: Vec<char> = line.chars().collect();
     let len = chars.len();
+    let marker_chars: Vec<char> = comment_marker.chars().collect();
+    let marker_len = marker_chars.len();
     let mut i = 0;
 
     while i < len {
-        // Comments
-        let slice: String = chars[i..].iter().collect();
-        if slice.starts_with(comment_marker) {
+        // Comments (zero string allocations for mismatch check)
+        if i + marker_len <= len && chars[i..i + marker_len] == marker_chars[..] {
             let comment_text: String = chars[i..].iter().collect();
             result.push_str(&comment_text.dimmed().to_string());
             break;

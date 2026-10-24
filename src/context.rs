@@ -8,10 +8,27 @@ pub fn estimate_tokens(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    // Blend of character count / 3.8 and whitespace word count
-    let chars = text.chars().count();
-    let words = text.split_whitespace().count();
-    let by_chars = (chars as f32 / 3.8).ceil() as usize;
+    // High-speed single pass token estimator: combines char count & word count without double scan
+    let mut words = 0;
+    let mut in_word = false;
+    let mut char_count = 0;
+
+    for b in text.bytes() {
+        char_count += 1;
+        if b.is_ascii_whitespace() {
+            if in_word {
+                words += 1;
+                in_word = false;
+            }
+        } else {
+            in_word = true;
+        }
+    }
+    if in_word {
+        words += 1;
+    }
+
+    let by_chars = (char_count as f32 / 3.8).ceil() as usize;
     let by_words = (words as f32 * 1.3).ceil() as usize;
     (by_chars + by_words) / 2
 }

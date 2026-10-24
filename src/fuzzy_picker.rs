@@ -78,9 +78,12 @@ impl FuzzyPicker {
             .parents(true)
             .build();
 
-        let sym_re = Regex::new(
-            r"(?m)^\s*(?:pub(?:\([^\)]+\))?\s+)?(?:export\s+)?(fn|def|struct|class|interface|enum|trait)\s+([A-Za-z0-9_]+)"
-        ).unwrap();
+        static SYM_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        let sym_re = SYM_RE.get_or_init(|| {
+            Regex::new(
+                r"(?m)^\s*(?:pub(?:\([^\)]+\))?\s+)?(?:export\s+)?(fn|def|struct|class|interface|enum|trait)\s+([A-Za-z0-9_]+)"
+            ).unwrap()
+        });
 
         let mut matches = Vec::new();
 

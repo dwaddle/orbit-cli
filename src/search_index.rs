@@ -86,12 +86,11 @@ impl CodeSearchIndex {
 
         for token in &query_tokens {
             if let Some(postings) = self.index.get(token) {
-                // Approximate IDF
-                let doc_count = postings
-                    .iter()
-                    .map(|(d, _)| *d)
-                    .collect::<HashSet<_>>()
-                    .len() as f32;
+                // Approximate IDF with fast deduplication (avoiding HashSet overhead)
+                let mut distinct_docs: Vec<usize> = postings.iter().map(|(d, _)| *d).collect();
+                distinct_docs.sort_unstable();
+                distinct_docs.dedup();
+                let doc_count = distinct_docs.len() as f32;
                 let idf = ((total_docs - doc_count + 0.5) / (doc_count + 0.5) + 1.0)
                     .ln()
                     .max(0.1);
@@ -102,8 +101,16 @@ impl CodeSearchIndex {
 
                     if line_num > 0 {
                         if let Some(doc) = self.documents.get(doc_id) {
-                            if let Some(line) = doc.lines.iter().find(|l| l.line_number == line_num)
+                            // O(1) direct line lookup with fallback to avoid O(N) scan
+                            let line_opt = if line_num <= doc.lines.len()
+                                && doc.lines[line_num - 1].line_number == line_num
                             {
+                                Some(&doc.lines[line_num - 1])
+                            } else {
+                                doc.lines.iter().find(|l| l.line_number == line_num)
+                            };
+
+                            if let Some(line) = line_opt {
                                 doc_matches
                                     .entry(doc_id)
                                     .or_default()
