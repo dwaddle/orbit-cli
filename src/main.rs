@@ -14,27 +14,40 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
+pub mod adr;
+pub mod ast_grep;
+pub mod benchmark;
+pub mod bisect;
 pub mod checkpoint;
+pub mod commit;
 pub mod compile_guard;
 pub mod context;
 pub mod diff_review;
 pub mod dispatch;
+pub mod editor;
 pub mod export;
+pub mod fetch;
 pub mod fuzzy_picker;
+pub mod gh_cli;
 pub mod git_context;
 pub mod grep;
 pub mod highlight;
 pub mod lsp;
 mod mcp;
+pub mod memory;
 pub mod metrics;
 pub mod modal_prompt;
 pub mod outline;
 pub mod patch;
+pub mod plan;
+pub mod query_cache;
 pub mod repo_map;
 pub mod review;
 pub mod routing;
 pub mod rules;
 pub mod search_index;
+pub mod security;
+pub mod session;
 pub mod subagent;
 pub mod tdd;
 pub mod tui;
@@ -181,6 +194,10 @@ pub struct AgentState {
     pub compile_guard: compile_guard::CompileGuard,
     pub metrics: metrics::SessionMetrics,
     pub active_sandbox: Arc<Mutex<Option<worktree::WorktreeSandbox>>>,
+    pub tool_permissions: security::ToolPermissions,
+    pub secret_redactor: security::SecretRedactor,
+    pub query_cache: query_cache::QueryCache,
+    pub project_memory: Option<memory::ProjectMemory>,
 }
 
 impl AgentState {
@@ -246,6 +263,10 @@ impl AgentState {
         let checkpoint_mgr = checkpoint::CheckpointManager::new();
         let compile_guard = compile_guard::CompileGuard::new(&workspace_dir);
         let metrics = metrics::SessionMetrics::new();
+        let tool_permissions = security::ToolPermissions::default();
+        let secret_redactor = security::SecretRedactor::default();
+        let query_cache = query_cache::QueryCache::default();
+        let project_memory = memory::ProjectMemory::load_or_init(&workspace_dir).ok();
 
         Ok(Self {
             config,
@@ -264,6 +285,10 @@ impl AgentState {
             compile_guard,
             metrics,
             active_sandbox: Arc::new(Mutex::new(None)),
+            tool_permissions,
+            secret_redactor,
+            query_cache,
+            project_memory,
         })
     }
 
@@ -2934,6 +2959,384 @@ async fn main() -> Result<()> {
                                     fuzzy_picker::FuzzyPicker::format_results(&m, query)
                                 ),
                                 Err(e) => println!("❌ Error in fuzzy search: {}", e),
+                            }
+                            continue;
+                        }
+                        "/adr" => {
+                            let title = arg.trim();
+                            if title.is_empty() {
+                                match adr::AdrManager::list_adrs(&state.workspace_dir) {
+                                    Ok(list) => {
+                                        if list.is_empty() {
+                                            println!("No ADRs found in docs/adr/. Usage: /adr <Title of Decision>");
+                                        } else {
+                                            println!(
+                                                "{}",
+                                                "=== ARCHITECTURE DECISION RECORDS ==="
+                                                    .bold()
+                                                    .cyan()
+                                            );
+                                            for (num, t, path) in list {
+                                                println!(
+                                                    "  [{:04}] {} ({})",
+                                                    num,
+                                                    t.bold(),
+                                                    path.display().to_string().cyan()
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => println!("Error listing ADRs: {}", e),
+                                }
+                            } else {
+                                match adr::AdrManager::create_adr(&state.workspace_dir, title) {
+                                    Ok((path, _)) => println!(
+                                        "Created ADR: {}",
+                                        path.display().to_string().bold().green()
+                                    ),
+                                    Err(e) => println!("Error creating ADR: {}", e),
+                                }
+                            }
+                            continue;
+                        }
+                        "/commit" => {
+                            match commit::CommitGenerator::get_diff(&state.workspace_dir) {
+                                Ok(diff) => {
+                                    match commit::CommitGenerator::analyze_and_generate(&diff) {
+                                        Ok(c) => {
+                                            let msg = c.format();
+                                            println!(
+                                                "\n{}\n{}\n",
+                                                "=== SUGGESTED CONVENTIONAL COMMIT ==="
+                                                    .bold()
+                                                    .cyan(),
+                                                msg
+                                            );
+                                            println!("Run `/sh git commit -m \"...\"` or review with `/diff`.");
+                                        }
+                                        Err(e) => println!("Cannot generate commit: {}", e),
+                                    }
+                                }
+                                Err(e) => println!("Error getting git diff: {}", e),
+                            }
+                            continue;
+                        }
+                        "/memory" => {
+                            let entry = arg.trim();
+                            if entry.is_empty() {
+                                if let Some(mem) = &state.project_memory {
+                                    println!(
+                                        "\n{}\n{}",
+                                        "=== PROJECT MEMORY (.orbit/memory.md) ===".bold().cyan(),
+                                        mem.content
+                                    );
+                                } else {
+                                    println!("Project memory not loaded.");
+                                }
+                            } else if let Some(mem) = &mut state.project_memory {
+                                match mem.append_entry("Note", entry) {
+                                    Ok(_) => println!("Appended to .orbit/memory.md"),
+                                    Err(e) => println!("Error saving memory: {}", e),
+                                }
+                            }
+                            continue;
+                        }
+                        "/plan" => {
+                            let goal = arg.trim();
+                            if goal.is_empty() {
+                                println!("Usage: /plan <task description>");
+                            } else {
+                                match plan::PlanGenerator::generate_plan(&state.workspace_dir, goal)
+                                {
+                                    Ok((path, content)) => {
+                                        println!(
+                                            "{}\n{}",
+                                            format!(
+                                                "Execution Plan generated at {}",
+                                                path.display()
+                                            )
+                                            .bold()
+                                            .green(),
+                                            content
+                                        );
+                                    }
+                                    Err(e) => println!("Error generating plan: {}", e),
+                                }
+                            }
+                            continue;
+                        }
+                        "/benchmark" => {
+                            let cmd_str = arg.trim();
+                            if cmd_str.is_empty() {
+                                println!("Usage: /benchmark <shell command>");
+                            } else {
+                                println!("Benchmarking '{}' (5 runs)...", cmd_str.bold());
+                                match benchmark::BenchmarkRunner::run(
+                                    cmd_str,
+                                    &state.workspace_dir,
+                                    5,
+                                ) {
+                                    Ok(stats) => println!("\n{}", stats.format_report()),
+                                    Err(e) => println!("Benchmark error: {}", e),
+                                }
+                            }
+                            continue;
+                        }
+                        "/edit" => {
+                            let path_str = arg.trim();
+                            if path_str.is_empty() {
+                                println!("Usage: /edit <file_path>");
+                            } else {
+                                match editor::ExternalEditor::edit_file(
+                                    Path::new(path_str),
+                                    &state.workspace_dir,
+                                ) {
+                                    Ok(_) => println!("Edited file: {}", path_str),
+                                    Err(e) => println!("Error spawning editor: {}", e),
+                                }
+                            }
+                            continue;
+                        }
+                        "/issue" => {
+                            let limit = arg.trim().parse::<usize>().unwrap_or(15);
+                            match gh_cli::GhCli::list_issues(&state.workspace_dir, limit) {
+                                Ok(res) => {
+                                    println!("\n{}\n{}", "=== GITHUB ISSUES ===".bold().cyan(), res)
+                                }
+                                Err(e) => println!("Error: {}", e),
+                            }
+                            continue;
+                        }
+                        "/pr" => {
+                            let p_arg = arg.trim();
+                            if let Some(num) = p_arg.strip_prefix("view ") {
+                                match gh_cli::GhCli::view_pr(&state.workspace_dir, num.trim()) {
+                                    Ok(res) => println!("\n{}", res),
+                                    Err(e) => println!("Error: {}", e),
+                                }
+                            } else {
+                                let limit = p_arg.parse::<usize>().unwrap_or(15);
+                                match gh_cli::GhCli::list_prs(&state.workspace_dir, limit) {
+                                    Ok(res) => println!(
+                                        "\n{}\n{}",
+                                        "=== GITHUB PULL REQUESTS ===".bold().cyan(),
+                                        res
+                                    ),
+                                    Err(e) => println!("Error: {}", e),
+                                }
+                            }
+                            continue;
+                        }
+                        "/bisect" => {
+                            let parts: Vec<&str> = arg.split_whitespace().collect();
+                            match parts.first().copied().unwrap_or("help") {
+                                "start" => {
+                                    let bad = parts.get(1).copied();
+                                    let good = parts.get(2).copied();
+                                    match bisect::GitBisect::start(&state.workspace_dir, bad, good) {
+                                        Ok(out) => println!("{}", out),
+                                        Err(e) => println!("Bisect error: {}", e),
+                                    }
+                                }
+                                "run" => {
+                                    let test_cmd = parts[1..].join(" ");
+                                    match bisect::GitBisect::run_automated(&state.workspace_dir, &test_cmd) {
+                                        Ok(out) => println!("{}", out),
+                                        Err(e) => println!("Bisect run error: {}", e),
+                                    }
+                                }
+                                "reset" => {
+                                    match bisect::GitBisect::reset(&state.workspace_dir) {
+                                        Ok(out) => println!("{}", out),
+                                        Err(e) => println!("Bisect reset error: {}", e),
+                                    }
+                                }
+                                _ => println!("Usage: /bisect start [bad] [good] | /bisect run <cmd> | /bisect reset"),
+                            }
+                            continue;
+                        }
+                        "/ast" => {
+                            println!("Running structural AST scan across workspace...");
+                            match ast_grep::AstScanner::scan_workspace(&state.workspace_dir) {
+                                Ok(findings) => {
+                                    if findings.is_empty() {
+                                        println!(
+                                            "{}",
+                                            "No structural or security defects found."
+                                                .bold()
+                                                .green()
+                                        );
+                                    } else {
+                                        println!(
+                                            "{}",
+                                            format!("Found {} AST defects:", findings.len())
+                                                .bold()
+                                                .yellow()
+                                        );
+                                        for f in findings {
+                                            println!(
+                                                "  {}:{} [{}] {}",
+                                                f.file.cyan(),
+                                                f.line,
+                                                f.rule.bold().red(),
+                                                f.message
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => println!("AST scanner error: {}", e),
+                            }
+                            continue;
+                        }
+                        "/fetch" => {
+                            let url = arg.trim();
+                            if url.is_empty() {
+                                println!("Usage: /fetch <url>");
+                            } else {
+                                println!(
+                                    "Fetching and cleaning documentation from {}...",
+                                    url.cyan()
+                                );
+                                match fetch::DocFetcher::fetch_and_clean(url).await {
+                                    Ok(clean_doc) => {
+                                        state.history.push(Message {
+                                            role: "user".to_string(),
+                                            content: format!(
+                                                "[Fetched Documentation from {}]:\n{}",
+                                                url, clean_doc
+                                            ),
+                                        });
+                                        println!(
+                                            "{}",
+                                            format!(
+                                                "Successfully loaded {} chars into context.",
+                                                clean_doc.len()
+                                            )
+                                            .bold()
+                                            .green()
+                                        );
+                                    }
+                                    Err(e) => println!("Fetch error: {}", e),
+                                }
+                            }
+                            continue;
+                        }
+                        "/permissions" => {
+                            let parts: Vec<&str> = arg.split_whitespace().collect();
+                            if parts.is_empty() {
+                                println!("{}", "=== TOOL EXECUTION POLICIES ===".bold().cyan());
+                                for (tool, policy) in state.tool_permissions.list_policies() {
+                                    let color = match policy {
+                                        security::ToolPolicy::Auto => "auto".green(),
+                                        security::ToolPolicy::Ask => "ask".yellow(),
+                                        security::ToolPolicy::Deny => "deny".red(),
+                                    };
+                                    println!("  {:20} -> {}", tool, color);
+                                }
+                            } else if parts.len() >= 2 && parts[0] == "set" {
+                                let tool = parts[1];
+                                let policy_str = parts.get(2).copied().unwrap_or("ask");
+                                if let Some(policy) = security::ToolPolicy::parse_policy(policy_str)
+                                {
+                                    state.tool_permissions.set_policy(tool, policy);
+                                    println!(
+                                        "Updated tool '{}' policy to {}",
+                                        tool,
+                                        policy.as_str().bold()
+                                    );
+                                } else {
+                                    println!(
+                                        "Invalid policy '{}'. Options: auto, ask, deny",
+                                        policy_str
+                                    );
+                                }
+                            } else {
+                                println!(
+                                    "Usage: /permissions | /permissions set <tool> <auto|ask|deny>"
+                                );
+                            }
+                            continue;
+                        }
+                        "/session" => {
+                            let parts: Vec<&str> = arg.split_whitespace().collect();
+                            match parts.first().copied().unwrap_or("list") {
+                                "save" => {
+                                    let id = parts.get(1).copied().unwrap_or("current");
+                                    let saved_msgs: Vec<session::SavedMessage> = state
+                                        .history
+                                        .iter()
+                                        .map(|m| session::SavedMessage {
+                                            role: m.role.clone(),
+                                            content: m.content.clone(),
+                                        })
+                                        .collect();
+                                    match session::SessionManager::save_session(
+                                        id,
+                                        &state.config.active_model,
+                                        &state.workspace_dir,
+                                        saved_msgs,
+                                    ) {
+                                        Ok(p) => println!(
+                                            "Session saved to {}",
+                                            p.display().to_string().bold().green()
+                                        ),
+                                        Err(e) => println!("Error saving session: {}", e),
+                                    }
+                                }
+                                "list" => match session::SessionManager::list_sessions() {
+                                    Ok(sessions) => {
+                                        if sessions.is_empty() {
+                                            println!(
+                                                "No saved sessions found in ~/.orbit/sessions/."
+                                            );
+                                        } else {
+                                            println!("{}", "=== SAVED SESSIONS ===".bold().cyan());
+                                            for (id, date, model, turns) in sessions {
+                                                println!(
+                                                    "  [{}] {} ({} turns, model: {})",
+                                                    id.bold().yellow(),
+                                                    date,
+                                                    turns,
+                                                    model
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => println!("Error listing sessions: {}", e),
+                                },
+                                _ => println!("Usage: /session save [id] | /session list"),
+                            }
+                            continue;
+                        }
+                        "/resume" => {
+                            let id = arg.trim();
+                            if id.is_empty() {
+                                println!("Usage: /resume <session_id>");
+                            } else {
+                                match session::SessionManager::load_session(id) {
+                                    Ok(snap) => {
+                                        state.history = snap
+                                            .messages
+                                            .into_iter()
+                                            .map(|m| Message {
+                                                role: m.role,
+                                                content: m.content,
+                                            })
+                                            .collect();
+                                        state.config.active_model = snap.model;
+                                        println!(
+                                            "{}",
+                                            format!(
+                                                "Resumed session '{}' with {} messages.",
+                                                id,
+                                                state.history.len()
+                                            )
+                                            .bold()
+                                            .green()
+                                        );
+                                    }
+                                    Err(e) => println!("Error resuming session: {}", e),
+                                }
                             }
                             continue;
                         }
