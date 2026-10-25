@@ -51,6 +51,8 @@ pub struct TuiApp {
     pub visual_start: usize,
     pub visual_cursor: usize,
     pub yank_buffer: String,
+    pub is_generating: bool,
+    pub spinner_frame: usize,
 }
 
 impl TuiApp {
@@ -77,6 +79,8 @@ impl TuiApp {
             visual_start: 0,
             visual_cursor: 0,
             yank_buffer: String::new(),
+            is_generating: false,
+            spinner_frame: 0,
         }
     }
 
@@ -423,6 +427,9 @@ async fn submit_input(
     });
 
     let tool_re = regex::Regex::new(crate::TOOL_REGEX_PATTERN)?;
+    let start_time = std::time::Instant::now();
+    let spinner_frames = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    app.is_generating = true;
 
     for _step in 0..8 {
         let active_limit = state
@@ -443,7 +450,13 @@ async fn submit_input(
 
         app.auto_scroll = true;
         app.streaming_reply.clear();
-        app.status_message = format!("Generating response with {}...", state.config.active_model);
+        app.spinner_frame = 0;
+        let s_char = spinner_frames[app.spinner_frame % spinner_frames.len()];
+        let elapsed = start_time.elapsed().as_secs_f32();
+        app.status_message = format!(
+            "{} Connecting to {} ({:.1}s)...",
+            s_char, state.config.active_model, elapsed
+        );
         terminal.draw(|frame| render_ui(frame, app, state))?;
 
         let full_result = {
@@ -452,6 +465,7 @@ async fn submit_input(
             tokio::pin!(stream_fut);
 
             let mut res: Option<Result<String>> = None;
+            let mut last_spin = std::time::Instant::now();
             while res.is_none() {
                 tokio::select! {
                     result = &mut stream_fut => {
@@ -459,13 +473,36 @@ async fn submit_input(
                     }
                     Some(chunk) = rx.recv() => {
                         app.streaming_reply.push_str(&chunk);
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_spin) >= std::time::Duration::from_millis(80) {
+                            last_spin = now;
+                            app.spinner_frame = app.spinner_frame.wrapping_add(1);
+                        }
+                        let s_char = spinner_frames[app.spinner_frame % spinner_frames.len()];
+                        let elapsed = start_time.elapsed().as_secs_f32();
+                        app.status_message = format!("{} Streaming from {} ({:.1}s)...", s_char, state.config.active_model, elapsed);
                         terminal.draw(|frame| render_ui(frame, app, state))?;
                     }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(30)) => {
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_spin) >= std::time::Duration::from_millis(80) {
+                            last_spin = now;
+                            app.spinner_frame = app.spinner_frame.wrapping_add(1);
+                            let s_char = spinner_frames[app.spinner_frame % spinner_frames.len()];
+                            let elapsed = start_time.elapsed().as_secs_f32();
+                            if app.streaming_reply.is_empty() {
+                                app.status_message = format!("{} Thinking... Waiting for {} ({:.1}s)", s_char, state.config.active_model, elapsed);
+                            } else {
+                                app.status_message = format!("{} Streaming from {} ({:.1}s)...", s_char, state.config.active_model, elapsed);
+                            }
+                            terminal.draw(|frame| render_ui(frame, app, state))?;
+                        }
+
                         if event::poll(std::time::Duration::from_millis(0))? {
                             if let Event::Key(key) = event::read()? {
                                 if key.kind == KeyEventKind::Press && (key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))) {
                                     app.status_message = "Generation interrupted by user.".to_string();
+                                    app.is_generating = false;
                                     break;
                                 }
                             }
@@ -495,9 +532,15 @@ async fn submit_input(
                     }
 
                     if !parsed_tools.is_empty() {
+                        let tool_names: Vec<String> =
+                            parsed_tools.iter().map(|t| t.name.clone()).collect();
+                        app.spinner_frame = app.spinner_frame.wrapping_add(1);
+                        let s_char = spinner_frames[app.spinner_frame % spinner_frames.len()];
                         app.status_message = format!(
-                            "⚙️ Executing {} tool(s) (with parallel read-only dispatch)...",
-                            parsed_tools.len()
+                            "⚙️ {} Executing {} tool(s) [{}]...",
+                            s_char,
+                            parsed_tools.len(),
+                            tool_names.join(", ")
                         );
                         terminal.draw(|frame| render_ui(frame, app, state))?;
 
@@ -523,14 +566,19 @@ async fn submit_input(
                     }
                 }
 
+                app.is_generating = false;
+                let elapsed = start_time.elapsed().as_secs_f32();
                 app.mode = TuiMode::Insert;
-                app.status_message =
-                    "-- INSERT -- Ready. Type prompt | [Esc] Normal mode | [Enter] Submit"
-                        .to_string();
+                app.status_message = format!(
+                    "✨ Ready in {:.1}s. Type prompt | [Esc] Normal mode | [Enter] Submit",
+                    elapsed
+                );
+                terminal.draw(|frame| render_ui(frame, app, state))?;
                 break;
             }
             Some(Err(e)) => {
-                app.status_message = format!("Error: {}", e);
+                app.is_generating = false;
+                app.status_message = format!("❌ Error: {}", e);
                 if !app.streaming_reply.is_empty() {
                     state.history.push(crate::Message {
                         role: "assistant".to_string(),
@@ -540,6 +588,7 @@ async fn submit_input(
                 break;
             }
             None => {
+                app.is_generating = false;
                 if !app.streaming_reply.is_empty() {
                     state.history.push(crate::Message {
                         role: "assistant".to_string(),
@@ -550,6 +599,7 @@ async fn submit_input(
             }
         }
     }
+    app.is_generating = false;
     terminal.draw(|frame| render_ui(frame, app, state))?;
     Ok(())
 }
@@ -877,7 +927,12 @@ async fn tui_event_loop(
                             }
                             KeyCode::Char('j') | KeyCode::Down => match app.active_pane {
                                 ActivePane::Chat => {
-                                    let chat_lines = build_chat_lines(state, &app.streaming_reply);
+                                    let chat_lines = build_chat_lines(
+                                        state,
+                                        &app.streaming_reply,
+                                        app.is_generating,
+                                        app.spinner_frame,
+                                    );
                                     if app.visual_cursor + 1 < chat_lines.len() {
                                         app.visual_cursor += 1;
                                         if app.visual_cursor as u16
@@ -922,7 +977,12 @@ async fn tui_event_loop(
                             }
                             KeyCode::Char('G') => {
                                 if app.active_pane == ActivePane::Chat {
-                                    let chat_lines = build_chat_lines(state, &app.streaming_reply);
+                                    let chat_lines = build_chat_lines(
+                                        state,
+                                        &app.streaming_reply,
+                                        app.is_generating,
+                                        app.spinner_frame,
+                                    );
                                     app.visual_cursor = chat_lines.len().saturating_sub(1);
                                     app.chat_scroll = app.max_chat_scroll;
                                 } else if app.active_pane == ActivePane::FileTree {
@@ -932,7 +992,12 @@ async fn tui_event_loop(
                             }
                             KeyCode::Char('y') | KeyCode::Char('Y') => match app.active_pane {
                                 ActivePane::Chat => {
-                                    let chat_lines = build_chat_lines(state, &app.streaming_reply);
+                                    let chat_lines = build_chat_lines(
+                                        state,
+                                        &app.streaming_reply,
+                                        app.is_generating,
+                                        app.spinner_frame,
+                                    );
                                     let sel_min = app.visual_start.min(app.visual_cursor);
                                     let sel_max = app
                                         .visual_start
@@ -1282,9 +1347,15 @@ fn format_message_lines(lines: &mut Vec<Line>, content: &str, default_style: Sty
     }
 }
 
-pub fn build_chat_lines(state: &AgentState, streaming_reply: &str) -> Vec<Line<'static>> {
+pub fn build_chat_lines(
+    state: &AgentState,
+    streaming_reply: &str,
+    is_generating: bool,
+    spinner_frame: usize,
+) -> Vec<Line<'static>> {
+    let spinner_frames = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut lines = Vec::new();
-    if state.history.is_empty() && streaming_reply.is_empty() {
+    if state.history.is_empty() && streaming_reply.is_empty() && !is_generating {
         lines.push(Line::from(Span::styled(
             "Welcome to Orbit TUI! Type your prompt below and press [Enter].",
             Style::default().fg(Color::Cyan).bold(),
@@ -1315,9 +1386,25 @@ pub fn build_chat_lines(state: &AgentState, streaming_reply: &str) -> Vec<Line<'
             lines.push(Line::from(""));
         }
 
-        if !streaming_reply.is_empty() {
+        if is_generating && streaming_reply.is_empty() {
+            let s_char = spinner_frames[spinner_frame % spinner_frames.len()];
+            lines.push(Line::from(vec![
+                Span::styled("🤖 Orbit: ", Style::default().fg(Color::Green).bold()),
+                Span::styled(
+                    format!("{} Thinking... Waiting for model response", s_char),
+                    Style::default().fg(Color::Yellow).bold(),
+                ),
+            ]));
+            lines.push(Line::from(""));
+        } else if !streaming_reply.is_empty() {
+            let prefix = if is_generating {
+                let s_char = spinner_frames[spinner_frame % spinner_frames.len()];
+                format!("🤖 Orbit ({} streaming): ", s_char)
+            } else {
+                "🤖 Orbit: ".to_string()
+            };
             lines.push(Line::from(Span::styled(
-                "🤖 Orbit: ",
+                prefix,
                 Style::default().fg(Color::Green).bold(),
             )));
             format_message_lines(
@@ -1342,7 +1429,12 @@ fn render_chat_pane(frame: &mut ratatui::Frame, area: Rect, app: &mut TuiApp, st
         Color::Blue
     };
 
-    let mut lines = build_chat_lines(state, &app.streaming_reply);
+    let mut lines = build_chat_lines(
+        state,
+        &app.streaming_reply,
+        app.is_generating,
+        app.spinner_frame,
+    );
 
     let total_lines = lines.len();
     let inner_height = area.height.saturating_sub(2) as usize;

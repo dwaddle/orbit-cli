@@ -22,7 +22,7 @@ impl Spinner {
         let msg = initial_message.into();
         let start_time = Instant::now();
 
-        if !io::stdout().is_terminal() {
+        if !io::stderr().is_terminal() {
             return Self {
                 stop_tx: None,
                 msg_tx: None,
@@ -39,7 +39,7 @@ impl Spinner {
 
         let join_handle = tokio::spawn(async move {
             let mut frame_idx = 0;
-            let mut stdout = io::stdout();
+            let mut stderr = io::stderr();
 
             while !*stop_rx.borrow() {
                 let current_msg = msg_rx.borrow().clone();
@@ -53,8 +53,8 @@ impl Spinner {
                     format!("({:.1}s)", elapsed_secs).dimmed()
                 );
 
-                let _ = stdout.write_all(text.as_bytes());
-                let _ = stdout.flush();
+                let _ = stderr.write_all(text.as_bytes());
+                let _ = stderr.flush();
 
                 frame_idx = (frame_idx + 1) % SPINNER_FRAMES.len();
 
@@ -66,8 +66,8 @@ impl Spinner {
                 }
             }
 
-            let _ = stdout.write_all(b"\r\x1b[2K");
-            let _ = stdout.flush();
+            let _ = stderr.write_all(b"\r\x1b[2K");
+            let _ = stderr.flush();
             active_clone.store(false, Ordering::SeqCst);
         });
 
@@ -95,10 +95,10 @@ impl Spinner {
         if let Some(handle) = self.join_handle.take() {
             handle.abort();
         }
-        if io::stdout().is_terminal() {
-            let mut stdout = io::stdout();
-            let _ = stdout.write_all(b"\r\x1b[2K");
-            let _ = stdout.flush();
+        if io::stderr().is_terminal() {
+            let mut stderr = io::stderr();
+            let _ = stderr.write_all(b"\r\x1b[2K");
+            let _ = stderr.flush();
         }
         self.active.store(false, Ordering::SeqCst);
     }
@@ -106,8 +106,8 @@ impl Spinner {
     /// Stops the spinner and displays a permanent completion message.
     pub fn finish_with_message(&mut self, message: &str) {
         self.stop_and_clear();
-        if io::stdout().is_terminal() {
-            println!("{}", message);
+        if io::stderr().is_terminal() {
+            eprintln!("{}", message);
         }
     }
 
