@@ -48,6 +48,7 @@ pub mod rules;
 pub mod search_index;
 pub mod security;
 pub mod session;
+pub mod spinner;
 pub mod subagent;
 pub mod tdd;
 pub mod tui;
@@ -1221,6 +1222,15 @@ pub async fn stream_completion_internal(
     let is_terminal = matches!(mode, StreamOutputMode::TerminalRepl { .. });
 
     for (candidate_idx, model_candidate) in candidates.iter().enumerate() {
+        let mut spinner = if is_terminal {
+            Some(spinner::Spinner::start(format!(
+                "Thinking [{}]{}...",
+                model_candidate, tier_note
+            )))
+        } else {
+            None
+        };
+
         let payload = json!({
             "model": model_candidate,
             "messages": req_messages,
@@ -1242,6 +1252,9 @@ pub async fn stream_completion_internal(
         let resp = match resp_result {
             Ok(r) => r,
             Err(e) => {
+                if let Some(ref mut s) = spinner {
+                    s.stop_and_clear();
+                }
                 if candidate_idx + 1 < candidates.len() {
                     let next = &candidates[candidate_idx + 1];
                     if is_terminal {
@@ -1263,6 +1276,9 @@ pub async fn stream_completion_internal(
 
         let status = resp.status();
         if !status.is_success() {
+            if let Some(ref mut s) = spinner {
+                s.stop_and_clear();
+            }
             let err_text = resp
                 .text()
                 .await
@@ -1293,6 +1309,10 @@ pub async fn stream_completion_internal(
             }
         }
 
+        if let Some(ref mut s) = spinner {
+            s.set_message(format!("Streaming from {}...", model_candidate));
+        }
+
         // Successfully connected to model candidate
         let is_failover = candidate_idx > 0;
         let failover_badge = if is_failover {
@@ -1305,18 +1325,6 @@ pub async fn stream_completion_internal(
         } else {
             ""
         };
-
-        if is_terminal {
-            print!(
-                "\n{} {}{}{}{} ",
-                "🤖".bold(),
-                model_candidate.cyan(),
-                tier_note.magenta(),
-                failover_badge.yellow(),
-                cache_badge.dimmed()
-            );
-            io::stdout().flush()?;
-        }
 
         let start_time = std::time::Instant::now();
         let mut ttft_ms: Option<u128> = None;
@@ -1341,6 +1349,20 @@ pub async fn stream_completion_internal(
                         if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
                             if ttft_ms.is_none() {
                                 ttft_ms = Some(start_time.elapsed().as_millis());
+                                if let Some(ref mut s) = spinner {
+                                    s.stop_and_clear();
+                                }
+                                if is_terminal {
+                                    print!(
+                                        "\n{} {}{}{}{} ",
+                                        "🤖".bold(),
+                                        model_candidate.cyan(),
+                                        tier_note.magenta(),
+                                        failover_badge.yellow(),
+                                        cache_badge.dimmed()
+                                    );
+                                    io::stdout().flush()?;
+                                }
                             }
                             if let Some(h) = &mut highlighter {
                                 h.feed(content);
@@ -3355,6 +3377,8 @@ async fn main() -> Result<()> {
                     content: input.to_string(),
                 });
 
+                let turn_start_time = std::time::Instant::now();
+
                 loop {
                     // Check and auto-prune context at 80% threshold
                     let active_limit = state
@@ -3403,6 +3427,17 @@ async fn main() -> Result<()> {
                                 }
 
                                 if !parsed_tools.is_empty() {
+                                    let tool_summary = parsed_tools
+                                        .iter()
+                                        .map(|t| t.name.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    let mut tool_spinner = spinner::Spinner::start(format!(
+                                        "Executing {} tool(s) [{}]...",
+                                        parsed_tools.len(),
+                                        tool_summary
+                                    ));
+
                                     let results =
                                         dispatch::ToolDispatch::execute_batch(
                                             parsed_tools,
@@ -3414,6 +3449,8 @@ async fn main() -> Result<()> {
                                             },
                                         )
                                         .await;
+
+                                    tool_spinner.stop_and_clear();
 
                                     for (tool_name, tool_result) in results {
                                         println!("{}\n{}", "Result:".dimmed(), tool_result);
@@ -3433,6 +3470,15 @@ async fn main() -> Result<()> {
                                     continue;
                                 }
                             }
+                            println!(
+                                "{}",
+                                format!(
+                                    "✨ Finished in {:.1}s. Ready for input.",
+                                    turn_start_time.elapsed().as_secs_f32()
+                                )
+                                .green()
+                                .dimmed()
+                            );
                             break;
                         }
                         Err(e) => {
