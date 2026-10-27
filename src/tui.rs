@@ -195,6 +195,7 @@ async fn submit_input(
         return Ok(());
     }
     app.input_text.clear();
+    app.auto_scroll = true;
 
     if input == "/exit" || input == "/quit" {
         app.should_quit = true;
@@ -1418,6 +1419,87 @@ pub fn build_chat_lines(
     lines
 }
 
+pub fn count_wrapped_lines(lines: &[Line], max_width: usize) -> usize {
+    if max_width == 0 {
+        return lines.len();
+    }
+
+    let mut total_visual = 0;
+    for line in lines {
+        let total_w = line.width();
+        if total_w == 0 {
+            total_visual += 1;
+            continue;
+        }
+
+        if total_w <= max_width {
+            total_visual += 1;
+            continue;
+        }
+
+        let mut visual_rows = 0;
+        let mut current_row_w = 0;
+
+        for span in &line.spans {
+            let text = span.content.as_ref();
+            let mut word_start = 0;
+            let chars: Vec<(usize, char)> = text.char_indices().collect();
+
+            for (i, &(byte_idx, ch)) in chars.iter().enumerate() {
+                if ch.is_whitespace() {
+                    let word = &text[word_start..byte_idx + ch.len_utf8()];
+                    let word_w = ratatui::text::Span::raw(word).width();
+
+                    if current_row_w + word_w > max_width && current_row_w > 0 {
+                        visual_rows += 1;
+                        current_row_w = word_w;
+                    } else {
+                        current_row_w += word_w;
+                    }
+
+                    if i + 1 < chars.len() {
+                        word_start = chars[i + 1].0;
+                    } else {
+                        word_start = text.len();
+                    }
+                }
+            }
+
+            if word_start < text.len() {
+                let remainder = &text[word_start..];
+                let rem_w = ratatui::text::Span::raw(remainder).width();
+
+                if current_row_w + rem_w > max_width && current_row_w > 0 {
+                    visual_rows += 1;
+                    if rem_w > max_width {
+                        visual_rows += (rem_w - 1) / max_width;
+                        current_row_w = rem_w % max_width;
+                        if current_row_w == 0 {
+                            current_row_w = max_width;
+                        }
+                    } else {
+                        current_row_w = rem_w;
+                    }
+                } else {
+                    current_row_w += rem_w;
+                    if current_row_w > max_width && visual_rows == 0 {
+                        visual_rows += (current_row_w - 1) / max_width;
+                        current_row_w %= max_width;
+                    }
+                }
+            }
+        }
+
+        if current_row_w > 0 || visual_rows == 0 {
+            visual_rows += 1;
+        }
+
+        total_visual += visual_rows;
+    }
+
+    total_visual
+}
+
 fn render_chat_pane(frame: &mut ratatui::Frame, area: Rect, app: &mut TuiApp, state: &AgentState) {
     let border_color = if app.active_pane == ActivePane::Chat {
         if app.mode == TuiMode::Visual {
@@ -1436,9 +1518,10 @@ fn render_chat_pane(frame: &mut ratatui::Frame, area: Rect, app: &mut TuiApp, st
         app.spinner_frame,
     );
 
-    let total_lines = lines.len();
+    let inner_width = area.width.saturating_sub(2) as usize;
     let inner_height = area.height.saturating_sub(2) as usize;
-    let max_scroll = total_lines.saturating_sub(inner_height) as u16;
+    let total_visual_lines = count_wrapped_lines(&lines, inner_width);
+    let max_scroll = total_visual_lines.saturating_sub(inner_height) as u16;
     app.max_chat_scroll = max_scroll;
 
     if app.mode == TuiMode::Visual && app.active_pane == ActivePane::Chat {
@@ -1456,6 +1539,7 @@ fn render_chat_pane(frame: &mut ratatui::Frame, area: Rect, app: &mut TuiApp, st
     }
 
     let scroll_pos = if app.auto_scroll {
+        app.chat_scroll = max_scroll;
         max_scroll
     } else {
         app.chat_scroll.min(max_scroll)
@@ -1739,5 +1823,32 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir_a);
         let _ = std::fs::remove_dir_all(&temp_dir_b);
+    }
+
+    #[test]
+    fn test_count_wrapped_lines() {
+        // Empty lines count as 1 visual row
+        let lines = vec![Line::from(""), Line::from("")];
+        assert_eq!(count_wrapped_lines(&lines, 80), 2);
+
+        // Short lines fit in 1 row
+        let lines = vec![Line::from("Hello world"), Line::from("Second short line")];
+        assert_eq!(count_wrapped_lines(&lines, 80), 2);
+
+        // Long line wrapping across multiple rows
+        // "This is a longer line that will wrap when rendered into a narrow width of 20 columns." (86 chars)
+        let long_line = Line::from(
+            "This is a longer line that will wrap when rendered into a narrow width of 20 columns.",
+        );
+        let wrapped_rows = count_wrapped_lines(&[long_line], 20);
+        assert!(
+            wrapped_rows >= 5,
+            "Expected at least 5 rows for 86 chars wrapped at 20 cols, got {}",
+            wrapped_rows
+        );
+
+        // Unicode / emoji width
+        let emoji_line = Line::from("🧑 User: Heb de versie met Nduja gemaakt");
+        assert_eq!(count_wrapped_lines(&[emoji_line], 80), 1);
     }
 }
