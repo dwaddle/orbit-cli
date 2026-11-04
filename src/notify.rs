@@ -102,10 +102,11 @@ impl TaskNotificationManager {
         // macOS: osascript
         #[cfg(target_os = "macos")]
         {
+            let clean_msg = message.replace(['\\', '"', '\n', '\r'], " ");
+            let clean_title = title.replace(['\\', '"', '\n', '\r'], " ");
             let script = format!(
                 "display notification \"{}\" with title \"{}\"",
-                message.replace('"', "\\\""),
-                title.replace('"', "\\\"")
+                clean_msg, clean_title
             );
             let _ = Command::new("osascript").args(["-e", &script]).spawn();
         }

@@ -86,35 +86,86 @@ impl ToolPermissions {
     }
 }
 
+pub fn prompt_tool_approval(tool_name: &str) -> std::io::Result<bool> {
+    use colored::*;
+    use std::io::{self, Write};
+
+    print!(
+        "⚠️  Tool Permission Prompt: Allow execution of '{}'? [y/N]: ",
+        tool_name.bold().yellow()
+    );
+    io::stdout().flush()?;
+    let mut resp = String::new();
+    io::stdin().read_line(&mut resp)?;
+    let ans = resp.trim().to_lowercase();
+    Ok(ans == "y" || ans == "yes")
+}
+
 pub struct WorkspaceSandbox;
 
 impl WorkspaceSandbox {
     pub fn sanitize_path(target: &Path, workspace_root: &Path) -> Result<PathBuf, String> {
         let root = workspace_root
             .canonicalize()
-            .unwrap_or_else(|_| workspace_root.to_path_buf());
+            .map_err(|e| format!("Failed to canonicalize workspace root: {}", e))?;
 
-        let full_path = if target.is_absolute() {
+        let resolved = if target.is_absolute() {
             target.to_path_buf()
         } else {
             root.join(target)
         };
 
-        let canonical = if full_path.exists() {
-            full_path.canonicalize().map_err(|e| e.to_string())?
-        } else {
-            // For not-yet-existing files, canonicalize the parent directory
-            let parent = full_path.parent().unwrap_or(&root);
-            let canonical_parent = parent.canonicalize().unwrap_or_else(|_| root.clone());
-            if let Some(file_name) = full_path.file_name() {
-                canonical_parent.join(file_name)
+        if resolved.exists() {
+            let canonical = resolved.canonicalize().map_err(|e| e.to_string())?;
+            if canonical.starts_with(&root) {
+                return Ok(canonical);
             } else {
-                canonical_parent
+                return Err(format!(
+                    "Access denied: path '{}' escapes workspace boundary '{}'",
+                    target.display(),
+                    workspace_root.display()
+                ));
             }
+        }
+
+        // For non-existent files: find the highest existing ancestor, canonicalize it,
+        // and verify it is strictly within the workspace root.
+        let mut uncreated_components = Vec::new();
+        let mut curr: &Path = &resolved;
+        while !curr.exists() {
+            if let Some(name) = curr.file_name() {
+                uncreated_components.push(name);
+            }
+            match curr.parent() {
+                Some(p) if p != curr => curr = p,
+                _ => break,
+            }
+        }
+
+        let canonical_base = if curr.exists() {
+            curr.canonicalize().map_err(|e| e.to_string())?
+        } else {
+            return Err(format!(
+                "Access denied: cannot resolve base path for '{}'",
+                target.display()
+            ));
         };
 
-        if canonical.starts_with(&root) {
-            Ok(canonical)
+        if !canonical_base.starts_with(&root) {
+            return Err(format!(
+                "Access denied: path '{}' escapes workspace boundary '{}'",
+                target.display(),
+                workspace_root.display()
+            ));
+        }
+
+        let mut final_path = canonical_base;
+        for component in uncreated_components.into_iter().rev() {
+            final_path.push(component);
+        }
+
+        if final_path.starts_with(&root) {
+            Ok(final_path)
         } else {
             Err(format!(
                 "Access denied: path '{}' escapes workspace boundary '{}'",
@@ -214,6 +265,16 @@ mod tests {
         let err = WorkspaceSandbox::sanitize_path(escaping, ws);
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("escapes workspace boundary"));
+
+        // Non-existent path attempting escape via nested traverse
+        let non_existent_escaping = Path::new("../../nonexistent_dir/nested/escape.txt");
+        let err2 = WorkspaceSandbox::sanitize_path(non_existent_escaping, ws);
+        assert!(err2.is_err());
+
+        // Non-existent nested path inside workspace is permitted
+        let valid_new_file = Path::new("sub/dir/new_module.rs");
+        let ok_new = WorkspaceSandbox::sanitize_path(valid_new_file, ws);
+        assert!(ok_new.is_ok());
     }
 
     #[test]

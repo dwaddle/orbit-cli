@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PatchBlock {
@@ -186,8 +186,17 @@ fn normalize_trailing_spaces(input: &str) -> String {
 
 /// Applies a surgical patch to a file on disk.
 pub fn apply_patch_to_file(path_str: &str, raw_patch: &str) -> Result<PatchResult> {
+    apply_patch_to_file_in_workspace(path_str, raw_patch, None)
+}
+
+/// Applies a surgical patch to a file on disk, enforcing sandbox boundaries if workspace is specified.
+pub fn apply_patch_to_file_in_workspace(
+    path_str: &str,
+    raw_patch: &str,
+    workspace: Option<&Path>,
+) -> Result<PatchResult> {
     let (embedded_path, blocks) = parse_patch_blocks(raw_patch)?;
-    let final_path = if !path_str.trim().is_empty() {
+    let raw_target = if !path_str.trim().is_empty() {
         path_str.trim()
     } else if let Some(ref ep) = embedded_path {
         ep.as_str()
@@ -195,18 +204,24 @@ pub fn apply_patch_to_file(path_str: &str, raw_patch: &str) -> Result<PatchResul
         return Err(anyhow!("No target file path specified for apply_patch"));
     };
 
-    let p = Path::new(final_path);
+    let p = if let Some(ws) = workspace {
+        crate::security::WorkspaceSandbox::sanitize_path(Path::new(raw_target), ws)
+            .map_err(|e| anyhow!("{}", e))?
+    } else {
+        PathBuf::from(raw_target)
+    };
+
     if !p.exists() {
-        return Err(anyhow!("File does not exist: {}", final_path));
+        return Err(anyhow!("File does not exist: {}", p.display()));
     }
 
-    let original = fs::read_to_string(p)?;
+    let original = fs::read_to_string(&p)?;
     let updated = apply_patch_blocks_to_content(&original, &blocks)?;
 
-    fs::write(p, &updated)?;
+    fs::write(&p, &updated)?;
 
     Ok(PatchResult {
-        path: final_path.to_string(),
+        path: p.display().to_string(),
         blocks_applied: blocks.len(),
         original_len: original.len(),
         new_len: updated.len(),

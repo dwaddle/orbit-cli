@@ -213,6 +213,15 @@ impl AgentState {
             .unwrap_or_else(|| PathBuf::from("~/.config"))
             .join("openrouter");
         fs::create_dir_all(&config_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = fs::metadata(&config_dir) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o700);
+                let _ = fs::set_permissions(&config_dir, perms);
+            }
+        }
         let config_path = config_dir.join("config.json");
 
         let mut config = if config_path.exists() {
@@ -347,6 +356,15 @@ impl AgentState {
     fn save_config(&self) -> Result<()> {
         let data = serde_json::to_string_pretty(&self.config)?;
         fs::write(&self.config_path, data)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = fs::metadata(&self.config_path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o600);
+                let _ = fs::set_permissions(&self.config_path, perms);
+            }
+        }
         Ok(())
     }
 
@@ -616,6 +634,27 @@ async fn execute_tool_internal(
             format!("⚙️ Executing Tool: {}", tool_name).bold().yellow()
         );
     }
+
+    // Security Tool Permission Gate
+    let policy = state.tool_permissions.check_permission(tool_name);
+    match policy {
+        security::ToolPolicy::Deny => {
+            return format!(
+                "⛔ Security Policy: Execution of tool '{}' is DENIED.",
+                tool_name
+            );
+        }
+        security::ToolPolicy::Ask => {
+            if !quiet {
+                match security::prompt_tool_approval(tool_name) {
+                    Ok(true) => {}
+                    _ => return format!("Tool '{}' execution rejected by user.", tool_name),
+                }
+            }
+        }
+        security::ToolPolicy::Auto => {}
+    }
+
     match tool_name {
         "run_command" => {
             let cmd = body.trim();
@@ -672,8 +711,15 @@ async fn execute_tool_internal(
             }
         }
         "view_file" => {
-            let path = body.trim();
-            match fs::read_to_string(path) {
+            let path_str = body.trim();
+            let safe_path = match security::WorkspaceSandbox::sanitize_path(
+                Path::new(path_str),
+                &state.workspace_dir,
+            ) {
+                Ok(p) => p,
+                Err(e) => return format!("Security Sandbox Error: {}", e),
+            };
+            match fs::read_to_string(&safe_path) {
                 Ok(content) => {
                     let lines: Vec<&str> = content.lines().collect();
                     let preview = if lines.len() > 200 {
@@ -685,40 +731,58 @@ async fn execute_tool_internal(
                     } else {
                         content
                     };
-                    format!("File Content ({}):\n{}", path, preview)
+                    format!("File Content ({}):\n{}", safe_path.display(), preview)
                 }
-                Err(e) => format!("Failed to read file {}: {}", path, e),
+                Err(e) => format!("Failed to read file {}: {}", safe_path.display(), e),
             }
         }
         "write_file" => {
             let mut parts = body.trim_start().splitn(2, '\n');
-            let path = parts.next().unwrap_or("").trim();
+            let path_str = parts.next().unwrap_or("").trim();
             let content = parts.next().unwrap_or("");
-            if path.is_empty() {
+            if path_str.is_empty() {
                 return "Error: Empty path specified for write_file".to_string();
             }
 
+            let safe_path = match security::WorkspaceSandbox::sanitize_path(
+                Path::new(path_str),
+                &state.workspace_dir,
+            ) {
+                Ok(p) => p,
+                Err(e) => return format!("Security Sandbox Error: {}", e),
+            };
+
+            let path_display = safe_path.display().to_string();
+
             // Interactive diff approval check
             if state.config.diff_approval_required && !quiet {
-                let existing = fs::read_to_string(path).unwrap_or_default();
-                let diff = diff_review::generate_unified_diff(&existing, content, path);
-                if !diff_review::prompt_diff_approval(&diff, path).unwrap_or(true) {
-                    return format!("Modification to {} was rejected by user.", path);
+                let existing = fs::read_to_string(&safe_path).unwrap_or_default();
+                let diff = diff_review::generate_unified_diff(&existing, content, &path_display);
+                if !diff_review::prompt_diff_approval(&diff, &path_display).unwrap_or(true) {
+                    return format!("Modification to {} was rejected by user.", path_display);
                 }
             }
 
             // Snapshot before write
             state
                 .checkpoint_mgr
-                .record_before_modify(Path::new(path), "write_file");
+                .record_before_modify(&safe_path, "write_file");
 
-            match fs::write(path, content) {
+            if let Some(parent) = safe_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+
+            match fs::write(&safe_path, content) {
                 Ok(_) => {
-                    let mut res = format!("Successfully wrote {} bytes to {}", content.len(), path);
+                    let mut res = format!(
+                        "Successfully wrote {} bytes to {}",
+                        content.len(),
+                        path_display
+                    );
 
                     // Compile Guard check
                     if state.config.compile_guard_enabled {
-                        let comp = state.compile_guard.check_for_path(Path::new(path));
+                        let comp = state.compile_guard.check_for_path(&safe_path);
                         if comp.command != "none" {
                             if !quiet {
                                 println!("{}", compile_guard::format_compile_banner(&comp));
@@ -745,7 +809,7 @@ async fn execute_tool_internal(
                             println!("{}", "🛡️ Running automatic adversarial review...".dimmed());
                         }
                         match review::AdversarialReviewer::review_code(
-                            path,
+                            &path_display,
                             content,
                             "Automatic post-write safety and regression review",
                             &state.config.api_key,
@@ -772,7 +836,7 @@ async fn execute_tool_internal(
                     }
                     res
                 }
-                Err(e) => format!("Failed to write file {}: {}", path, e),
+                Err(e) => format!("Failed to write file {}: {}", path_display, e),
             }
         }
         "apply_patch" => {
@@ -788,14 +852,30 @@ async fn execute_tool_internal(
                 ("".to_string(), body.to_string())
             };
 
+            let safe_target = if !target_path.is_empty() {
+                match security::WorkspaceSandbox::sanitize_path(
+                    Path::new(&target_path),
+                    &state.workspace_dir,
+                ) {
+                    Ok(p) => p.display().to_string(),
+                    Err(e) => return format!("Security Sandbox Error: {}", e),
+                }
+            } else {
+                target_path
+            };
+
             // Snapshot target file before patch
-            if !target_path.is_empty() {
+            if !safe_target.is_empty() {
                 state
                     .checkpoint_mgr
-                    .record_before_modify(Path::new(&target_path), "apply_patch");
+                    .record_before_modify(Path::new(&safe_target), "apply_patch");
             }
 
-            match patch::apply_patch_to_file(&target_path, &patch_payload) {
+            match patch::apply_patch_to_file_in_workspace(
+                &safe_target,
+                &patch_payload,
+                Some(&state.workspace_dir),
+            ) {
                 Ok(patch_res) => {
                     let mut res = format!(
                         "Successfully applied {} search/replace block(s) to {} (bytes: {} -> {})",
@@ -2866,11 +2946,11 @@ async fn main() -> Result<()> {
                             } else {
                                 for s in snapshots.iter().rev().take(10) {
                                     println!(
-                                        "• Snapshot #{} [{}] {} (has previous content: {})",
+                                        "• Snapshot #{} [{}] {} (existed before: {})",
                                         s.id,
                                         s.action.yellow(),
                                         s.path.display().to_string().bold(),
-                                        s.previous_content.is_some()
+                                        s.existed_before
                                     );
                                 }
                             }
@@ -3779,12 +3859,14 @@ async fn main() -> Result<()> {
                                     tool_spinner.stop_and_clear();
 
                                     for (tool_name, tool_result) in results {
-                                        println!("{}\n{}", "Result:".dimmed(), tool_result);
+                                        let redacted_result =
+                                            state.secret_redactor.redact(&tool_result);
+                                        println!("{}\n{}", "Result:".dimmed(), redacted_result);
                                         state.history.push(Message {
                                             role: "user".to_string(),
                                             content: format!(
                                                 "[TOOL OUTPUT ({})]:\n{}",
-                                                tool_name, tool_result
+                                                tool_name, redacted_result
                                             ),
                                         });
                                     }
@@ -3902,5 +3984,69 @@ mod tests {
         let _ = std::env::set_current_dir(&orig_dir);
         let _ = std::fs::remove_dir_all(&temp_dir_1);
         let _ = std::fs::remove_dir_all(&temp_dir_2);
+    }
+
+    #[tokio::test]
+    async fn test_tool_permission_gate_denies_execution() {
+        let mut state = AgentState::new(Some(std::env::temp_dir())).unwrap();
+        state
+            .tool_permissions
+            .set_policy("run_command", security::ToolPolicy::Deny);
+
+        let res = execute_tool_quiet("run_command", "echo 'should_not_run'", &state).await;
+        assert!(res.contains("DENIED"), "Expected denial message: {}", res);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_blocks_escaping_file_tools() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("orbit_sandbox_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let state = AgentState::new(Some(temp_dir.clone())).unwrap();
+
+        // 1. view_file escaping boundary
+        let view_res = execute_tool_quiet("view_file", "../../etc/passwd", &state).await;
+        assert!(
+            view_res.contains("Security Sandbox Error"),
+            "Expected sandbox error on view_file: {}",
+            view_res
+        );
+
+        // 2. write_file escaping boundary
+        let write_res = execute_tool_quiet(
+            "write_file",
+            "../../etc/evil.txt\nmalicious payload",
+            &state,
+        )
+        .await;
+        assert!(
+            write_res.contains("Security Sandbox Error"),
+            "Expected sandbox error on write_file: {}",
+            write_res
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_config_file_permissions_unix() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let temp_cfg =
+                std::env::temp_dir().join(format!("orbit_cfg_perm_{}", std::process::id()));
+            let _ = std::fs::remove_file(&temp_cfg);
+
+            let mut state = AgentState::new(Some(std::env::temp_dir())).unwrap();
+            state.config_path = temp_cfg.clone();
+            state.save_config().unwrap();
+
+            let perms = std::fs::metadata(&temp_cfg).unwrap().permissions();
+            assert_eq!(perms.mode() & 0o777, 0o600);
+
+            let _ = std::fs::remove_file(&temp_cfg);
+        }
     }
 }

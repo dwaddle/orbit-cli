@@ -44,6 +44,12 @@ impl McpClient {
     pub async fn spawn(server_name: &str, config: &McpServerConfig) -> Result<Self> {
         let mut cmd = Command::new(&config.command);
         cmd.args(&config.args);
+        cmd.env_clear();
+        for key in &["PATH", "HOME", "USER", "LANG", "SHELL", "TERM"] {
+            if let Ok(val) = std::env::var(key) {
+                cmd.env(key, val);
+            }
+        }
         for (k, v) in &config.env {
             cmd.env(k, v);
         }

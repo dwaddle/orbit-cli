@@ -557,9 +557,13 @@ async fn submit_input(
                         };
 
                         for (tool_name, tool_result) in results {
+                            let redacted_result = state.secret_redactor.redact(&tool_result);
                             state.history.push(crate::Message {
                                 role: "user".to_string(),
-                                content: format!("[TOOL OUTPUT ({})]:\n{}", tool_name, tool_result),
+                                content: format!(
+                                    "[TOOL OUTPUT ({})]:\n{}",
+                                    tool_name, redacted_result
+                                ),
                             });
                         }
                         terminal.draw(|frame| render_ui(frame, app, state))?;

@@ -8,7 +8,8 @@ use std::time::SystemTime;
 pub struct Snapshot {
     pub id: usize,
     pub path: PathBuf,
-    pub previous_content: Option<String>,
+    pub previous_bytes: Option<Vec<u8>>,
+    pub existed_before: bool,
     pub action: String,
     pub timestamp: SystemTime,
 }
@@ -38,8 +39,9 @@ impl CheckpointManager {
     pub fn record_before_modify(&self, path: &Path, action: &str) -> usize {
         let mut guard = self.history.lock().unwrap();
         let id = guard.len() + 1;
-        let previous_content = if path.exists() {
-            fs::read_to_string(path).ok()
+        let existed_before = path.exists();
+        let previous_bytes = if existed_before {
+            fs::read(path).ok()
         } else {
             None
         };
@@ -47,7 +49,8 @@ impl CheckpointManager {
         guard.push(Snapshot {
             id,
             path: path.to_path_buf(),
-            previous_content,
+            previous_bytes,
+            existed_before,
             action: action.to_string(),
             timestamp: SystemTime::now(),
         });
@@ -62,18 +65,25 @@ impl CheckpointManager {
             .pop()
             .ok_or_else(|| anyhow!("No checkpoints available to undo"))?;
 
-        if let Some(content) = snapshot.previous_content {
-            if let Some(parent) = snapshot.path.parent() {
-                let _ = fs::create_dir_all(parent);
+        if snapshot.existed_before {
+            if let Some(bytes) = snapshot.previous_bytes {
+                if let Some(parent) = snapshot.path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                fs::write(&snapshot.path, &bytes)?;
+                Ok(RollbackResult {
+                    id: snapshot.id,
+                    path: snapshot.path,
+                    restored_bytes: bytes.len(),
+                    was_deleted: false,
+                    action: snapshot.action,
+                })
+            } else {
+                Err(anyhow!(
+                    "Cannot restore checkpoint #{}: original file existed but could not be captured",
+                    snapshot.id
+                ))
             }
-            fs::write(&snapshot.path, &content)?;
-            Ok(RollbackResult {
-                id: snapshot.id,
-                path: snapshot.path,
-                restored_bytes: content.len(),
-                was_deleted: false,
-                action: snapshot.action,
-            })
         } else {
             // File did not exist before this snapshot; delete newly created file
             let was_deleted = if snapshot.path.exists() {
@@ -149,5 +159,27 @@ mod tests {
     fn test_empty_rollback_errors() {
         let mgr = CheckpointManager::new();
         assert!(mgr.rollback_last().is_err());
+    }
+
+    #[test]
+    fn test_checkpoint_and_rollback_binary_file() {
+        let tmp = std::env::temp_dir().join(format!("orbit_bin_chk_{}", std::process::id()));
+        let binary_payload: Vec<u8> = vec![0x00, 0xFF, 0xFE, 0xAA, 0xBB, 0xCC, 0x80, 0x90];
+        fs::write(&tmp, &binary_payload).unwrap();
+
+        let mgr = CheckpointManager::new();
+        mgr.record_before_modify(&tmp, "write_file");
+
+        // Overwrite binary file
+        fs::write(&tmp, b"corrupted bytes").unwrap();
+        assert_eq!(fs::read(&tmp).unwrap(), b"corrupted bytes");
+
+        // Rollback restores original non-UTF8 binary bytes without deleting
+        let res = mgr.rollback_last().unwrap();
+        assert_eq!(res.restored_bytes, binary_payload.len());
+        assert!(!res.was_deleted);
+        assert_eq!(fs::read(&tmp).unwrap(), binary_payload);
+
+        let _ = fs::remove_file(&tmp);
     }
 }

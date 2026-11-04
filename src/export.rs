@@ -65,20 +65,22 @@ pub fn export_session_to_org(
 
     doc.push_str("* 💬 Conversation & Implementation Log\n\n");
 
+    let redactor = crate::security::SecretRedactor::default();
     let mut turn_counter = 1;
     for msg in history {
+        let clean_content = redactor.redact(&msg.content);
         if msg.role == "user" {
             doc.push_str(&format!("** Turn {}: User Request\n", turn_counter));
-            doc.push_str(&format!("{}\n\n", msg.content.trim()));
+            doc.push_str(&format!("{}\n\n", clean_content.trim()));
             turn_counter += 1;
         } else if msg.role == "assistant" {
             doc.push_str("*** 🤖 Agent Response\n");
-            let formatted_content = convert_markdown_code_to_org(&msg.content);
+            let formatted_content = convert_markdown_code_to_org(&clean_content);
             doc.push_str(&format!("{}\n\n", formatted_content.trim()));
         } else if msg.role == "tool" || msg.role == "system" {
             doc.push_str(&format!("*** ⚙️ Context / Tool: {}\n", msg.role));
             doc.push_str("#+BEGIN_EXAMPLE\n");
-            doc.push_str(msg.content.trim());
+            doc.push_str(clean_content.trim());
             doc.push_str("\n#+END_EXAMPLE\n\n");
         }
     }
@@ -139,7 +141,7 @@ pub mod tests {
             },
             ExportTurn {
                 role: "assistant".to_string(),
-                content: "Here is the fix:\n```rust\nfn login() {}\n```".to_string(),
+                content: "Here is the fix with token: sk-1234567890abcdef1234567890\n```rust\nfn login() {}\n```".to_string(),
             },
         ];
 
@@ -161,5 +163,7 @@ pub mod tests {
         assert!(content.contains("** Turn 1: User Request"));
         assert!(content.contains("#+BEGIN_SRC rust"));
         assert!(content.contains("#+END_SRC"));
+        assert!(!content.contains("sk-1234567890"));
+        assert!(content.contains("[REDACTED_SECRET]"));
     }
 }
