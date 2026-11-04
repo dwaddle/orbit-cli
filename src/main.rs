@@ -18,7 +18,9 @@ pub mod adr;
 pub mod ast_grep;
 pub mod benchmark;
 pub mod bisect;
+pub mod budget;
 pub mod checkpoint;
+pub mod ci_triage;
 pub mod commit;
 pub mod compile_guard;
 pub mod context;
@@ -37,10 +39,12 @@ mod mcp;
 pub mod memory;
 pub mod metrics;
 pub mod modal_prompt;
+pub mod notify;
 pub mod outline;
 pub mod patch;
 pub mod plan;
 pub mod query_cache;
+pub mod release_gen;
 pub mod repo_map;
 pub mod review;
 pub mod routing;
@@ -199,6 +203,8 @@ pub struct AgentState {
     pub secret_redactor: security::SecretRedactor,
     pub query_cache: query_cache::QueryCache,
     pub project_memory: Option<memory::ProjectMemory>,
+    pub budget_enforcer: Mutex<budget::BudgetEnforcer>,
+    pub notification_mgr: Mutex<notify::TaskNotificationManager>,
 }
 
 impl AgentState {
@@ -268,6 +274,11 @@ impl AgentState {
         let secret_redactor = security::SecretRedactor::default();
         let query_cache = query_cache::QueryCache::default();
         let project_memory = memory::ProjectMemory::load_or_init(&workspace_dir).ok();
+        let budget_enforcer =
+            Mutex::new(budget::BudgetEnforcer::new(budget::BudgetConfig::default()));
+        let notification_mgr = Mutex::new(notify::TaskNotificationManager::new(
+            notify::NotificationConfig::default(),
+        ));
 
         Ok(Self {
             config,
@@ -290,6 +301,8 @@ impl AgentState {
             secret_redactor,
             query_cache,
             project_memory,
+            budget_enforcer,
+            notification_mgr,
         })
     }
 
@@ -1864,6 +1877,18 @@ async fn main() -> Result<()> {
                                 "  /stats / /cost         - View real-time token economics, latency & spend"
                             );
                             println!(
+                                "  /budget [amount|status|off] - Enforce session USD budget cap & auto-fallback"
+                            );
+                            println!(
+                                "  /notify [status|on|off|bell] - Terminal audio bell and desktop notification on task finish"
+                            );
+                            println!(
+                                "  /release [dry-run|apply] - Conventional commits semver bump & CHANGELOG.md generator"
+                            );
+                            println!(
+                                "  /ci [list|triage [run_id]] - GitHub Actions CI run inspector & failure triager"
+                            );
+                            println!(
                                 "  /grep <pattern> [glob] - Blazing fast native ripgrep across codebase"
                             );
                             println!(
@@ -3362,6 +3387,251 @@ async fn main() -> Result<()> {
                             }
                             continue;
                         }
+                        "/budget" => {
+                            let parts: Vec<&str> = arg.split_whitespace().collect();
+                            let sub = parts.first().copied().unwrap_or("status");
+                            match sub {
+                                "status" => {
+                                    let cost = state.metrics.snapshot().await.total_cost_usd;
+                                    println!(
+                                        "{}",
+                                        state.budget_enforcer.lock().unwrap().format_status(cost)
+                                    );
+                                }
+                                "off" | "disable" => {
+                                    state.budget_enforcer.lock().unwrap().set_hard_cap(None);
+                                    println!(
+                                        "{}",
+                                        "Budget limit removed (session unlimited).".yellow()
+                                    );
+                                }
+                                "fallback" => {
+                                    let toggle = parts.get(1).copied().unwrap_or("on");
+                                    let enable =
+                                        toggle != "off" && toggle != "false" && toggle != "disable";
+                                    state
+                                        .budget_enforcer
+                                        .lock()
+                                        .unwrap()
+                                        .set_fallback_to_free(enable);
+                                    let status_str = if enable {
+                                        "ENABLED".green()
+                                    } else {
+                                        "DISABLED".red()
+                                    };
+                                    println!("Budget auto-fallback to free models: {}", status_str);
+                                }
+                                val => match val.parse::<f64>() {
+                                    Ok(amt) if amt > 0.0 => {
+                                        state
+                                            .budget_enforcer
+                                            .lock()
+                                            .unwrap()
+                                            .set_hard_cap(Some(amt));
+                                        println!(
+                                            "{}",
+                                            format!(
+                                                "Session budget hard cap set to ${:.4} USD.",
+                                                amt
+                                            )
+                                            .green()
+                                            .bold()
+                                        );
+                                    }
+                                    _ => {
+                                        println!("Usage: /budget [amount|status|off|fallback on/off] (e.g. /budget 0.50)");
+                                    }
+                                },
+                            }
+                            continue;
+                        }
+                        "/notify" => {
+                            let parts: Vec<&str> = arg.split_whitespace().collect();
+                            let sub = parts.first().copied().unwrap_or("status");
+                            match sub {
+                                "status" => {
+                                    println!(
+                                        "{}",
+                                        state.notification_mgr.lock().unwrap().format_status()
+                                    );
+                                }
+                                "on" | "enable" => {
+                                    state.notification_mgr.lock().unwrap().set_enabled(true);
+                                    println!("{}", "Task notifications: ENABLED".green().bold());
+                                }
+                                "off" | "disable" => {
+                                    state.notification_mgr.lock().unwrap().set_enabled(false);
+                                    println!("{}", "Task notifications: DISABLED".red().bold());
+                                }
+                                "bell" => {
+                                    let current = state
+                                        .notification_mgr
+                                        .lock()
+                                        .unwrap()
+                                        .config()
+                                        .bell_enabled;
+                                    state.notification_mgr.lock().unwrap().set_bell(!current);
+                                    let status_str = if !current {
+                                        "ENABLED".green()
+                                    } else {
+                                        "DISABLED".yellow()
+                                    };
+                                    println!("Terminal bell notification: {}", status_str);
+                                }
+                                "desktop" => {
+                                    let current = state
+                                        .notification_mgr
+                                        .lock()
+                                        .unwrap()
+                                        .config()
+                                        .desktop_enabled;
+                                    state.notification_mgr.lock().unwrap().set_desktop(!current);
+                                    let status_str = if !current {
+                                        "ENABLED".green()
+                                    } else {
+                                        "DISABLED".yellow()
+                                    };
+                                    println!("Desktop notification: {}", status_str);
+                                }
+                                "threshold" => {
+                                    if let Some(sec_str) = parts.get(1) {
+                                        if let Ok(sec) = sec_str.parse::<u64>() {
+                                            state
+                                                .notification_mgr
+                                                .lock()
+                                                .unwrap()
+                                                .set_threshold(sec);
+                                            println!(
+                                                "{}",
+                                                format!(
+                                                    "Notification duration threshold set to {} seconds.",
+                                                    sec
+                                                )
+                                                .green()
+                                                .bold()
+                                            );
+                                        } else {
+                                            println!("Usage: /notify threshold <seconds>");
+                                        }
+                                    } else {
+                                        println!("Usage: /notify threshold <seconds>");
+                                    }
+                                }
+                                _ => {
+                                    println!("Usage: /notify [status|on|off|bell|desktop|threshold <seconds>]");
+                                }
+                            }
+                            continue;
+                        }
+                        "/release" => {
+                            let parts: Vec<&str> = arg.split_whitespace().collect();
+                            let action = parts.first().copied().unwrap_or("dry-run");
+                            match action {
+                                "dry-run" | "plan" | "preview" => {
+                                    match release_gen::ReleaseOrchestrator::plan_release(
+                                        &state.workspace_dir,
+                                    ) {
+                                        Ok(plan) => println!(
+                                            "{}",
+                                            release_gen::ReleaseOrchestrator::format_release_banner(
+                                                &plan
+                                            )
+                                        ),
+                                        Err(e) => println!("Error planning release: {}", e),
+                                    }
+                                }
+                                "apply" | "bump" => {
+                                    match release_gen::ReleaseOrchestrator::plan_release(
+                                        &state.workspace_dir,
+                                    ) {
+                                        Ok(plan) => {
+                                            if plan.bump == release_gen::SemverBump::None {
+                                                println!("{}", "No version bump needed (no new commits found since last tag).".yellow());
+                                            } else {
+                                                match release_gen::ReleaseOrchestrator::apply_release(&state.workspace_dir, &plan) {
+                                                    Ok(()) => {
+                                                        println!(
+                                                            "{}",
+                                                            format!(
+                                                                "Successfully bumped version to v{} in Cargo.toml and updated CHANGELOG.md!",
+                                                                plan.next_version
+                                                            )
+                                                            .green()
+                                                            .bold()
+                                                        );
+                                                    }
+                                                    Err(e) => println!("Error applying release: {}", e),
+                                                }
+                                            }
+                                        }
+                                        Err(e) => println!("Error preparing release: {}", e),
+                                    }
+                                }
+                                _ => {
+                                    println!("Usage: /release [dry-run|apply]");
+                                }
+                            }
+                            continue;
+                        }
+                        "/ci" => {
+                            let parts: Vec<&str> = arg.split_whitespace().collect();
+                            let action = parts.first().copied().unwrap_or("list");
+                            match action {
+                                "list" => {
+                                    match ci_triage::CiTriageManager::list_runs(
+                                        &state.workspace_dir,
+                                        8,
+                                    ) {
+                                        Ok(runs) => {
+                                            println!(
+                                                "{}",
+                                                "=== RECENT GITHUB ACTIONS CI RUNS ==="
+                                                    .bold()
+                                                    .cyan()
+                                            );
+                                            for r in runs {
+                                                let status_badge = if r.conclusion == "success" {
+                                                    r.conclusion.green()
+                                                } else if r.conclusion == "failure" {
+                                                    r.conclusion.red().bold()
+                                                } else {
+                                                    r.status.yellow()
+                                                };
+                                                println!(
+                                                    "  #{} [{}] {} (branch: {}, commit: {})",
+                                                    r.id,
+                                                    status_badge,
+                                                    r.workflow.bold(),
+                                                    r.branch,
+                                                    r.commit
+                                                );
+                                            }
+                                            println!("\nTo triage failures: /ci triage [run_id]");
+                                        }
+                                        Err(e) => println!("Error querying CI runs: {}", e),
+                                    }
+                                }
+                                "triage" | "log" | "failed" => {
+                                    let run_id = parts.get(1).copied();
+                                    match ci_triage::CiTriageManager::triage_failure(
+                                        &state.workspace_dir,
+                                        run_id,
+                                    ) {
+                                        Ok(report) => println!(
+                                            "{}",
+                                            ci_triage::CiTriageManager::format_triage_banner(
+                                                &report
+                                            )
+                                        ),
+                                        Err(e) => println!("Error triaging CI failure: {}", e),
+                                    }
+                                }
+                                _ => {
+                                    println!("Usage: /ci [list|triage [run_id]]");
+                                }
+                            }
+                            continue;
+                        }
                         _ => {
                             println!(
                                 "Unknown command {}. Type `/help` for options.",
@@ -3376,6 +3646,62 @@ async fn main() -> Result<()> {
                     role: "user".to_string(),
                     content: input.to_string(),
                 });
+
+                let total_spent = state.metrics.snapshot().await.total_cost_usd;
+                let verdict = state.budget_enforcer.lock().unwrap().evaluate(total_spent);
+                match verdict {
+                    budget::BudgetVerdict::SoftCapWarning {
+                        current,
+                        limit,
+                        pct,
+                    } => {
+                        println!(
+                            "{}",
+                            format!(
+                                "⚠️  BUDGET WARNING: Session spent ${:.4} USD ({:.1}% of ${:.4} cap).",
+                                current, pct, limit
+                            )
+                            .yellow()
+                            .bold()
+                        );
+                    }
+                    budget::BudgetVerdict::HardCapExceeded {
+                        current,
+                        limit,
+                        switch_to_free,
+                        fallback_model,
+                    } => {
+                        println!(
+                            "{}",
+                            format!(
+                                "🛑 BUDGET CAP EXCEEDED: Session spent ${:.4} USD >= limit ${:.4} USD.",
+                                current, limit
+                            )
+                            .red()
+                            .bold()
+                        );
+                        if switch_to_free {
+                            println!(
+                                "{}",
+                                format!(
+                                    "🔄 Auto-switching active model to free fallback: {}",
+                                    fallback_model
+                                )
+                                .yellow()
+                                .bold()
+                            );
+                            state.config.active_model = fallback_model;
+                        } else {
+                            println!(
+                                "{}",
+                                "Halting turn. Increase budget with `/budget <amount>` or `/budget off`."
+                                    .red()
+                            );
+                            continue;
+                        }
+                    }
+                    budget::BudgetVerdict::Ok => {}
+                }
 
                 let turn_start_time = std::time::Instant::now();
 
@@ -3479,6 +3805,13 @@ async fn main() -> Result<()> {
                                 .green()
                                 .dimmed()
                             );
+                            let dur_secs = turn_start_time.elapsed().as_secs();
+                            state.notification_mgr.lock().unwrap().notify_if_exceeded(
+                                "Turn Execution",
+                                dur_secs,
+                                true,
+                                Some("Ready for next command."),
+                            );
                             break;
                         }
                         Err(e) => {
@@ -3521,7 +3854,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_command_execution() {
-        let state = AgentState::new(None).unwrap();
+        let state = AgentState::new(Some(std::env::temp_dir())).unwrap();
         let res = execute_tool_quiet("run_command", "echo 'orbit_local_ok'", &state).await;
         assert!(
             res.contains("Exit Code: 0"),
@@ -3537,7 +3870,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_system_prompt_includes_local_execution() {
-        let state = AgentState::new(None).unwrap();
+        let state = AgentState::new(Some(std::env::temp_dir())).unwrap();
         let prompt = state.system_prompt();
         assert!(prompt.contains("run_command"));
         assert!(prompt.contains("local operating system"));
