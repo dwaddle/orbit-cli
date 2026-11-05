@@ -1,6 +1,482 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Categories for Long-Term Memory (LTM) insights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InsightCategory {
+    Architecture,
+    BugPattern,
+    UserPreference,
+    BuildQuirk,
+}
+
+impl InsightCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Architecture => "architecture",
+            Self::BugPattern => "bug_pattern",
+            Self::UserPreference => "user_preference",
+            Self::BuildQuirk => "build_quirk",
+        }
+    }
+}
+
+impl std::str::FromStr for InsightCategory {
+    type Err = ();
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().trim() {
+            "architecture" | "arch" => Ok(Self::Architecture),
+            "bug_pattern" | "bug" | "fix" => Ok(Self::BugPattern),
+            "user_preference" | "user" | "pref" => Ok(Self::UserPreference),
+            "build_quirk" | "build" | "quirk" => Ok(Self::BuildQuirk),
+            _ => Err(()),
+        }
+    }
+}
+
+/// A single persistent insight in Long-Term Memory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InsightRecord {
+    pub id: usize,
+    pub category: InsightCategory,
+    pub trigger_keywords: Vec<String>,
+    pub insight: String,
+    pub confidence: f32,
+    pub occurrence_count: u32,
+    pub created_at: u64,
+}
+
+/// Persistent Long-Term Memory (LTM) store.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LongTermMemory {
+    pub insights: Vec<InsightRecord>,
+    next_id: usize,
+}
+
+impl LongTermMemory {
+    pub fn memory_path(workspace_root: &Path) -> PathBuf {
+        workspace_root.join(".orbit").join("insights.json")
+    }
+
+    pub fn load_or_init(workspace_root: &Path) -> Result<Self> {
+        let file_path = Self::memory_path(workspace_root);
+        if file_path.exists() {
+            let data = fs::read_to_string(&file_path)?;
+            let mut ltm: Self = serde_json::from_str(&data).unwrap_or_default();
+            if ltm.next_id == 0 {
+                ltm.next_id = ltm.insights.iter().map(|i| i.id).max().unwrap_or(0) + 1;
+            }
+            Ok(ltm)
+        } else {
+            let default_ltm = Self {
+                insights: Vec::new(),
+                next_id: 1,
+            };
+            default_ltm.save(workspace_root)?;
+            Ok(default_ltm)
+        }
+    }
+
+    pub fn save(&self, workspace_root: &Path) -> Result<()> {
+        let file_path = Self::memory_path(workspace_root);
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let data = serde_json::to_string_pretty(self)?;
+        fs::write(&file_path, data)?;
+        Ok(())
+    }
+
+    pub fn add_or_reinforce(
+        &mut self,
+        category: InsightCategory,
+        trigger_keywords: Vec<String>,
+        insight_text: &str,
+        confidence: f32,
+    ) -> usize {
+        let text_clean = insight_text.trim();
+        if let Some(existing) = self.insights.iter_mut().find(|i| {
+            i.category == category
+                && (i.insight.eq_ignore_ascii_case(text_clean)
+                    || i.insight.contains(text_clean)
+                    || text_clean.contains(&i.insight))
+        }) {
+            existing.occurrence_count += 1;
+            existing.confidence = (existing.confidence + confidence).min(1.0);
+            for kw in trigger_keywords {
+                let kw_clean = kw.to_lowercase().trim().to_string();
+                if !kw_clean.is_empty() && !existing.trigger_keywords.iter().any(|k| k == &kw_clean)
+                {
+                    existing.trigger_keywords.push(kw_clean);
+                }
+            }
+            return existing.id;
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let clean_keywords: Vec<String> = trigger_keywords
+            .into_iter()
+            .map(|k| k.to_lowercase().trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect();
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        self.insights.push(InsightRecord {
+            id,
+            category,
+            trigger_keywords: clean_keywords,
+            insight: text_clean.to_string(),
+            confidence: confidence.clamp(0.0, 1.0),
+            occurrence_count: 1,
+            created_at: ts,
+        });
+
+        id
+    }
+
+    pub fn find_relevant_insights(&self, query: &str, max_results: usize) -> Vec<&InsightRecord> {
+        let lower_query = query.to_lowercase();
+        let query_tokens: HashSet<&str> = lower_query
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            .filter(|t| t.len() >= 3)
+            .collect();
+
+        let mut scored: Vec<(&InsightRecord, usize)> = self
+            .insights
+            .iter()
+            .filter_map(|rec| {
+                let mut score = 0;
+                for kw in &rec.trigger_keywords {
+                    if lower_query.contains(kw) || query_tokens.contains(kw.as_str()) {
+                        score += 3;
+                    }
+                }
+                for token in &query_tokens {
+                    if rec.insight.to_lowercase().contains(token) {
+                        score += 1;
+                    }
+                }
+                if score > 0 {
+                    Some((rec, score + (rec.occurrence_count as usize)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        scored.sort_by_key(|a| std::cmp::Reverse(a.1));
+        scored
+            .into_iter()
+            .take(max_results)
+            .map(|(r, _)| r)
+            .collect()
+    }
+
+    pub fn format_prompt_injection(&self, query: &str) -> Option<String> {
+        let relevant = self.find_relevant_insights(query, 5);
+        if relevant.is_empty() {
+            None
+        } else {
+            let mut out = String::from("<learned_project_insights>\n");
+            for rec in relevant {
+                out.push_str(&format!(
+                    "- [{}] {}: {} (reinforcements: {})\n",
+                    rec.category.as_str(),
+                    rec.trigger_keywords.join("/"),
+                    rec.insight,
+                    rec.occurrence_count
+                ));
+            }
+            out.push_str("</learned_project_insights>");
+            Some(out)
+        }
+    }
+}
+
+/// Short-Term Working Memory (STM) tracking current task state, failed attempts, and observations.
+#[derive(Debug, Clone, Default)]
+pub struct WorkingMemory {
+    pub current_goal: Option<String>,
+    pub current_subtask: Option<String>,
+    pub failed_attempts: Vec<FailedAttempt>,
+    pub recent_touchpoints: Vec<PathBuf>,
+    pub observed_events: Vec<StmEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedAttempt {
+    pub action: String,
+    pub error_summary: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StmEvent {
+    ToolExecution {
+        tool: String,
+        target: String,
+        succeeded: bool,
+        error: Option<String>,
+    },
+    UserCorrection {
+        instruction: String,
+    },
+    SelfHealingSuccess {
+        tool: String,
+        target: String,
+        initial_error: String,
+        resolution_strategy: String,
+    },
+}
+
+impl WorkingMemory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_goal(&mut self, goal: &str) {
+        self.current_goal = Some(goal.trim().to_string());
+    }
+
+    pub fn set_subtask(&mut self, subtask: &str) {
+        self.current_subtask = Some(subtask.trim().to_string());
+    }
+
+    pub fn record_attempt(&mut self, action: &str, error: Option<&str>, succeeded: bool) {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if !succeeded {
+            if let Some(err) = error {
+                let first_line = err.lines().next().unwrap_or(err).trim();
+                let summary = if first_line.len() > 120 {
+                    format!("{}...", &first_line[..120])
+                } else {
+                    first_line.to_string()
+                };
+                self.failed_attempts.push(FailedAttempt {
+                    action: action.to_string(),
+                    error_summary: summary,
+                    timestamp: ts,
+                });
+            }
+        }
+    }
+
+    pub fn record_touchpoint(&mut self, path: &Path) {
+        let pb = path.to_path_buf();
+        if !self.recent_touchpoints.contains(&pb) {
+            self.recent_touchpoints.push(pb);
+            if self.recent_touchpoints.len() > 10 {
+                self.recent_touchpoints.remove(0);
+            }
+        }
+    }
+
+    pub fn record_event(&mut self, event: StmEvent) {
+        self.observed_events.push(event);
+    }
+
+    pub fn clear_task(&mut self) {
+        self.current_goal = None;
+        self.current_subtask = None;
+        self.failed_attempts.clear();
+        self.observed_events.clear();
+    }
+
+    pub fn format_scratchpad(&self) -> String {
+        let mut out = String::new();
+        if let Some(ref goal) = self.current_goal {
+            out.push_str(&format!("🎯 Active Goal: {}\n", goal));
+        }
+        if let Some(ref subtask) = self.current_subtask {
+            out.push_str(&format!("  ⚡ Current Subtask: {}\n", subtask));
+        }
+        if !self.failed_attempts.is_empty() {
+            out.push_str("  ⚠️ Previous Failed Attempts in this Session:\n");
+            for att in &self.failed_attempts {
+                out.push_str(&format!(
+                    "    • {} failed: {}\n",
+                    att.action, att.error_summary
+                ));
+            }
+        }
+        if !self.recent_touchpoints.is_empty() {
+            let files: Vec<String> = self
+                .recent_touchpoints
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            out.push_str(&format!("  📁 Touchpoints: {}\n", files.join(", ")));
+        }
+        out
+    }
+}
+
+/// The bridge that consolidates Salient STM events into LTM insights.
+pub struct MemoryConsolidator;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConsolidationOutcome {
+    pub insight_id: usize,
+    pub category: InsightCategory,
+    pub insight_text: String,
+    pub reason: String,
+}
+
+impl MemoryConsolidator {
+    /// Consolidates salient learning events from Working Memory into Long-Term Memory.
+    pub fn consolidate(stm: &WorkingMemory, ltm: &mut LongTermMemory) -> Vec<ConsolidationOutcome> {
+        let mut outcomes = Vec::new();
+
+        for event in &stm.observed_events {
+            match event {
+                StmEvent::UserCorrection { instruction } => {
+                    let clean = instruction.trim();
+                    if clean.len() >= 10 {
+                        let keywords = Self::extract_salient_keywords(clean);
+                        let id = ltm.add_or_reinforce(
+                            InsightCategory::UserPreference,
+                            keywords,
+                            clean,
+                            1.0,
+                        );
+                        outcomes.push(ConsolidationOutcome {
+                            insight_id: id,
+                            category: InsightCategory::UserPreference,
+                            insight_text: clean.to_string(),
+                            reason: "Learned directly from user correction".to_string(),
+                        });
+                    }
+                }
+                StmEvent::SelfHealingSuccess {
+                    tool,
+                    target,
+                    initial_error,
+                    resolution_strategy,
+                } => {
+                    if Self::is_systemic_error(initial_error) {
+                        let insight_text = format!(
+                            "When encountering '{}' during {}, resolve by {}",
+                            Self::summarize_error(initial_error),
+                            tool,
+                            resolution_strategy.trim()
+                        );
+                        let mut keywords = Self::extract_salient_keywords(initial_error);
+                        keywords.push(tool.clone());
+                        if let Some(ext) = Path::new(target).extension().and_then(|e| e.to_str()) {
+                            keywords.push(ext.to_string());
+                        }
+
+                        let id = ltm.add_or_reinforce(
+                            InsightCategory::BugPattern,
+                            keywords,
+                            &insight_text,
+                            0.8,
+                        );
+                        outcomes.push(ConsolidationOutcome {
+                            insight_id: id,
+                            category: InsightCategory::BugPattern,
+                            insight_text,
+                            reason: "Consolidated from self-healing diagnostic recovery"
+                                .to_string(),
+                        });
+                    }
+                }
+                StmEvent::ToolExecution {
+                    tool: _,
+                    target: _,
+                    succeeded,
+                    error,
+                } => {
+                    if !succeeded {
+                        if let Some(err) = error {
+                            if err.contains("pre-commit")
+                                || err.contains("cargo fmt")
+                                || err.contains("formatting check failed")
+                            {
+                                let insight_text =
+                                    "Run 'cargo fmt' before committing changes to pass repository pre-commit hooks.";
+                                let keywords = vec![
+                                    "git".to_string(),
+                                    "commit".to_string(),
+                                    "cargo fmt".to_string(),
+                                    "pre-commit".to_string(),
+                                ];
+                                let id = ltm.add_or_reinforce(
+                                    InsightCategory::BuildQuirk,
+                                    keywords,
+                                    insight_text,
+                                    0.9,
+                                );
+                                outcomes.push(ConsolidationOutcome {
+                                    insight_id: id,
+                                    category: InsightCategory::BuildQuirk,
+                                    insight_text: insight_text.to_string(),
+                                    reason: "Consolidated repository pre-commit requirement"
+                                        .to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        outcomes
+    }
+
+    fn extract_salient_keywords(text: &str) -> Vec<String> {
+        let stop_words: HashSet<&str> = [
+            "the", "and", "or", "in", "on", "at", "to", "for", "with", "a", "an", "is", "was",
+            "are", "were", "of", "by", "from", "van", "een", "het", "de", "en", "naar", "met",
+            "voor", "niet", "wel", "maar", "als", "om", "te", "dan", "ook", "dit", "dat",
+        ]
+        .into_iter()
+        .collect();
+
+        text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            .filter(|w| w.len() >= 3 && !stop_words.contains(&w.to_lowercase().as_str()))
+            .map(|w| w.to_lowercase())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .take(6)
+            .collect()
+    }
+
+    fn is_systemic_error(err: &str) -> bool {
+        let lower = err.to_lowercase();
+        lower.contains("cannot find")
+            || lower.contains("unresolved import")
+            || lower.contains("trait bound")
+            || lower.contains("mismatched types")
+            || lower.contains("borrow")
+            || lower.contains("pre-commit")
+            || lower.contains("lto")
+            || lower.contains("linker")
+    }
+
+    fn summarize_error(err: &str) -> String {
+        let first_line = err.lines().next().unwrap_or(err).trim();
+        if first_line.len() > 80 {
+            format!("{}...", &first_line[..80])
+        } else {
+            first_line.to_string()
+        }
+    }
+}
 
 pub struct ProjectMemory {
     pub file_path: PathBuf,
@@ -94,5 +570,127 @@ mod tests {
         let injection = mem.format_prompt_injection().unwrap();
         assert!(injection.starts_with("<project_memory>"));
         assert!(injection.ends_with("</project_memory>"));
+    }
+
+    #[test]
+    fn test_working_memory_tracking_and_scratchpad() {
+        let mut stm = WorkingMemory::new();
+        stm.set_goal("Fix flaky database connection in test harness");
+        stm.set_subtask("Retry with exponential backoff");
+        stm.record_attempt(
+            "connect_db",
+            Some("Connection refused: 127.0.0.1:5432"),
+            false,
+        );
+        stm.record_touchpoint(Path::new("tests/db_test.rs"));
+
+        let scratchpad = stm.format_scratchpad();
+        assert!(scratchpad.contains("🎯 Active Goal: Fix flaky database connection"));
+        assert!(scratchpad.contains("⚡ Current Subtask: Retry with exponential backoff"));
+        assert!(scratchpad.contains("Connection refused"));
+        assert!(scratchpad.contains("tests/db_test.rs"));
+
+        stm.clear_task();
+        assert!(stm.current_goal.is_none());
+        assert!(stm.failed_attempts.is_empty());
+    }
+
+    #[test]
+    fn test_long_term_memory_save_and_relevance_retrieval() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+        ltm.add_or_reinforce(
+            InsightCategory::BuildQuirk,
+            vec![
+                "git".to_string(),
+                "commit".to_string(),
+                "cargo fmt".to_string(),
+            ],
+            "Always run cargo fmt before git commit",
+            0.9,
+        );
+        ltm.add_or_reinforce(
+            InsightCategory::UserPreference,
+            vec!["tone".to_string(), "metaphor".to_string()],
+            "Do not use maritime metaphors",
+            1.0,
+        );
+        ltm.save(ws).unwrap();
+
+        // Reload
+        let loaded = LongTermMemory::load_or_init(ws).unwrap();
+        assert_eq!(loaded.insights.len(), 2);
+
+        // Find relevant insights
+        let results = loaded.find_relevant_insights("Can you commit the changes to git?", 5);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].category, InsightCategory::BuildQuirk);
+        assert!(results[0].insight.contains("cargo fmt"));
+
+        let injection = loaded.format_prompt_injection("git commit please").unwrap();
+        assert!(injection.contains("<learned_project_insights>"));
+        assert!(injection.contains("cargo fmt"));
+    }
+
+    #[test]
+    fn test_memory_consolidator_transition() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+        let mut stm = WorkingMemory::new();
+
+        // 1. User correction event in STM
+        stm.record_event(StmEvent::UserCorrection {
+            instruction: "Keep font packages intact during system cleanups".to_string(),
+        });
+
+        // 2. Pre-commit failure event in STM
+        stm.record_event(StmEvent::ToolExecution {
+            tool: "run_command".to_string(),
+            target: "git commit".to_string(),
+            succeeded: false,
+            error: Some(
+                "❌ [Pre-Commit] Formatting check failed! Run 'cargo fmt' before committing."
+                    .to_string(),
+            ),
+        });
+
+        // 3. Self-healing success event
+        stm.record_event(StmEvent::SelfHealingSuccess {
+            tool: "write_file".to_string(),
+            target: "src/db.rs".to_string(),
+            initial_error: "error[E0432]: unresolved import `tokio::sync::Mutex`".to_string(),
+            resolution_strategy: "adding `use tokio::sync::Mutex;` at top of file".to_string(),
+        });
+
+        // Run consolidation
+        let outcomes = MemoryConsolidator::consolidate(&stm, &mut ltm);
+        assert_eq!(outcomes.len(), 3);
+
+        // Verify LTM stored the items
+        assert_eq!(ltm.insights.len(), 3);
+        let user_pref = ltm
+            .insights
+            .iter()
+            .find(|i| i.category == InsightCategory::UserPreference)
+            .unwrap();
+        assert!(user_pref.insight.contains("font packages intact"));
+
+        let build_quirk = ltm
+            .insights
+            .iter()
+            .find(|i| i.category == InsightCategory::BuildQuirk)
+            .unwrap();
+        assert!(build_quirk.insight.contains("cargo fmt"));
+
+        let bug_pattern = ltm
+            .insights
+            .iter()
+            .find(|i| i.category == InsightCategory::BugPattern)
+            .unwrap();
+        assert!(bug_pattern.insight.contains("unresolved import"));
     }
 }

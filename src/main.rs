@@ -203,6 +203,8 @@ pub struct AgentState {
     pub secret_redactor: security::SecretRedactor,
     pub query_cache: query_cache::QueryCache,
     pub project_memory: Option<memory::ProjectMemory>,
+    pub working_memory: Mutex<memory::WorkingMemory>,
+    pub long_term_memory: Mutex<memory::LongTermMemory>,
     pub budget_enforcer: Mutex<budget::BudgetEnforcer>,
     pub notification_mgr: Mutex<notify::TaskNotificationManager>,
 }
@@ -283,6 +285,9 @@ impl AgentState {
         let secret_redactor = security::SecretRedactor::default();
         let query_cache = query_cache::QueryCache::default();
         let project_memory = memory::ProjectMemory::load_or_init(&workspace_dir).ok();
+        let working_memory = Mutex::new(memory::WorkingMemory::new());
+        let long_term_memory =
+            Mutex::new(memory::LongTermMemory::load_or_init(&workspace_dir).unwrap_or_default());
         let budget_enforcer =
             Mutex::new(budget::BudgetEnforcer::new(budget::BudgetConfig::default()));
         let notification_mgr = Mutex::new(notify::TaskNotificationManager::new(
@@ -310,6 +315,8 @@ impl AgentState {
             secret_redactor,
             query_cache,
             project_memory,
+            working_memory,
+            long_term_memory,
             budget_enforcer,
             notification_mgr,
         })
@@ -336,6 +343,11 @@ impl AgentState {
         *self.code_index.lock().unwrap() = None;
         self.project_rules = rules::ProjectRules::discover(&self.workspace_dir);
         self.compile_guard = compile_guard::CompileGuard::new(&self.workspace_dir);
+        self.project_memory = memory::ProjectMemory::load_or_init(&self.workspace_dir).ok();
+        self.working_memory = Mutex::new(memory::WorkingMemory::new());
+        self.long_term_memory = Mutex::new(
+            memory::LongTermMemory::load_or_init(&self.workspace_dir).unwrap_or_default(),
+        );
         Ok(canonical)
     }
 
@@ -481,12 +493,39 @@ impl AgentState {
             ```\n\n\
             ```tool:export_session\n\
             <optional output path for Org-mode report>\n\
+            ```\n\n\
+            ```tool:store_insight\n\
+            category: architecture | bug_pattern | user_preference | build_quirk\n\
+            keywords: <comma-separated triggers>\n\
+            insight: <permanent lesson or rule to remember>\n\
             ```\n\n",
             base
         );
 
         if let Some(rules) = &self.project_rules {
             prompt.push_str(&rules.format_for_prompt());
+        }
+
+        if let Ok(stm) = self.working_memory.lock() {
+            let scratchpad = stm.format_scratchpad();
+            if !scratchpad.trim().is_empty() {
+                prompt.push_str("\n## WORKING MEMORY (Active Task Scratchpad):\n");
+                prompt.push_str(&scratchpad);
+                prompt.push('\n');
+            }
+        }
+
+        if let Ok(ltm) = self.long_term_memory.lock() {
+            let context_snippet = self
+                .history
+                .last()
+                .map(|m| m.content.as_str())
+                .unwrap_or("");
+            if let Some(injection) = ltm.format_prompt_injection(context_snippet) {
+                prompt.push_str("\n## LEARNED PROJECT INSIGHTS (Long-Term Memory):\n");
+                prompt.push_str(&injection);
+                prompt.push('\n');
+            }
         }
 
         if !self.mcp_tools.is_empty() {
@@ -612,7 +651,7 @@ impl AgentState {
     }
 }
 
-pub const TOOL_REGEX_PATTERN: &str = r"```tool:(run_command|view_file|write_file|apply_patch|tdd_cycle|invoke_subagent|mcp|code_search|code_outline|git_context|adversarial_review|run_dag|code_grep|code_map|worktree_sandbox|lsp_query|export_session)\n([\s\S]*?)```";
+pub const TOOL_REGEX_PATTERN: &str = r"```tool:(run_command|view_file|write_file|apply_patch|tdd_cycle|invoke_subagent|mcp|code_search|code_outline|git_context|adversarial_review|run_dag|code_grep|code_map|worktree_sandbox|lsp_query|export_session|store_insight)\n([\s\S]*?)```";
 
 pub async fn execute_tool_quiet(tool_name: &str, body: &str, state: &AgentState) -> String {
     execute_tool_internal(tool_name, body, state, true).await
@@ -719,6 +758,9 @@ async fn execute_tool_internal(
                 Ok(p) => p,
                 Err(e) => return format!("Security Sandbox Error: {}", e),
             };
+            if let Ok(mut stm) = state.working_memory.lock() {
+                stm.record_touchpoint(&safe_path);
+            }
             match fs::read_to_string(&safe_path) {
                 Ok(content) => {
                     let lines: Vec<&str> = content.lines().collect();
@@ -751,6 +793,9 @@ async fn execute_tool_internal(
                 Ok(p) => p,
                 Err(e) => return format!("Security Sandbox Error: {}", e),
             };
+            if let Ok(mut stm) = state.working_memory.lock() {
+                stm.record_touchpoint(&safe_path);
+            }
 
             let path_display = safe_path.display().to_string();
 
@@ -869,6 +914,9 @@ async fn execute_tool_internal(
                 state
                     .checkpoint_mgr
                     .record_before_modify(Path::new(&safe_target), "apply_patch");
+                if let Ok(mut stm) = state.working_memory.lock() {
+                    stm.record_touchpoint(Path::new(&safe_target));
+                }
             }
 
             match patch::apply_patch_to_file_in_workspace(
@@ -1252,6 +1300,45 @@ async fn execute_tool_internal(
                 Ok(p) => format!("Session exported to Org-mode: {}", p.display()),
                 Err(e) => format!("Export failed: {}", e),
             }
+        }
+        "store_insight" => {
+            let mut category = memory::InsightCategory::Architecture;
+            let mut keywords = Vec::new();
+            let mut insight = String::new();
+
+            for line in body.lines() {
+                let trimmed = line.trim();
+                if let Some(cat) = trimmed.strip_prefix("category:") {
+                    if let Ok(c) = cat.trim().parse() {
+                        category = c;
+                    }
+                } else if let Some(kw) = trimmed.strip_prefix("keywords:") {
+                    keywords = kw.split(',').map(|s| s.trim().to_string()).collect();
+                } else if let Some(ins) = trimmed.strip_prefix("insight:") {
+                    insight = ins.trim().to_string();
+                } else if !trimmed.is_empty() && insight.is_empty() {
+                    insight = trimmed.to_string();
+                }
+            }
+
+            if insight.is_empty() {
+                return "Error: Empty insight provided to store_insight".to_string();
+            }
+
+            if keywords.is_empty() {
+                keywords.push(category.as_str().to_string());
+            }
+
+            let mut ltm = state.long_term_memory.lock().unwrap();
+            let id = ltm.add_or_reinforce(category, keywords.clone(), &insight, 1.0);
+            let _ = ltm.save(&state.workspace_dir);
+
+            format!(
+                "✅ Consolidated insight #{} [{}] ('{}') to Long-Term Memory.",
+                id,
+                category.as_str(),
+                insight
+            )
         }
         _ => format!("Unknown tool: {}", tool_name),
     }
@@ -1999,6 +2086,21 @@ async fn main() -> Result<()> {
                                 "  /export [path]         - Export session conversation to Org-mode document"
                             );
                             println!("  /rules                 - View or verify active project .orbitrules");
+                            println!(
+                                "  /memory [note]         - View consolidated memory overview or append project note"
+                            );
+                            println!(
+                                "  /remember <insight>    - Explicitly store a rule/user preference in Long-Term Memory"
+                            );
+                            println!(
+                                "  /insights [clear]      - Inspect or clear persistent insights (.orbit/insights.json)"
+                            );
+                            println!(
+                                "  /stm [goal|subtask|clear] - View or adjust Short-Term Working Memory scratchpad"
+                            );
+                            println!(
+                                "  /consolidate           - Manually trigger STM -> LTM memory consolidation"
+                            );
                             println!(
                                 "  /context               - View context token usage and budget"
                             );
@@ -3151,19 +3253,171 @@ async fn main() -> Result<()> {
                         "/memory" => {
                             let entry = arg.trim();
                             if entry.is_empty() {
+                                println!(
+                                    "\n{}",
+                                    "=== 🧠 ORBIT MEMORY ARCHITECTURE ===".bold().cyan()
+                                );
+                                if let Ok(stm) = state.working_memory.lock() {
+                                    println!(
+                                        "\n{}",
+                                        "--- [SHORT-TERM WORKING MEMORY] ---".bold().yellow()
+                                    );
+                                    let scratch = stm.format_scratchpad();
+                                    if scratch.trim().is_empty() {
+                                        println!("Working memory scratchpad is empty.");
+                                    } else {
+                                        println!("{}", scratch);
+                                    }
+                                }
+                                if let Ok(ltm) = state.long_term_memory.lock() {
+                                    println!(
+                                        "\n{}",
+                                        "--- [LONG-TERM MEMORY (INSIGHTS)] ---".bold().green()
+                                    );
+                                    println!("Stored Insights: {}", ltm.insights.len());
+                                    for ins in ltm.insights.iter().take(10) {
+                                        println!(
+                                            "  • #{} [{}] ({:.1}) {} (used {}x)",
+                                            ins.id,
+                                            ins.category.as_str().cyan(),
+                                            ins.confidence,
+                                            ins.insight.bold(),
+                                            ins.occurrence_count
+                                        );
+                                    }
+                                    if ltm.insights.len() > 10 {
+                                        println!(
+                                            "  ... and {} more (use `/insights` to view all)",
+                                            ltm.insights.len() - 10
+                                        );
+                                    }
+                                }
                                 if let Some(mem) = &state.project_memory {
                                     println!(
                                         "\n{}\n{}",
-                                        "=== PROJECT MEMORY (.orbit/memory.md) ===".bold().cyan(),
+                                        "--- [PROJECT MEMORY (.orbit/memory.md)] ---"
+                                            .bold()
+                                            .magenta(),
                                         mem.content
                                     );
-                                } else {
-                                    println!("Project memory not loaded.");
                                 }
                             } else if let Some(mem) = &mut state.project_memory {
                                 match mem.append_entry("Note", entry) {
                                     Ok(_) => println!("Appended to .orbit/memory.md"),
                                     Err(e) => println!("Error saving memory: {}", e),
+                                }
+                            }
+                            continue;
+                        }
+                        "/remember" => {
+                            let entry = arg.trim();
+                            if entry.is_empty() {
+                                println!(
+                                    "Usage: /remember <rule, user preference or permanent lesson>"
+                                );
+                            } else {
+                                let mut ltm = state.long_term_memory.lock().unwrap();
+                                let keywords =
+                                    vec!["user_preference".to_string(), "manual".to_string()];
+                                let id = ltm.add_or_reinforce(
+                                    memory::InsightCategory::UserPreference,
+                                    keywords,
+                                    entry,
+                                    1.0,
+                                );
+                                match ltm.save(&state.workspace_dir) {
+                                    Ok(_) => println!(
+                                        "{}",
+                                        format!(
+                                            "🧠 Remembered insight #{} [UserPreference] permanently: '{}'",
+                                            id, entry
+                                        )
+                                        .green()
+                                        .bold()
+                                    ),
+                                    Err(e) => println!("Error persisting insight: {}", e),
+                                }
+                            }
+                            continue;
+                        }
+                        "/insights" => {
+                            let subcmd = arg.trim();
+                            let mut ltm = state.long_term_memory.lock().unwrap();
+                            if subcmd == "clear" {
+                                ltm.insights.clear();
+                                let _ = ltm.save(&state.workspace_dir);
+                                println!("🗑️ Cleared all long-term insights.");
+                            } else {
+                                println!(
+                                    "{}",
+                                    "=== 💡 LONG-TERM INSIGHTS (.orbit/insights.json) ==="
+                                        .bold()
+                                        .cyan()
+                                );
+                                if ltm.insights.is_empty() {
+                                    println!("No insights recorded yet. Store with `/remember <text>` or tool `store_insight`.");
+                                } else {
+                                    for ins in &ltm.insights {
+                                        println!(
+                                            "• #{} [{}] (conf: {:.1}, used: {}x)\n  Insight: {}\n  Keywords: {}\n",
+                                            ins.id,
+                                            ins.category.as_str().cyan().bold(),
+                                            ins.confidence,
+                                            ins.occurrence_count,
+                                            ins.insight,
+                                            ins.trigger_keywords.join(", ").dimmed()
+                                        );
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        "/stm" => {
+                            let subcmd = arg.trim();
+                            let mut stm = state.working_memory.lock().unwrap();
+                            if subcmd.is_empty() {
+                                println!(
+                                    "{}",
+                                    "=== ⚡ SHORT-TERM WORKING MEMORY ===".bold().yellow()
+                                );
+                                println!("{}", stm.format_scratchpad());
+                            } else if subcmd == "clear" {
+                                stm.clear_task();
+                                println!("🧹 Working memory scratchpad cleared.");
+                            } else if let Some(goal) = subcmd.strip_prefix("goal ") {
+                                stm.set_goal(goal.trim());
+                                println!(
+                                    "🎯 Working memory active goal set to: {}",
+                                    goal.trim().bold()
+                                );
+                            } else if let Some(sub) = subcmd.strip_prefix("subtask ") {
+                                stm.set_subtask(sub.trim());
+                                println!(
+                                    "⚡ Working memory active subtask set to: {}",
+                                    sub.trim().bold()
+                                );
+                            } else {
+                                println!("Usage: /stm | /stm clear | /stm goal <goal> | /stm subtask <subtask>");
+                            }
+                            continue;
+                        }
+                        "/consolidate" => {
+                            let stm = state.working_memory.lock().unwrap().clone();
+                            let mut ltm = state.long_term_memory.lock().unwrap();
+                            let outcomes = memory::MemoryConsolidator::consolidate(&stm, &mut ltm);
+                            if outcomes.is_empty() {
+                                println!("No salient events in working memory required consolidation to long-term memory.");
+                            } else {
+                                let _ = ltm.save(&state.workspace_dir);
+                                println!("{}", "=== 🧠 CONSOLIDATION COMPLETED ===".bold().green());
+                                for o in outcomes {
+                                    println!(
+                                        "  • Consolidated #{} [{}]: {} ({})",
+                                        o.insight_id,
+                                        o.category.as_str().cyan(),
+                                        o.insight_text.bold(),
+                                        o.reason.dimmed()
+                                    );
                                 }
                             }
                             continue;
@@ -3722,6 +3976,33 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                // Check if user input is corrective or instructive feedback for Working Memory
+                let input_lower = input.trim().to_lowercase();
+                let is_correction = input_lower.starts_with("no,")
+                    || input_lower.starts_with("no ")
+                    || input_lower.starts_with("nee,")
+                    || input_lower.starts_with("nee ")
+                    || input_lower.starts_with("niet zo")
+                    || input_lower.starts_with("don't ")
+                    || input_lower.starts_with("dont ")
+                    || input_lower.starts_with("gebruik altijd")
+                    || input_lower.starts_with("always use")
+                    || input_lower.starts_with("remember to")
+                    || input_lower.starts_with("onthoud dat");
+
+                if is_correction {
+                    if let Ok(mut stm) = state.working_memory.lock() {
+                        stm.record_event(memory::StmEvent::UserCorrection {
+                            instruction: input.trim().to_string(),
+                        });
+                    }
+                } else if let Ok(mut stm) = state.working_memory.lock() {
+                    // Update current goal if not set or user explicitly gives a task
+                    if stm.current_goal.is_none() && input.trim().len() > 15 {
+                        stm.set_goal(input.trim());
+                    }
+                }
+
                 state.history.push(Message {
                     role: "user".to_string(),
                     content: input.to_string(),
@@ -3894,6 +4175,33 @@ async fn main() -> Result<()> {
                                 true,
                                 Some("Ready for next command."),
                             );
+
+                            // Autonomous memory consolidation check at turn completion
+                            let stm_copy = state.working_memory.lock().map(|s| s.clone()).ok();
+                            if let Some(stm) = stm_copy {
+                                if !stm.observed_events.is_empty() {
+                                    if let Ok(mut ltm) = state.long_term_memory.lock() {
+                                        let outcomes =
+                                            memory::MemoryConsolidator::consolidate(&stm, &mut ltm);
+                                        if !outcomes.is_empty() {
+                                            let _ = ltm.save(&state.workspace_dir);
+                                            for o in outcomes {
+                                                println!(
+                                                    "{}",
+                                                    format!(
+                                                        "💡 [Auto-Consolidated LTM #{}] [{}]: {}",
+                                                        o.insight_id,
+                                                        o.category.as_str(),
+                                                        o.insight_text
+                                                    )
+                                                    .green()
+                                                    .bold()
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             break;
                         }
                         Err(e) => {
@@ -4048,5 +4356,79 @@ mod tests {
 
             let _ = std::fs::remove_file(&temp_cfg);
         }
+    }
+
+    #[tokio::test]
+    async fn test_store_insight_tool_and_injection() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("orbit_memory_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut state = AgentState::new(Some(temp_dir.clone())).unwrap();
+
+        // 1. Execute store_insight tool
+        let tool_input = "category: architecture\nkeywords: sqlite, pool, thread\ninsight: Use r2d2 connection pooling with max 5 connections for SQLite.";
+        let res = execute_tool_quiet("store_insight", tool_input, &state).await;
+        assert!(
+            res.contains("Consolidated insight #1 [architecture]"),
+            "Expected success result from store_insight: {}",
+            res
+        );
+
+        // 2. Verify stored in LTM
+        {
+            let ltm = state.long_term_memory.lock().unwrap();
+            assert_eq!(ltm.insights.len(), 1);
+            assert_eq!(
+                ltm.insights[0].category,
+                memory::InsightCategory::Architecture
+            );
+        }
+
+        // 3. Set a message context that triggers relevance match
+        state.history.push(Message {
+            role: "user".to_string(),
+            content: "We need to connect to sqlite pool concurrently".to_string(),
+        });
+
+        // 4. Verify system prompt injection contains the insight
+        let sys_prompt = state.system_prompt();
+        assert!(
+            sys_prompt.contains("LEARNED PROJECT INSIGHTS (Long-Term Memory)"),
+            "System prompt should include LTM section: {}",
+            sys_prompt
+        );
+        assert!(
+            sys_prompt.contains("r2d2 connection pooling"),
+            "System prompt should include relevant insight: {}",
+            sys_prompt
+        );
+
+        // 5. Test Working Memory scratchpad injection
+        {
+            let mut stm = state.working_memory.lock().unwrap();
+            stm.set_goal("Refactor SQLite database connector");
+            stm.set_subtask("Implement connection pool factory");
+            stm.record_attempt("direct sqlite open", Some("database is locked"), false);
+        }
+        let sys_prompt_stm = state.system_prompt();
+        assert!(
+            sys_prompt_stm.contains("WORKING MEMORY (Active Task Scratchpad)"),
+            "System prompt should include STM section: {}",
+            sys_prompt_stm
+        );
+        assert!(
+            sys_prompt_stm.contains("🎯 Active Goal: Refactor SQLite database connector"),
+            "Expected goal in STM scratchpad: {}",
+            sys_prompt_stm
+        );
+        assert!(
+            sys_prompt_stm.contains("database is locked"),
+            "Expected failed attempt in STM scratchpad: {}",
+            sys_prompt_stm
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
