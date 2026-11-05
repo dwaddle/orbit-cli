@@ -37,6 +37,10 @@ orbit [INSERT] >
 - **🔍 Inverted BM25 Code Search**: In-memory keyword search index with camelCase/snake_case tokenization and lazy, bounded indexing (`/search` and `code_search`).
 - **🗺️ Codebase Symbol Outline**: Multi-language symbol extractor for Rust, Python, TypeScript/JavaScript, and Go (`/outline` and `code_outline`).
 - **📜 Git Context Intelligence**: Built-in git history inspection with commit logs, line-range blame, unified diffs, and pickaxe search (`/git` and `git_context`).
+- **🧠 Bi-Level Memory & Autonomous Consolidation (STM & LTM)**: Dual-layer cognitive memory architecture:
+  - **Short-Term Working Memory (STM)**: In-memory scratchpad tracking active goals, current subtasks, recent touchpoints, and failed attempts with error summaries, injected dynamically into system prompts.
+  - **Long-Term Memory (LTM)**: Persistent knowledge repository stored in `.orbit/insights.json` categorized into `Architecture`, `BugPattern`, `UserPreference`, and `BuildQuirk` with TF-based relevance search and zero-overhead prompt injection.
+  - **Memory Consolidator**: Autonomous bridge that filters noise and transitions salient learning events (user corrections with confidence 1.0, compiler/linter self-healing with confidence 0.8, build/pre-commit quirks with confidence 0.9) into persistent LTM with frequency reinforcement and deduplication (`/memory`, `/remember`, `/insights`, `/stm`, `/consolidate`, and tool `store_insight`).
 - **🧠 Sliding-Window Context & Tool Compression**: Smart token budgeting that compresses large tool outputs (>150 lines or >12,000 chars) and summarizes older turns to prevent context window overflow.
 - **📋 Project Rules Auto-Discovery**: Hierarchical upward search for `.orbitrules`, `AGENTS.md`, `.agents/AGENTS.md`, and `.orbit/rules.md`, automatically injected into the system prompt.
 - **💰 OpenRouter Prompt Caching**: Injects explicit ephemeral `cache_control` headers into static system prompts, project rules, and reference files, cutting token costs by up to 90% on Claude and DeepSeek.
@@ -57,7 +61,7 @@ orbit [INSERT] >
 - **🔎 In-Process Native Ripgrep Engine**: Blazing fast codebase searching using `ignore` + `regex`, respecting `.gitignore` without spawning shell subprocesses (`/grep` and `code_grep`).
 - **💰 Real-Time Token Economics & Cost Meter**: Live tracking of prompt tokens, completion tokens, cached prompt savings, tokens/sec speed, TTFT, and estimated USD spend per turn and session (`/stats` and `/cost`).
 - **🔍 Fuzzy File & Symbol Finder**: Instant keyboard-driven fuzzy discovery across files and language symbols powered by `fuzzy-matcher` (`/find <query>` or `/find @symbol`).
-- **🛠️ 13 Autonomous Built-in Tools**:
+- **🛠️ 14 Autonomous Built-in Tools**:
   - `run_command`: Local shell execution and stdout/stderr capture.
   - `view_file`: Workspace file exploration.
   - `write_file`: In-place code generation and editing.
@@ -68,6 +72,7 @@ orbit [INSERT] >
   - `code_grep`: Native ripgrep search respecting `.gitignore`.
   - `code_map`: AST PageRank architectural skeleton.
   - `git_context`: Log, blame, diff, and pickaxe search.
+  - `store_insight`: Explicit consolidation of permanent project rules and architecture lessons to Long-Term Memory.
   - `invoke_subagent`: Background subagent task spawning.
   - `adversarial_review`: Ruthless 5-axis security and regression critique.
   - `run_dag`: Concurrent multi-agent workflow execution.
@@ -143,6 +148,11 @@ The compiled binary will be located at `target/release/orbit-cli`.
 |---|---|
 | `/cd <path>` | Switch active workspace directory at runtime (re-indexes code & updates TUI) |
 | `/pwd` | Print current workspace directory |
+| `/memory [note]` | View consolidated memory overview (STM scratchpad, LTM insights, project notes) or append note |
+| `/remember <rule>` | Explicitly store a permanent rule or user preference in Long-Term Memory |
+| `/insights [clear]` | Inspect or clear persistent project insights (`.orbit/insights.json`) |
+| `/stm [goal\|subtask\|clear]` | View, inspect, or adjust the active Short-Term Working Memory scratchpad |
+| `/consolidate` | Manually trigger evaluation and transition of salient events from STM to LTM |
 | `/search <query>` | Search workspace code using in-memory BM25 index |
 | `/outline [path]` | Generate codebase symbol outline (Rust, Python, TS/JS, Go) |
 | `/git <subcmd> [args]` | Inspect git context (`log`, `blame`, `diff`, `search`) |
