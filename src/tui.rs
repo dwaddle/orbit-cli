@@ -409,6 +409,206 @@ async fn submit_input(
         });
         app.auto_scroll = true;
         return Ok(());
+    } else if input == "/memory" || input.starts_with("/memory ") {
+        let entry = input.strip_prefix("/memory").unwrap_or("").trim();
+        if entry.is_empty() {
+            let mut report = String::from("=== 🧠 ORBIT MEMORY ARCHITECTURE ===\n");
+            if let Ok(stm) = state.working_memory.lock() {
+                report.push_str("\n--- [SHORT-TERM WORKING MEMORY] ---\n");
+                let scratch = stm.format_scratchpad();
+                if scratch.trim().is_empty() {
+                    report.push_str("Working memory scratchpad is empty.\n");
+                } else {
+                    report.push_str(&scratch);
+                }
+            }
+            if let Ok(ltm) = state.long_term_memory.lock() {
+                report.push_str("\n--- [LONG-TERM MEMORY (INSIGHTS)] ---\n");
+                report.push_str(&format!("Stored Insights: {}\n", ltm.insights.len()));
+                for ins in ltm.insights.iter().take(10) {
+                    report.push_str(&format!(
+                        "  • #{} [{}] ({:.1}) {} (used {}x)\n",
+                        ins.id,
+                        ins.category.as_str(),
+                        ins.confidence,
+                        ins.insight,
+                        ins.occurrence_count
+                    ));
+                }
+                if ltm.insights.len() > 10 {
+                    report.push_str(&format!(
+                        "  ... and {} more (use `/insights` to view all)\n",
+                        ltm.insights.len() - 10
+                    ));
+                }
+            }
+            if let Some(mem) = &state.project_memory {
+                report.push_str("\n--- [PROJECT MEMORY (.orbit/memory.md)] ---\n");
+                report.push_str(&mem.content);
+                report.push('\n');
+            }
+            state.history.push(crate::Message {
+                role: "system".to_string(),
+                content: report.trim_end().to_string(),
+            });
+        } else if let Some(mem) = &mut state.project_memory {
+            match mem.append_entry("Note", entry) {
+                Ok(_) => {
+                    state.history.push(crate::Message {
+                        role: "system".to_string(),
+                        content: format!("Appended note to .orbit/memory.md: '{}'", entry),
+                    });
+                }
+                Err(e) => {
+                    state.history.push(crate::Message {
+                        role: "system".to_string(),
+                        content: format!("Error saving memory note: {}", e),
+                    });
+                }
+            }
+        }
+        app.auto_scroll = true;
+        return Ok(());
+    } else if input.starts_with("/remember ") {
+        let entry = input.strip_prefix("/remember ").unwrap().trim();
+        if entry.is_empty() {
+            state.history.push(crate::Message {
+                role: "system".to_string(),
+                content: "Usage: /remember <rule, user preference or permanent lesson>".to_string(),
+            });
+        } else {
+            let mut ltm = state.long_term_memory.lock().unwrap();
+            let keywords = vec!["user_preference".to_string(), "manual".to_string()];
+            let id = ltm.add_or_reinforce(
+                crate::memory::InsightCategory::UserPreference,
+                keywords,
+                entry,
+                1.0,
+            );
+            match ltm.save(&state.workspace_dir) {
+                Ok(_) => {
+                    state.history.push(crate::Message {
+                        role: "system".to_string(),
+                        content: format!(
+                            "🧠 Remembered insight #{} [UserPreference] permanently: '{}'",
+                            id, entry
+                        ),
+                    });
+                    app.status_message = format!("Remembered insight #{} [UserPreference]", id);
+                }
+                Err(e) => {
+                    state.history.push(crate::Message {
+                        role: "system".to_string(),
+                        content: format!("Error persisting insight: {}", e),
+                    });
+                }
+            }
+        }
+        app.auto_scroll = true;
+        return Ok(());
+    } else if input == "/insights" || input.starts_with("/insights ") {
+        let subcmd = input.strip_prefix("/insights").unwrap_or("").trim();
+        let mut ltm = state.long_term_memory.lock().unwrap();
+        if subcmd == "clear" {
+            ltm.insights.clear();
+            let _ = ltm.save(&state.workspace_dir);
+            state.history.push(crate::Message {
+                role: "system".to_string(),
+                content: "🗑️ Cleared all long-term insights.".to_string(),
+            });
+        } else {
+            let mut report = String::from("=== 💡 LONG-TERM INSIGHTS (.orbit/insights.json) ===\n");
+            if ltm.insights.is_empty() {
+                report.push_str("No insights recorded yet. Store with `/remember <text>` or tool `store_insight`.\n");
+            } else {
+                for ins in &ltm.insights {
+                    report.push_str(&format!(
+                        "• #{} [{}] (conf: {:.1}, used: {}x)\n  Insight: {}\n  Keywords: {}\n\n",
+                        ins.id,
+                        ins.category.as_str(),
+                        ins.confidence,
+                        ins.occurrence_count,
+                        ins.insight,
+                        ins.trigger_keywords.join(", ")
+                    ));
+                }
+            }
+            state.history.push(crate::Message {
+                role: "system".to_string(),
+                content: report.trim_end().to_string(),
+            });
+        }
+        app.auto_scroll = true;
+        return Ok(());
+    } else if input == "/stm" || input.starts_with("/stm ") {
+        let subcmd = input.strip_prefix("/stm").unwrap_or("").trim();
+        let mut stm = state.working_memory.lock().unwrap();
+        if subcmd.is_empty() {
+            let scratch = stm.format_scratchpad();
+            let content = if scratch.trim().is_empty() {
+                "Short-term working memory scratchpad is empty.".to_string()
+            } else {
+                format!("=== ⚡ SHORT-TERM WORKING MEMORY ===\n{}", scratch)
+            };
+            state.history.push(crate::Message {
+                role: "system".to_string(),
+                content,
+            });
+        } else if subcmd == "clear" {
+            stm.clear_task();
+            state.history.push(crate::Message {
+                role: "system".to_string(),
+                content: "🧹 Working memory scratchpad cleared.".to_string(),
+            });
+        } else if let Some(goal) = subcmd.strip_prefix("goal ") {
+            stm.set_goal(goal.trim());
+            state.history.push(crate::Message {
+                role: "system".to_string(),
+                content: format!("🎯 Working memory active goal set to: {}", goal.trim()),
+            });
+        } else if let Some(sub) = subcmd.strip_prefix("subtask ") {
+            stm.set_subtask(sub.trim());
+            state.history.push(crate::Message {
+                role: "system".to_string(),
+                content: format!("⚡ Working memory active subtask set to: {}", sub.trim()),
+            });
+        } else {
+            state.history.push(crate::Message {
+                role: "system".to_string(),
+                content: "Usage: /stm | /stm clear | /stm goal <goal> | /stm subtask <subtask>"
+                    .to_string(),
+            });
+        }
+        app.auto_scroll = true;
+        return Ok(());
+    } else if input == "/consolidate" {
+        let stm = state.working_memory.lock().unwrap().clone();
+        let mut ltm = state.long_term_memory.lock().unwrap();
+        let outcomes = crate::memory::MemoryConsolidator::consolidate(&stm, &mut ltm);
+        if outcomes.is_empty() {
+            state.history.push(crate::Message {
+                role: "system".to_string(),
+                content: "No salient events in working memory required consolidation to long-term memory.".to_string(),
+            });
+        } else {
+            let _ = ltm.save(&state.workspace_dir);
+            let mut report = String::from("=== 🧠 CONSOLIDATION COMPLETED ===\n");
+            for o in outcomes {
+                report.push_str(&format!(
+                    "  • Consolidated #{} [{}]: {} ({})\n",
+                    o.insight_id,
+                    o.category.as_str(),
+                    o.insight_text,
+                    o.reason
+                ));
+            }
+            state.history.push(crate::Message {
+                role: "system".to_string(),
+                content: report.trim_end().to_string(),
+            });
+        }
+        app.auto_scroll = true;
+        return Ok(());
     } else if input == "/help" {
         state.history.push(crate::Message {
             role: "system".to_string(),
@@ -416,10 +616,37 @@ async fn submit_input(
                       - Normal Mode: [i]/[a] Insert mode | [j]/[k] Scroll/Move | [h]/[l] or [Tab] Switch Panes\n\
                       - Motions: [gg] Jump to top | [G] Jump to bottom | [Ctrl-d]/[Ctrl-u] Half page | [q] Quit\n\
                       - Insert Mode: Type prompt | [Enter] Submit | [Esc] or [Ctrl-[] Normal mode\n\
-                      - Commands: /cd <path> (change workspace), /pwd (current workspace), /sh <cmd> or !<cmd> (run local shell command), /mcp (list MCP servers & tools), /tools (toggle tools), /clear (clear history), /help (help), /exit or /quit (quit TUI)".to_string(),
+                      - Memory: /memory [note], /remember <insight>, /insights [clear], /stm [goal|subtask|clear], /consolidate\n\
+                      - Commands: /cd <path>, /pwd, /sh <cmd> or !<cmd>, /mcp, /tools, /grep <pattern>, /map, /find <query>, /stats, /clear, /help, /exit or /quit".to_string(),
         });
         app.auto_scroll = true;
         return Ok(());
+    }
+
+    // Check if user input is corrective or instructive feedback for Working Memory in TUI mode
+    let input_lower = input.trim().to_lowercase();
+    let is_correction = input_lower.starts_with("no,")
+        || input_lower.starts_with("no ")
+        || input_lower.starts_with("nee,")
+        || input_lower.starts_with("nee ")
+        || input_lower.starts_with("niet zo")
+        || input_lower.starts_with("don't ")
+        || input_lower.starts_with("dont ")
+        || input_lower.starts_with("gebruik altijd")
+        || input_lower.starts_with("always use")
+        || input_lower.starts_with("remember to")
+        || input_lower.starts_with("onthoud dat");
+
+    if is_correction {
+        if let Ok(mut stm) = state.working_memory.lock() {
+            stm.record_event(crate::memory::StmEvent::UserCorrection {
+                instruction: input.trim().to_string(),
+            });
+        }
+    } else if let Ok(mut stm) = state.working_memory.lock() {
+        if stm.current_goal.is_none() && input.trim().len() > 15 {
+            stm.set_goal(input.trim());
+        }
     }
 
     state.history.push(crate::Message {
@@ -578,6 +805,32 @@ async fn submit_input(
                     "✨ Ready in {:.1}s. Type prompt | [Esc] Normal mode | [Enter] Submit",
                     elapsed
                 );
+
+                // Autonomous consolidation hook in TUI mode
+                let stm_copy = state.working_memory.lock().map(|s| s.clone()).ok();
+                if let Some(stm) = stm_copy {
+                    if !stm.observed_events.is_empty() {
+                        if let Ok(mut ltm) = state.long_term_memory.lock() {
+                            let outcomes =
+                                crate::memory::MemoryConsolidator::consolidate(&stm, &mut ltm);
+                            if !outcomes.is_empty() {
+                                let _ = ltm.save(&state.workspace_dir);
+                                for o in outcomes {
+                                    state.history.push(crate::Message {
+                                        role: "system".to_string(),
+                                        content: format!(
+                                            "💡 [Auto-Consolidated LTM #{}] [{}]: {}",
+                                            o.insight_id,
+                                            o.category.as_str(),
+                                            o.insight_text
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
                 terminal.draw(|frame| render_ui(frame, app, state))?;
                 break;
             }
