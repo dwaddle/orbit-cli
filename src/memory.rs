@@ -693,4 +693,174 @@ mod tests {
             .unwrap();
         assert!(bug_pattern.insight.contains("unresolved import"));
     }
+
+    #[test]
+    fn test_eval_overgang_agressiviteit_en_ruis_filtering() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+        let mut stm = WorkingMemory::new();
+
+        // 1. Trivial feedback / non-salient remarks should NOT transition to LTM
+        stm.record_event(StmEvent::UserCorrection {
+            instruction: "ok thanks".to_string(), // < 10 chars, noise
+        });
+        stm.record_event(StmEvent::UserCorrection {
+            instruction: "goedzo".to_string(), // short, noise
+        });
+
+        // 2. Ephemeral or non-systemic compile glitches should NOT become permanent rules
+        stm.record_event(StmEvent::SelfHealingSuccess {
+            tool: "run_command".to_string(),
+            target: "test_script.sh".to_string(),
+            initial_error: "mkdir: cannot create directory 'tmp': File exists".to_string(), // not a systemic language/linker error
+            resolution_strategy: "mkdir -p tmp".to_string(),
+        });
+
+        // 3. True salient instruction SHOULD transition
+        stm.record_event(StmEvent::UserCorrection {
+            instruction: "Always run tests with --nocapture flag".to_string(),
+        });
+
+        let outcomes = MemoryConsolidator::consolidate(&stm, &mut ltm);
+
+        // Only the salient instruction (#3) should have transitioned
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "Expected exactly 1 consolidated outcome, but got {}",
+            outcomes.len()
+        );
+        assert_eq!(outcomes[0].category, InsightCategory::UserPreference);
+        assert!(outcomes[0].insight_text.contains("--nocapture"));
+        assert_eq!(ltm.insights.len(), 1);
+    }
+
+    #[test]
+    fn test_eval_relevance_ranking_en_token_budget_beheersing() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+
+        // Populate multiple insights across diverse domains
+        ltm.add_or_reinforce(
+            InsightCategory::Architecture,
+            vec![
+                "database".to_string(),
+                "sqlite".to_string(),
+                "wal".to_string(),
+            ],
+            "Always enable WAL mode on SQLite connections for concurrency.",
+            0.9,
+        );
+        ltm.add_or_reinforce(
+            InsightCategory::BuildQuirk,
+            vec![
+                "docker".to_string(),
+                "cache".to_string(),
+                "buildkit".to_string(),
+            ],
+            "Set DOCKER_BUILDKIT=1 before running docker build.",
+            0.8,
+        );
+        ltm.add_or_reinforce(
+            InsightCategory::BugPattern,
+            vec![
+                "tokio".to_string(),
+                "channel".to_string(),
+                "deadlock".to_string(),
+            ],
+            "Never await on unbounded channels without select! branch timeouts.",
+            0.85,
+        );
+        ltm.add_or_reinforce(
+            InsightCategory::UserPreference,
+            vec![
+                "commit".to_string(),
+                "git".to_string(),
+                "message".to_string(),
+            ],
+            "Use conventional commits format: feat, fix, chore.",
+            1.0,
+        );
+
+        // Test 1: Query specifically about SQLite database
+        let query_db = "Could you check the sqlite database settings and optimize queries?";
+        let matched_db = ltm.find_relevant_insights(query_db, 2);
+        assert_eq!(matched_db.len(), 1, "Only DB insight should match");
+        assert_eq!(matched_db[0].category, InsightCategory::Architecture);
+        assert!(matched_db[0].insight.contains("WAL mode"));
+
+        // Test 2: Query unrelated to any insight -> zero injection (zero token overhead)
+        let query_irrelevant = "Can you write a poem about the autumn leaves?";
+        let matched_none = ltm.find_relevant_insights(query_irrelevant, 5);
+        assert!(
+            matched_none.is_empty(),
+            "Irrelevant query must produce zero matched insights"
+        );
+        assert!(ltm.format_prompt_injection(query_irrelevant).is_none());
+
+        // Test 3: Top-K bounding keeps token budget controlled
+        let query_broad = "git commit to database";
+        let matched_top = ltm.find_relevant_insights(query_broad, 1);
+        assert_eq!(matched_top.len(), 1, "Top-K must strictly enforce limit 1");
+    }
+
+    #[test]
+    fn test_eval_consolidatie_frequentie_versterking_en_deduplicatie() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+
+        // 1. Initial insight insertion
+        let id1 = ltm.add_or_reinforce(
+            InsightCategory::BuildQuirk,
+            vec!["cargo".to_string(), "fmt".to_string()],
+            "Always run cargo fmt before git commit",
+            0.8,
+        );
+        assert_eq!(id1, 1);
+        assert_eq!(ltm.insights.len(), 1);
+        assert_eq!(ltm.insights[0].occurrence_count, 1);
+        assert_eq!(ltm.insights[0].confidence, 0.8);
+
+        // 2. Reinforce the identical insight (e.g. encountered again during another session)
+        let id2 = ltm.add_or_reinforce(
+            InsightCategory::BuildQuirk,
+            vec![
+                "cargo".to_string(),
+                "fmt".to_string(),
+                "pre-commit".to_string(),
+            ],
+            "Always run cargo fmt before git commit",
+            0.9,
+        );
+        assert_eq!(id2, 1, "Must deduplicate and update existing ID 1");
+        assert_eq!(ltm.insights.len(), 1, "Must not introduce duplicate record");
+        assert_eq!(
+            ltm.insights[0].occurrence_count, 2,
+            "Occurrence count must increment"
+        );
+        assert!(
+            ltm.insights[0].confidence >= 0.9,
+            "Confidence must be elevated"
+        );
+        assert!(ltm.insights[0]
+            .trigger_keywords
+            .contains(&"pre-commit".to_string()));
+
+        // 3. Verify rank boost due to frequency reinforcement
+        ltm.add_or_reinforce(
+            InsightCategory::BuildQuirk,
+            vec!["cargo".to_string(), "clippy".to_string()],
+            "Run cargo clippy on all targets",
+            0.85,
+        );
+        let ranked = ltm.find_relevant_insights("cargo check and commit", 5);
+        // The reinforced insight with occurrence_count = 2 must rank higher
+        assert_eq!(ranked[0].id, 1);
+    }
 }
