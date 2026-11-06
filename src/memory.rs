@@ -1170,6 +1170,7 @@ mod tests {
         assert!(report.avg_retrieval_latency_us > 0.0);
 
         let banner = report.format_banner();
+        println!("\n{}", banner);
         assert!(banner.contains("ORBIT MEMORY BENCHMARK & DIAGNOSTIC REPORT"));
         assert!(banner.contains("Noise Rejection"));
         assert!(banner.contains("Retrieval Precision"));
