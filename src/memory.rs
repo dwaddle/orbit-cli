@@ -420,7 +420,7 @@ impl WorkingMemory {
     /// Drains all observed events that have been processed during consolidation,
     /// preventing redundant re-evaluation on subsequent agent turns.
     pub fn drain_events(&mut self) -> Vec<StmEvent> {
-        self.observed_events.drain(..).collect()
+        std::mem::take(&mut self.observed_events)
     }
 
     pub fn clear_task(&mut self) {
