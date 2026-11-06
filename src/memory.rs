@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,6 +48,32 @@ pub struct InsightRecord {
     pub confidence: f32,
     pub occurrence_count: u32,
     pub created_at: u64,
+    #[serde(default = "default_last_accessed")]
+    pub last_accessed: u64,
+    #[serde(default = "default_stability")]
+    pub stability_days: f32,
+}
+
+fn default_last_accessed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn default_stability() -> f32 {
+    14.0 // Baseline half-life: 14 days
+}
+
+impl InsightRecord {
+    /// Calculates the Ebbinghaus memory retrievability R in [0.0, 1.0]
+    /// Formula: R = exp( - delta_t / stability )
+    pub fn retrievability(&self, now_secs: u64) -> f32 {
+        let delta_secs = now_secs.saturating_sub(self.last_accessed);
+        let delta_days = delta_secs as f32 / 86400.0;
+        let stability = self.stability_days.max(1.0);
+        (-delta_days / stability).exp().clamp(0.01, 1.0)
+    }
 }
 
 /// Persistent Long-Term Memory (LTM) store.
@@ -55,6 +81,9 @@ pub struct InsightRecord {
 pub struct LongTermMemory {
     pub insights: Vec<InsightRecord>,
     next_id: usize,
+    /// Inverted index mapping lowercase keyword tokens to list of insight IDs for O(1) candidate lookup
+    #[serde(skip)]
+    keyword_index: HashMap<String, Vec<usize>>,
 }
 
 impl Default for LongTermMemory {
@@ -62,6 +91,7 @@ impl Default for LongTermMemory {
         Self {
             insights: Vec::new(),
             next_id: 1,
+            keyword_index: HashMap::new(),
         }
     }
 }
@@ -79,14 +109,40 @@ impl LongTermMemory {
             if ltm.next_id == 0 {
                 ltm.next_id = ltm.insights.iter().map(|i| i.id).max().unwrap_or(0) + 1;
             }
+            ltm.rebuild_index();
             Ok(ltm)
         } else {
             let default_ltm = Self {
                 insights: Vec::new(),
                 next_id: 1,
+                keyword_index: HashMap::new(),
             };
             default_ltm.save(workspace_root)?;
             Ok(default_ltm)
+        }
+    }
+
+    /// Rebuilds the inverted index mapping lowercase tokens to insight IDs.
+    pub fn rebuild_index(&mut self) {
+        self.keyword_index.clear();
+        for rec in &self.insights {
+            for kw in &rec.trigger_keywords {
+                let kw_clean = kw.to_lowercase();
+                self.keyword_index.entry(kw_clean).or_default().push(rec.id);
+            }
+            // Also index content tokens for full fast coverage
+            for token in rec
+                .insight
+                .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            {
+                if token.len() >= 3 {
+                    let tok_lower = token.to_lowercase();
+                    let entry = self.keyword_index.entry(tok_lower).or_default();
+                    if !entry.contains(&rec.id) {
+                        entry.push(rec.id);
+                    }
+                }
+            }
         }
     }
 
@@ -96,7 +152,9 @@ impl LongTermMemory {
             fs::create_dir_all(parent)?;
         }
         let data = serde_json::to_string_pretty(self)?;
-        fs::write(&file_path, data)?;
+        let temp_path = file_path.with_extension("json.tmp");
+        fs::write(&temp_path, data)?;
+        fs::rename(&temp_path, &file_path)?;
         Ok(())
     }
 
@@ -108,6 +166,11 @@ impl LongTermMemory {
         confidence: f32,
     ) -> usize {
         let text_clean = insight_text.trim();
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         if let Some(existing) = self.insights.iter_mut().find(|i| {
             i.category == category
                 && (i.insight.eq_ignore_ascii_case(text_clean)
@@ -116,6 +179,9 @@ impl LongTermMemory {
         }) {
             existing.occurrence_count += 1;
             existing.confidence = (existing.confidence + confidence).min(1.0);
+            existing.last_accessed = now_ts;
+            // Spaced repetition: memory stability increases by 50% with each reinforcement
+            existing.stability_days = (existing.stability_days * 1.5).min(365.0);
             for kw in trigger_keywords {
                 let kw_clean = kw.to_lowercase().trim().to_string();
                 if !kw_clean.is_empty() && !existing.trigger_keywords.iter().any(|k| k == &kw_clean)
@@ -135,11 +201,6 @@ impl LongTermMemory {
             .filter(|k| !k.is_empty())
             .collect();
 
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
         self.insights.push(InsightRecord {
             id,
             category,
@@ -147,43 +208,79 @@ impl LongTermMemory {
             insight: text_clean.to_string(),
             confidence: confidence.clamp(0.0, 1.0),
             occurrence_count: 1,
-            created_at: ts,
+            created_at: now_ts,
+            last_accessed: now_ts,
+            stability_days: 14.0,
         });
 
+        self.rebuild_index();
         id
     }
 
     pub fn find_relevant_insights(&self, query: &str, max_results: usize) -> Vec<&InsightRecord> {
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         let lower_query = query.to_lowercase();
         let query_tokens: HashSet<&str> = lower_query
             .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
             .filter(|t| t.len() >= 3)
             .collect();
 
-        let mut scored: Vec<(&InsightRecord, usize)> = self
-            .insights
-            .iter()
+        // 1. O(1) Candidate set extraction using Inverted Index
+        let mut candidate_ids: HashSet<usize> = HashSet::new();
+        for token in &query_tokens {
+            if let Some(ids) = self.keyword_index.get(*token) {
+                for id in ids {
+                    candidate_ids.insert(*id);
+                }
+            }
+        }
+
+        // Also check if any trigger keywords are multi-word substrings in lower_query
+        for rec in &self.insights {
+            for kw in &rec.trigger_keywords {
+                if kw.contains(' ') && lower_query.contains(kw) {
+                    candidate_ids.insert(rec.id);
+                }
+            }
+        }
+
+        if candidate_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let mut scored: Vec<(&InsightRecord, f32)> = candidate_ids
+            .into_iter()
+            .filter_map(|id| self.insights.iter().find(|r| r.id == id))
             .filter_map(|rec| {
-                let mut score = 0;
+                let mut match_score: f32 = 0.0;
                 for kw in &rec.trigger_keywords {
                     if lower_query.contains(kw) || query_tokens.contains(kw.as_str()) {
-                        score += 3;
+                        match_score += 3.0;
                     }
                 }
                 for token in &query_tokens {
                     if rec.insight.to_lowercase().contains(token) {
-                        score += 1;
+                        match_score += 1.0;
                     }
                 }
-                if score > 0 {
-                    Some((rec, score + (rec.occurrence_count as usize)))
+                if match_score > 0.0 {
+                    // Biologically-grounded retention weight:
+                    // Base activation from match + frequency reinforcement, scaled by Ebbinghaus retention R
+                    let r = rec.retrievability(now_ts);
+                    let freq_factor = (rec.occurrence_count as f32).min(10.0);
+                    let final_score = (match_score + freq_factor) * r;
+                    Some((rec, final_score))
                 } else {
                     None
                 }
             })
             .collect();
 
-        scored.sort_by_key(|a| std::cmp::Reverse(a.1));
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored
             .into_iter()
             .take(max_results)
@@ -209,6 +306,24 @@ impl LongTermMemory {
             out.push_str("</learned_project_insights>");
             Some(out)
         }
+    }
+
+    /// Synaptic Pruning: removes or archives inactive insights whose Ebbinghaus retrievability
+    /// has dropped below `min_retrievability` (e.g. 0.05). Returns count of pruned records.
+    pub fn prune_decayed_insights(&mut self, min_retrievability: f32) -> usize {
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let initial_len = self.insights.len();
+        self.insights
+            .retain(|rec| rec.retrievability(now_ts) >= min_retrievability);
+        let pruned = initial_len.saturating_sub(self.insights.len());
+        if pruned > 0 {
+            self.rebuild_index();
+        }
+        pruned
     }
 }
 
@@ -280,6 +395,10 @@ impl WorkingMemory {
                     error_summary: summary,
                     timestamp: ts,
                 });
+                // Miller's Law: keep working memory focused on recent 7 +/- 2 chunks (cap at 7)
+                if self.failed_attempts.len() > 7 {
+                    self.failed_attempts.remove(0);
+                }
             }
         }
     }
@@ -296,6 +415,12 @@ impl WorkingMemory {
 
     pub fn record_event(&mut self, event: StmEvent) {
         self.observed_events.push(event);
+    }
+
+    /// Drains all observed events that have been processed during consolidation,
+    /// preventing redundant re-evaluation on subsequent agent turns.
+    pub fn drain_events(&mut self) -> Vec<StmEvent> {
+        self.observed_events.drain(..).collect()
     }
 
     pub fn clear_task(&mut self) {
@@ -354,20 +479,23 @@ impl MemoryConsolidator {
             match event {
                 StmEvent::UserCorrection { instruction } => {
                     let clean = instruction.trim();
-                    if clean.len() >= 10 {
+                    if clean.len() >= 10 && !Self::is_trivial_remark(clean) {
                         let keywords = Self::extract_salient_keywords(clean);
-                        let id = ltm.add_or_reinforce(
-                            InsightCategory::UserPreference,
-                            keywords,
-                            clean,
-                            1.0,
-                        );
-                        outcomes.push(ConsolidationOutcome {
-                            insight_id: id,
-                            category: InsightCategory::UserPreference,
-                            insight_text: clean.to_string(),
-                            reason: "Learned directly from user correction".to_string(),
-                        });
+                        // Require at least one meaningful non-stopword keyword
+                        if !keywords.is_empty() {
+                            let id = ltm.add_or_reinforce(
+                                InsightCategory::UserPreference,
+                                keywords,
+                                clean,
+                                1.0,
+                            );
+                            outcomes.push(ConsolidationOutcome {
+                                insight_id: id,
+                                category: InsightCategory::UserPreference,
+                                insight_text: clean.to_string(),
+                                reason: "Learned directly from user correction".to_string(),
+                            });
+                        }
                     }
                 }
                 StmEvent::SelfHealingSuccess {
@@ -463,6 +591,44 @@ impl MemoryConsolidator {
             .into_iter()
             .take(6)
             .collect()
+    }
+
+    /// Rejects conversational affirmations and pleasantries that lack actionable instruction.
+    pub fn is_trivial_remark(text: &str) -> bool {
+        let lower = text.trim().to_lowercase();
+        let cleaned: String = lower
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .collect();
+
+        let trivial_phrases = [
+            "klinkt goed",
+            "sounds good",
+            "looks good",
+            "prima bedankt",
+            "dank je wel",
+            "dankjewel",
+            "thank you very much",
+            "perfect bedankt",
+            "heel erg bedankt",
+            "geen probleem",
+            "hartelijk dank",
+            "ziet er goed uit",
+            "goed gedaan",
+            "well done",
+            "nice job",
+            "great job",
+            "super bedankt",
+            "veel dank",
+        ];
+
+        for phrase in &trivial_phrases {
+            if cleaned == *phrase || cleaned.starts_with(&format!("{} ", phrase)) {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn is_systemic_error(err: &str) -> bool {
@@ -1176,5 +1342,423 @@ mod tests {
         assert!(banner.contains("Retrieval Precision"));
         assert!(banner.contains("Zero-Overhead Specificity"));
         assert!(banner.contains("Deduplication & Reinforcement"));
+    }
+
+    #[test]
+    fn test_stm_high_throughput_and_rotation_limit() {
+        let mut stm = WorkingMemory::new();
+        stm.set_goal("Massive batch execution stress test");
+        stm.set_subtask("Execute 1000 actions and 50 touchpoints");
+
+        // Record 1,000 attempts (under Miller's Law capped at 7 items via FIFO eviction)
+        for i in 0..1000 {
+            stm.record_attempt(
+                &format!("action_{}", i),
+                Some(&format!(
+                    "Error detail line 1 for action {}\nStacktrace ignored",
+                    i
+                )),
+                false,
+            );
+        }
+        assert_eq!(
+            stm.failed_attempts.len(),
+            7,
+            "Miller's Law cap must strictly enforce max 7 chunks"
+        );
+        assert!(stm
+            .failed_attempts
+            .last()
+            .unwrap()
+            .error_summary
+            .contains("action 999"));
+
+        // Record 50 touchpoints (should be strictly capped at 10 items via FIFO eviction)
+        for i in 0..50 {
+            stm.record_touchpoint(&PathBuf::from(format!("src/module_{}.rs", i)));
+        }
+        assert_eq!(stm.recent_touchpoints.len(), 10);
+        // The last added (49) must be present, the oldest (0..39) must have been evicted
+        assert_eq!(
+            stm.recent_touchpoints.last().unwrap(),
+            &PathBuf::from("src/module_49.rs")
+        );
+        assert_eq!(
+            stm.recent_touchpoints.first().unwrap(),
+            &PathBuf::from("src/module_40.rs")
+        );
+
+        // Verify scratchpad formatting under load
+        let scratch = stm.format_scratchpad();
+        assert!(scratch.contains("🎯 Active Goal: Massive batch execution stress test"));
+        assert!(scratch.contains("📁 Touchpoints:"));
+
+        // Verify clean task wiping
+        stm.clear_task();
+        assert!(stm.current_goal.is_none());
+        assert!(stm.current_subtask.is_none());
+        assert!(stm.failed_attempts.is_empty());
+        assert!(stm.observed_events.is_empty());
+        // Touchpoints remain as session workspace context
+        assert_eq!(stm.recent_touchpoints.len(), 10);
+    }
+
+    #[test]
+    fn test_ltm_mass_insertion_and_ranking_stability() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+
+        // Insert 200 distinct synthetic insights across all 4 categories
+        for i in 0..200 {
+            let cat = match i % 4 {
+                0 => InsightCategory::Architecture,
+                1 => InsightCategory::BugPattern,
+                2 => InsightCategory::UserPreference,
+                _ => InsightCategory::BuildQuirk,
+            };
+            ltm.add_or_reinforce(
+                cat,
+                vec![
+                    format!("tag_{}", i),
+                    format!("cluster_{}", i % 10),
+                    "common_kw".to_string(),
+                ],
+                &format!(
+                    "Synthetic architecture and coding rule number {} for cluster {}",
+                    i,
+                    i % 10
+                ),
+                0.75,
+            );
+        }
+        assert_eq!(ltm.insights.len(), 200);
+
+        // Reinforce a specific insight 5 times
+        for _ in 0..5 {
+            ltm.add_or_reinforce(
+                InsightCategory::Architecture,
+                vec!["high_priority".to_string(), "common_kw".to_string()],
+                "Synthetic architecture and coding rule number 0 for cluster 0",
+                0.9,
+            );
+        }
+
+        // Verify occurrence count and top-K ranking
+        let matched = ltm.find_relevant_insights("high_priority common_kw architecture", 5);
+        assert!(!matched.is_empty());
+        assert_eq!(matched[0].id, 1);
+        assert_eq!(matched[0].occurrence_count, 6); // 1 initial + 5 reinforcements
+        assert_eq!(matched[0].confidence, 1.0);
+    }
+
+    #[test]
+    fn test_ltm_persistence_roundtrip_integrity() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+
+        let test_records = [
+            (
+                InsightCategory::Architecture,
+                vec!["tokio", "async", "lock"],
+                "Always guard async locks across await boundaries.",
+            ),
+            (
+                InsightCategory::UserPreference,
+                vec!["emacs", "evil", "editor"],
+                "User uses Emacs with Evil mode; format buffer commands cleanly.",
+            ),
+            (
+                InsightCategory::BugPattern,
+                vec!["sql", "injection", "sanitize"],
+                "Escape all SQL user inputs using parameterized statements.",
+            ),
+            (
+                InsightCategory::BuildQuirk,
+                vec!["docker", "container", "isolated"],
+                "Run all unit tests inside ephemeral disposable containers.",
+            ),
+        ];
+
+        for (cat, kws, text) in &test_records {
+            ltm.add_or_reinforce(
+                *cat,
+                kws.iter().map(|s| s.to_string()).collect(),
+                text,
+                0.95,
+            );
+        }
+
+        // Save to disk
+        ltm.save(ws).unwrap();
+        let file_path = ws.join(".orbit").join("insights.json");
+        assert!(file_path.exists());
+
+        // Reload fresh from disk
+        let loaded = LongTermMemory::load_or_init(ws).unwrap();
+        assert_eq!(loaded.insights.len(), 4);
+
+        for (i, (cat, kws, text)) in test_records.iter().enumerate() {
+            let item = &loaded.insights[i];
+            assert_eq!(item.category, *cat);
+            assert_eq!(&item.insight, text);
+            for kw in kws {
+                assert!(item.trigger_keywords.contains(&kw.to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_consolidator_complex_conversation_lifecycle() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+        let mut stm = WorkingMemory::new();
+
+        // 1. Noise events (should ALL be filtered out because they are trivial remarks or under 10 chars)
+        for noise in &[
+            "ok", "thanks", "prima", "goed zo", "prima!", "super!", "yes",
+        ] {
+            stm.record_event(StmEvent::UserCorrection {
+                instruction: noise.to_string(),
+            });
+        }
+
+        // 2. Salient user instructions (should transition)
+        stm.record_event(StmEvent::UserCorrection {
+            instruction: "Always run tests with --nocapture and verify clean pass".to_string(),
+        });
+        stm.record_event(StmEvent::UserCorrection {
+            instruction: "Never modify production database without a transaction rollback guard"
+                .to_string(),
+        });
+
+        // 3. Self-healing event (should transition to BugPattern)
+        stm.record_event(StmEvent::SelfHealingSuccess {
+            tool: "cargo_test".to_string(),
+            target: "src/memory.rs".to_string(),
+            initial_error: "error[E0432]: unresolved import `crate::memory::StmEvent`".to_string(),
+            resolution_strategy: "imported StmEvent into scope".to_string(),
+        });
+
+        // 4. Pre-commit failure event (should transition to BuildQuirk)
+        stm.record_event(StmEvent::ToolExecution {
+            tool: "run_command".to_string(),
+            target: "git commit".to_string(),
+            succeeded: false,
+            error: Some("formatting check failed: run cargo fmt".to_string()),
+        });
+
+        let outcomes = MemoryConsolidator::consolidate(&stm, &mut ltm);
+        // Exactly 4 items consolidated: 2 user corrections + 1 self-healing + 1 pre-commit check
+        assert_eq!(
+            outcomes.len(),
+            4,
+            "Expected 4 consolidated insights, got {}",
+            outcomes.len()
+        );
+
+        // Verify categories
+        let user_prefs: Vec<_> = outcomes
+            .iter()
+            .filter(|o| o.category == InsightCategory::UserPreference)
+            .collect();
+        let bug_patterns: Vec<_> = outcomes
+            .iter()
+            .filter(|o| o.category == InsightCategory::BugPattern)
+            .collect();
+        let build_quirks: Vec<_> = outcomes
+            .iter()
+            .filter(|o| o.category == InsightCategory::BuildQuirk)
+            .collect();
+
+        assert_eq!(user_prefs.len(), 2);
+        assert_eq!(bug_patterns.len(), 1);
+        assert_eq!(build_quirks.len(), 1);
+
+        // 5. Reinforce an existing insight in next turn
+        let mut stm2 = WorkingMemory::new();
+        stm2.record_event(StmEvent::UserCorrection {
+            instruction: "Always run tests with --nocapture and verify clean pass".to_string(),
+        });
+        let outcomes2 = MemoryConsolidator::consolidate(&stm2, &mut ltm);
+        assert_eq!(outcomes2.len(), 1);
+        // Total insights in LTM must still be 4 (deduplicated!)
+        assert_eq!(ltm.insights.len(), 4);
+        let reinforced = ltm
+            .insights
+            .iter()
+            .find(|i| i.insight.contains("--nocapture"))
+            .unwrap();
+        assert_eq!(reinforced.occurrence_count, 2);
+    }
+
+    #[test]
+    fn test_ebbinghaus_decay_and_spaced_repetition() {
+        let rec = InsightRecord {
+            id: 1,
+            category: InsightCategory::Architecture,
+            trigger_keywords: vec!["tokio".to_string()],
+            insight: "Async lock rule".to_string(),
+            confidence: 1.0,
+            occurrence_count: 1,
+            created_at: 1000,
+            last_accessed: 1000,
+            stability_days: 14.0,
+        };
+
+        // At t = 0 days since access: R should be 1.0
+        let r0 = rec.retrievability(1000);
+        assert!((r0 - 1.0).abs() < 0.01);
+
+        // At t = 14 days (14 * 86400 secs): R = exp(-1) ~= 0.368
+        let r14 = rec.retrievability(1000 + 14 * 86400);
+        assert!((r14 - 0.368).abs() < 0.05);
+
+        // At t = 45 days: R decays down towards 0.04
+        let r45 = rec.retrievability(1000 + 45 * 86400);
+        assert!(r45 < 0.1);
+
+        // Simulate reinforcement via spaced repetition
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+        ltm.add_or_reinforce(
+            InsightCategory::Architecture,
+            vec!["tokio".to_string()],
+            "Async lock rule",
+            1.0,
+        );
+        let initial_stability = ltm.insights[0].stability_days;
+        assert_eq!(initial_stability, 14.0);
+
+        // Reinforce again
+        ltm.add_or_reinforce(
+            InsightCategory::Architecture,
+            vec!["tokio".to_string()],
+            "Async lock rule",
+            1.0,
+        );
+        // Stability should expand by 1.5x (spaced repetition)
+        assert_eq!(ltm.insights[0].stability_days, 21.0);
+    }
+
+    #[test]
+    fn test_stm_drain_events_functionality() {
+        let mut stm = WorkingMemory::new();
+        stm.record_event(StmEvent::UserCorrection {
+            instruction: "Test event 1".to_string(),
+        });
+        stm.record_event(StmEvent::UserCorrection {
+            instruction: "Test event 2".to_string(),
+        });
+        assert_eq!(stm.observed_events.len(), 2);
+
+        let drained = stm.drain_events();
+        assert_eq!(drained.len(), 2);
+        assert!(stm.observed_events.is_empty());
+    }
+
+    #[test]
+    fn test_trivial_remark_noise_rejection() {
+        assert!(MemoryConsolidator::is_trivial_remark("klinkt goed"));
+        assert!(MemoryConsolidator::is_trivial_remark("sounds good!"));
+        assert!(MemoryConsolidator::is_trivial_remark("prima bedankt!"));
+        assert!(MemoryConsolidator::is_trivial_remark("thank you very much"));
+        assert!(!MemoryConsolidator::is_trivial_remark(
+            "Always run cargo test with --nocapture"
+        ));
+    }
+
+    #[test]
+    fn test_atomic_save_tmpfile_cleanup() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+        ltm.add_or_reinforce(
+            InsightCategory::Architecture,
+            vec!["atomic".to_string()],
+            "Atomic writes guarantee zero corruption",
+            1.0,
+        );
+        ltm.save(ws).unwrap();
+
+        let real_file = ws.join(".orbit").join("insights.json");
+        let tmp_file = ws.join(".orbit").join("insights.json.tmp");
+        assert!(real_file.exists());
+        assert!(!tmp_file.exists(), "Tmp file must be atomically renamed");
+    }
+
+    #[test]
+    fn test_synaptic_pruning_and_inverted_index() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+
+        // Insight 1: fresh (retrievability ~1.0)
+        ltm.add_or_reinforce(
+            InsightCategory::Architecture,
+            vec!["fresh_key".to_string()],
+            "Fresh insight rule that should remain active",
+            1.0,
+        );
+
+        // Insight 2: simulated ancient decayed insight (last_accessed 120 days ago)
+        let ancient_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(120 * 86400);
+
+        let old_rec = InsightRecord {
+            id: 2,
+            category: InsightCategory::BugPattern,
+            trigger_keywords: vec!["ancient_bug".to_string()],
+            insight: "Ancient deprecated workaround".to_string(),
+            confidence: 0.5,
+            occurrence_count: 1,
+            created_at: ancient_ts,
+            last_accessed: ancient_ts,
+            stability_days: 7.0, // R = exp(-120/7) ~= 3.8e-8 < 0.05
+        };
+        ltm.insights.push(old_rec);
+        ltm.rebuild_index();
+        assert_eq!(ltm.insights.len(), 2);
+
+        // Verify Inverted Index successfully returns both candidates
+        assert_eq!(ltm.find_relevant_insights("fresh_key", 5).len(), 1);
+
+        // Execute Synaptic Pruning at threshold R = 0.05
+        let pruned = ltm.prune_decayed_insights(0.05);
+        assert_eq!(pruned, 1, "Expected exactly 1 ancient insight to be pruned");
+        assert_eq!(ltm.insights.len(), 1);
+        assert_eq!(
+            ltm.insights[0].insight,
+            "Fresh insight rule that should remain active"
+        );
+
+        // Verify Inverted Index was rebuilt: query for ancient_bug should yield 0
+        assert!(ltm.find_relevant_insights("ancient_bug", 5).is_empty());
+    }
+
+    #[test]
+    fn test_live_active_store_health_and_benchmark() {
+        let ws = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let active_ltm = LongTermMemory::load_or_init(ws).ok();
+        let report = MemoryBenchmarkRunner::run_benchmark(active_ltm.as_ref());
+
+        println!("\n=== LIVE ACTIVE ORBIT BENCHMARK ===");
+        println!("{}", report.format_banner());
+
+        assert_eq!(report.quality_score, 100);
+        assert!(
+            report.avg_retrieval_latency_us < 200.0,
+            "Latency must be sub-millisecond"
+        );
+        assert!(report.noise_rejection_rate >= 1.0);
+        assert!(report.precision_rate >= 1.0);
+        assert!(report.specificity_rate >= 1.0);
+        assert!(report.deduplication_rate >= 1.0);
     }
 }

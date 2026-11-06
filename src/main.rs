@@ -207,6 +207,7 @@ pub struct AgentState {
     pub long_term_memory: Mutex<memory::LongTermMemory>,
     pub budget_enforcer: Mutex<budget::BudgetEnforcer>,
     pub notification_mgr: Mutex<notify::TaskNotificationManager>,
+    pub last_compile_error: Mutex<Option<(String, String)>>, // (tool_name, error_output)
 }
 
 impl AgentState {
@@ -293,6 +294,7 @@ impl AgentState {
         let notification_mgr = Mutex::new(notify::TaskNotificationManager::new(
             notify::NotificationConfig::default(),
         ));
+        let last_compile_error = Mutex::new(None);
 
         Ok(Self {
             config,
@@ -319,6 +321,7 @@ impl AgentState {
             long_term_memory,
             budget_enforcer,
             notification_mgr,
+            last_compile_error,
         })
     }
 
@@ -836,15 +839,37 @@ async fn execute_tool_internal(
                                 "\n\n{}",
                                 compile_guard::format_compile_banner(&comp)
                             ));
-                            if !comp.success && state.config.self_healing_enabled {
-                                if !quiet {
-                                    println!(
-                                        "{}",
-                                        "🩹 Compile Guard detected error. Self-healing triggered..."
-                                            .yellow()
-                                    );
+                            if !comp.success {
+                                if let Ok(mut lce) = state.last_compile_error.lock() {
+                                    *lce = Some(("write_file".to_string(), comp.output.clone()));
                                 }
-                                res.push_str("\n\n[SELF-HEALING REQUIRED]: Compilation failed. Please emit a corrected ```tool:write_file or ```tool:apply_patch immediately to resolve these compiler errors.");
+                                if state.config.self_healing_enabled {
+                                    if !quiet {
+                                        println!(
+                                            "{}",
+                                            "🩹 Compile Guard detected error. Self-healing triggered..."
+                                                .yellow()
+                                        );
+                                    }
+                                    res.push_str("\n\n[SELF-HEALING REQUIRED]: Compilation failed. Please emit a corrected ```tool:write_file or ```tool:apply_patch immediately to resolve these compiler errors.");
+                                }
+                            } else {
+                                // Successful compilation: check if this was a self-healing resolution of a prior error
+                                let prev_err = state
+                                    .last_compile_error
+                                    .lock()
+                                    .ok()
+                                    .and_then(|mut lce| lce.take());
+                                if let Some((prev_tool, err_text)) = prev_err {
+                                    if let Ok(mut stm) = state.working_memory.lock() {
+                                        stm.record_event(memory::StmEvent::SelfHealingSuccess {
+                                            tool: prev_tool,
+                                            target: path_display.clone(),
+                                            initial_error: err_text,
+                                            resolution_strategy: "adjusted code implementation to satisfy compiler checks".to_string(),
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
@@ -946,15 +971,37 @@ async fn execute_tool_internal(
                                 "\n\n{}",
                                 compile_guard::format_compile_banner(&comp)
                             ));
-                            if !comp.success && state.config.self_healing_enabled {
-                                if !quiet {
-                                    println!(
-                                        "{}",
-                                        "🩹 Compile Guard detected error. Self-healing triggered..."
-                                            .yellow()
-                                    );
+                            if !comp.success {
+                                if let Ok(mut lce) = state.last_compile_error.lock() {
+                                    *lce = Some(("apply_patch".to_string(), comp.output.clone()));
                                 }
-                                res.push_str("\n\n[SELF-HEALING REQUIRED]: Compilation failed. Please emit a corrected ```tool:apply_patch immediately to fix these compiler errors.");
+                                if state.config.self_healing_enabled {
+                                    if !quiet {
+                                        println!(
+                                            "{}",
+                                            "🩹 Compile Guard detected error. Self-healing triggered..."
+                                                .yellow()
+                                        );
+                                    }
+                                    res.push_str("\n\n[SELF-HEALING REQUIRED]: Compilation failed. Please emit a corrected ```tool:apply_patch immediately to fix these compiler errors.");
+                                }
+                            } else {
+                                // Successful compilation: check if this was a self-healing resolution of a prior error
+                                let prev_err = state
+                                    .last_compile_error
+                                    .lock()
+                                    .ok()
+                                    .and_then(|mut lce| lce.take());
+                                if let Some((prev_tool, err_text)) = prev_err {
+                                    if let Ok(mut stm) = state.working_memory.lock() {
+                                        stm.record_event(memory::StmEvent::SelfHealingSuccess {
+                                            tool: prev_tool,
+                                            target: patch_res.path.clone(),
+                                            initial_error: err_text,
+                                            resolution_strategy: "applied corrective patch satisfying compiler checks".to_string(),
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
@@ -4184,12 +4231,20 @@ async fn main() -> Result<()> {
                             );
 
                             // Autonomous memory consolidation check at turn completion
-                            let stm_copy = state.working_memory.lock().map(|s| s.clone()).ok();
-                            if let Some(stm) = stm_copy {
-                                if !stm.observed_events.is_empty() {
+                            let consolidation_needed = state
+                                .working_memory
+                                .lock()
+                                .map(|s| !s.observed_events.is_empty())
+                                .unwrap_or(false);
+
+                            if consolidation_needed {
+                                if let Ok(mut stm) = state.working_memory.lock() {
                                     if let Ok(mut ltm) = state.long_term_memory.lock() {
                                         let outcomes =
                                             memory::MemoryConsolidator::consolidate(&stm, &mut ltm);
+                                        // Drain processed events to prevent re-consolidation on future turns
+                                        let _ = stm.drain_events();
+
                                         if !outcomes.is_empty() {
                                             let _ = ltm.save(&state.workspace_dir);
                                             for o in outcomes {

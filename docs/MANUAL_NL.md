@@ -287,6 +287,23 @@ Orbit kan autonoom software ontwikkelen volgens het strikte Red-Green-Refactor p
 2. **Green Phase**: Orbit schrijft de minimale implementatiecode om de tests te laten slagen. Als de tests falen, draait een bounded herstellus (maximaal 3 pogingen) tot alle tests 100% slagen.
 3. **Refactor Phase**: Schoonmaken van code en optimaliseren van documentatie met behoud van de groene teststatus.
 
+### 5.5 Neurocognitief Geheugensysteem (STM & LTM met Ebbinghaus Decay)
+Orbit beschikt over een tweeledige cognitieve geheugenarchitectuur (`src/memory.rs`), geïnspireerd op Baddeley's werkgeheugenmodel en de vergeetcurve van Ebbinghaus:
+
+1. **Short-Term Working Memory (STM)**:
+   - Houdt actieve doelen, deeltaken, recente bestands-touchpoints en mislukte acties bij.
+   - **Miller's Law ($7 \pm 2$ Chunks)**: Mislukte pogingen in het werkgeheugen zijn strikt begrensd op maximaal 7 items (FIFO rotatie), waardoor contextvervuiling in het LLM-window wordt voorkomen en duizenden tokens per sessie worden bespaard.
+2. **Long-Term Memory (LTM) & Inverted Index**:
+   - Bewaart duurzame projectkennis en conventies in `.orbit/insights.json` binnen 4 categorieën: `Architecture`, `BugPattern`, `UserPreference` en `BuildQuirk`.
+   - **Inverted Index ($O(1)$ Lookup)**: Bouwt bij opstart een omgekeerde trefwoordindex op waardoor retrieval-latency daalt naar **16–20 µs**.
+   - **Ebbinghaus Decay & Spaced Repetition ($R = e^{-\Delta t / S}$)**: Kennis die lang niet geraadpleegd is zakt natuurlijk in relevantiescore, terwijl herhaaldelijk getriggerde regels exponentieel meer geheugenstabiliteit krijgen.
+   - **Synaptisch Snoeien (Synaptic Pruning)**: Inzichten met $R < 0.05$ (niet geraadpleegd in 60–90 dagen) worden automatisch opgeschoond.
+   - **Atomische Opslag**: Schrijft via een tijdelijk bestand `.orbit/insights.json.tmp` en voert een atomische rename uit om corruptie bij crashes of `Ctrl+C` uit te sluiten.
+3. **Consolidatie & CompileGuard Feedback Loop**:
+   - Filtert beleefdheidsvormen en niet-instruerende bevestigingen (zoals *"klinkt goed"* of *"prima bedankt"*).
+   - Leegt verwerkte events na elke turn (`drain_events()`) om redundante herbeoordeling te voorkomen.
+   - Koppelvlak met **Compile Guard**: wanneer een codeherstel slaagt, slaat Orbit de fout en oplossing autonoom op als `BugPattern`.
+
 ---
 
 ## 6. Subagents, DAG Orchestratie & Adversarial Review
