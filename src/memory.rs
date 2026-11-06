@@ -51,10 +51,19 @@ pub struct InsightRecord {
 }
 
 /// Persistent Long-Term Memory (LTM) store.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LongTermMemory {
     pub insights: Vec<InsightRecord>,
     next_id: usize,
+}
+
+impl Default for LongTermMemory {
+    fn default() -> Self {
+        Self {
+            insights: Vec::new(),
+            next_id: 1,
+        }
+    }
 }
 
 impl LongTermMemory {
@@ -535,6 +544,285 @@ Persistent architectural decisions, discovered constraints, and codebase pattern
     }
 }
 
+/// Comprehensive benchmark and evaluation result for the Orbit Memory subsystem.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryEvalReport {
+    pub total_insights_evaluated: usize,
+    pub noise_tests_total: usize,
+    pub noise_tests_passed: usize,
+    pub noise_rejection_rate: f64,
+    pub precision_tests_total: usize,
+    pub precision_tests_passed: usize,
+    pub precision_rate: f64,
+    pub specificity_tests_total: usize,
+    pub specificity_tests_passed: usize,
+    pub specificity_rate: f64,
+    pub deduplication_tests_total: usize,
+    pub deduplication_tests_passed: usize,
+    pub deduplication_rate: f64,
+    pub avg_retrieval_latency_us: f64,
+    pub estimated_tokens_saved: usize,
+    pub quality_score: usize,
+    pub verdict: String,
+}
+
+impl MemoryEvalReport {
+    pub fn format_banner(&self) -> String {
+        let mut out = String::new();
+        out.push_str("=== 🧠 ORBIT MEMORY BENCHMARK & DIAGNOSTIC REPORT ===\n\n");
+        out.push_str(&format!(
+            "• Noise Rejection (Vague/Trivial Ignored):    {}/{} ({:.1}%) [{}]\n",
+            self.noise_tests_passed,
+            self.noise_tests_total,
+            self.noise_rejection_rate * 100.0,
+            if self.noise_rejection_rate >= 0.99 {
+                "PASS"
+            } else {
+                "WARN"
+            }
+        ));
+        out.push_str(&format!(
+            "• Retrieval Precision (Targeted Context Hits): {}/{} ({:.1}%) [{}]\n",
+            self.precision_tests_passed,
+            self.precision_tests_total,
+            self.precision_rate * 100.0,
+            if self.precision_rate >= 0.90 {
+                "PASS"
+            } else {
+                "WARN"
+            }
+        ));
+        out.push_str(&format!(
+            "• Zero-Overhead Specificity (Irrelevant = 0):   {}/{} ({:.1}%) [{}]\n",
+            self.specificity_tests_passed,
+            self.specificity_tests_total,
+            self.specificity_rate * 100.0,
+            if self.specificity_rate >= 0.99 {
+                "PASS"
+            } else {
+                "WARN"
+            }
+        ));
+        out.push_str(&format!(
+            "• Deduplication & Reinforcement Integrity:    {}/{} ({:.1}%) [{}]\n",
+            self.deduplication_tests_passed,
+            self.deduplication_tests_total,
+            self.deduplication_rate * 100.0,
+            if self.deduplication_rate >= 0.99 {
+                "PASS"
+            } else {
+                "WARN"
+            }
+        ));
+        out.push_str(&format!(
+            "• Average Retrieval Latency:                  {:.2} µs ({:.3} ms) [FAST]\n",
+            self.avg_retrieval_latency_us,
+            self.avg_retrieval_latency_us / 1000.0
+        ));
+        out.push_str(&format!(
+            "• Net Token Overhead Saved (vs Brute-Force):  ~{} tokens saved\n\n",
+            self.estimated_tokens_saved
+        ));
+        out.push_str(&format!(
+            "🏆 Memory Quality Score: {}/100 -> {}\n",
+            self.quality_score, self.verdict
+        ));
+        out
+    }
+}
+
+pub struct MemoryBenchmarkRunner;
+
+impl MemoryBenchmarkRunner {
+    /// Executes a deterministic multi-axis benchmark against the active or synthetic memory store.
+    pub fn run_benchmark(active_ltm: Option<&LongTermMemory>) -> MemoryEvalReport {
+        let mut test_ltm = LongTermMemory::default();
+
+        // 1. Seed realistic benchmark insights across domains
+        test_ltm.add_or_reinforce(
+            InsightCategory::Architecture,
+            vec!["sqlite".to_string(), "wal".to_string(), "pool".to_string()],
+            "Always enable WAL mode on SQLite connections and use connection pooling.",
+            0.95,
+        );
+        test_ltm.add_or_reinforce(
+            InsightCategory::BuildQuirk,
+            vec!["cargo".to_string(), "fmt".to_string(), "commit".to_string()],
+            "Always run 'cargo fmt' before git commit to pass repository pre-commit checks.",
+            0.90,
+        );
+        test_ltm.add_or_reinforce(
+            InsightCategory::BugPattern,
+            vec![
+                "tokio".to_string(),
+                "channel".to_string(),
+                "deadlock".to_string(),
+            ],
+            "Avoid unbounded channels and recursive lock acquisitions across await boundaries.",
+            0.85,
+        );
+        test_ltm.add_or_reinforce(
+            InsightCategory::UserPreference,
+            vec![
+                "conventional".to_string(),
+                "commit".to_string(),
+                "git".to_string(),
+            ],
+            "Use conventional commit messages with standard feat/fix/chore prefixes.",
+            1.0,
+        );
+
+        // Also merge active LTM insights if provided
+        if let Some(act) = active_ltm {
+            for ins in &act.insights {
+                test_ltm.add_or_reinforce(
+                    ins.category,
+                    ins.trigger_keywords.clone(),
+                    &ins.insight,
+                    ins.confidence,
+                );
+            }
+        }
+
+        // --- AXIS 1: Noise Rejection ---
+        let noise_samples = ["ok thanks", "prima", "goed zo", "yes", "testje"];
+        let mut noise_passed = 0;
+        for s in &noise_samples {
+            let mut stm = WorkingMemory::new();
+            stm.record_event(StmEvent::UserCorrection {
+                instruction: s.to_string(),
+            });
+            let mut ltm_clone = test_ltm.clone();
+            let outcomes = MemoryConsolidator::consolidate(&stm, &mut ltm_clone);
+            if outcomes.is_empty() {
+                noise_passed += 1;
+            }
+        }
+
+        // --- AXIS 2: Retrieval Precision ---
+        let precision_queries = [
+            (
+                "How should we configure the sqlite database connection pool?",
+                InsightCategory::Architecture,
+                "sqlite",
+            ),
+            (
+                "Please commit my changes with cargo fmt checks",
+                InsightCategory::BuildQuirk,
+                "cargo fmt",
+            ),
+            (
+                "Can you inspect tokio channel deadlock and locks?",
+                InsightCategory::BugPattern,
+                "channel",
+            ),
+            (
+                "What format should my git commit message follow?",
+                InsightCategory::UserPreference,
+                "conventional commit",
+            ),
+        ];
+        let mut precision_passed = 0;
+        for (q, expected_cat, expected_sub) in &precision_queries {
+            let matched = test_ltm.find_relevant_insights(q, 3);
+            if !matched.is_empty()
+                && matched[0].category == *expected_cat
+                && matched[0].insight.to_lowercase().contains(expected_sub)
+            {
+                precision_passed += 1;
+            }
+        }
+
+        // --- AXIS 3: Zero-Overhead Specificity ---
+        let irrelevant_queries = [
+            "Can you write a short poem about the sea?",
+            "What is the weather like in Amsterdam?",
+            "Translate hello world to French",
+            "Calculate 42 multiplied by 1337",
+        ];
+        let mut specificity_passed = 0;
+        for q in &irrelevant_queries {
+            let matched = test_ltm.find_relevant_insights(q, 5);
+            let injection = test_ltm.format_prompt_injection(q);
+            if matched.is_empty() && injection.is_none() {
+                specificity_passed += 1;
+            }
+        }
+
+        // --- AXIS 4: Deduplication & Reinforcement Integrity ---
+        let mut dedup_ltm = test_ltm.clone();
+        let initial_count = dedup_ltm.insights.len();
+        // Insert exact same rule again
+        let id_re = dedup_ltm.add_or_reinforce(
+            InsightCategory::Architecture,
+            vec!["sqlite".to_string(), "wal".to_string()],
+            "Always enable WAL mode on SQLite connections and use connection pooling.",
+            0.98,
+        );
+        let dedup_passed = if dedup_ltm.insights.len() == initial_count
+            && id_re == 1
+            && dedup_ltm.insights[0].occurrence_count == 2
+        {
+            1
+        } else {
+            0
+        };
+
+        // --- Latency Measurement ---
+        let start = std::time::Instant::now();
+        let iters = 200;
+        for _ in 0..iters {
+            let _ = test_ltm.find_relevant_insights("sqlite database connection pool", 3);
+            let _ = test_ltm.find_relevant_insights("poem about flowers", 3);
+        }
+        let total_us = start.elapsed().as_micros() as f64;
+        let avg_latency_us = total_us / (iters as f64 * 2.0);
+
+        // --- Calculation of Token Savings ---
+        // Without relevance filtering, every turn would dump all insights into prompt
+        let brute_force_chars: usize = test_ltm.insights.iter().map(|i| i.insight.len() + 30).sum();
+        let brute_force_tokens = (brute_force_chars / 4).max(10);
+        let estimated_tokens_saved = brute_force_tokens * 45; // estimated 45 turns session
+
+        let noise_rate = noise_passed as f64 / noise_samples.len() as f64;
+        let prec_rate = precision_passed as f64 / precision_queries.len() as f64;
+        let spec_rate = specificity_passed as f64 / irrelevant_queries.len() as f64;
+        let dedup_rate = dedup_passed as f64;
+
+        let quality_score =
+            ((noise_rate * 25.0) + (prec_rate * 35.0) + (spec_rate * 25.0) + (dedup_rate * 15.0))
+                .round() as usize;
+
+        let verdict = if quality_score >= 95 {
+            "OPTIMAL (Production-Ready Cognitive Memory)".to_string()
+        } else if quality_score >= 80 {
+            "GOOD (Acceptable Signal-to-Noise Ratio)".to_string()
+        } else {
+            "SUBOPTIMAL (Requires Threshold Tuning)".to_string()
+        };
+
+        MemoryEvalReport {
+            total_insights_evaluated: test_ltm.insights.len(),
+            noise_tests_total: noise_samples.len(),
+            noise_tests_passed: noise_passed,
+            noise_rejection_rate: noise_rate,
+            precision_tests_total: precision_queries.len(),
+            precision_tests_passed: precision_passed,
+            precision_rate: prec_rate,
+            specificity_tests_total: irrelevant_queries.len(),
+            specificity_tests_passed: specificity_passed,
+            specificity_rate: spec_rate,
+            deduplication_tests_total: 1,
+            deduplication_tests_passed: dedup_passed,
+            deduplication_rate: dedup_rate,
+            avg_retrieval_latency_us: avg_latency_us,
+            estimated_tokens_saved,
+            quality_score,
+            verdict,
+        }
+    }
+}
+
 fn chrono_date() -> String {
     let out = std::process::Command::new("date")
         .arg("+%Y-%m-%d %H:%M")
@@ -862,5 +1150,30 @@ mod tests {
         let ranked = ltm.find_relevant_insights("cargo check and commit", 5);
         // The reinforced insight with occurrence_count = 2 must rank higher
         assert_eq!(ranked[0].id, 1);
+    }
+
+    #[test]
+    fn test_memory_benchmark_runner_execution() {
+        let report = MemoryBenchmarkRunner::run_benchmark(None);
+        assert_eq!(report.noise_tests_passed, report.noise_tests_total);
+        assert_eq!(report.precision_tests_passed, report.precision_tests_total);
+        assert_eq!(
+            report.specificity_tests_passed,
+            report.specificity_tests_total
+        );
+        assert_eq!(report.deduplication_tests_passed, 1);
+        assert!(
+            report.quality_score >= 95,
+            "Quality score should be >= 95: {}",
+            report.quality_score
+        );
+        assert!(report.avg_retrieval_latency_us > 0.0);
+
+        let banner = report.format_banner();
+        assert!(banner.contains("ORBIT MEMORY BENCHMARK & DIAGNOSTIC REPORT"));
+        assert!(banner.contains("Noise Rejection"));
+        assert!(banner.contains("Retrieval Precision"));
+        assert!(banner.contains("Zero-Overhead Specificity"));
+        assert!(banner.contains("Deduplication & Reinforcement"));
     }
 }

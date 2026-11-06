@@ -411,7 +411,18 @@ async fn submit_input(
         return Ok(());
     } else if input == "/memory" || input.starts_with("/memory ") {
         let entry = input.strip_prefix("/memory").unwrap_or("").trim();
-        if entry.is_empty() {
+        if entry == "eval" || entry == "benchmark" || entry == "test" {
+            let ltm_guard = state.long_term_memory.lock().ok();
+            let report = crate::memory::MemoryBenchmarkRunner::run_benchmark(ltm_guard.as_deref());
+            state.history.push(crate::Message {
+                role: "system".to_string(),
+                content: report.format_banner(),
+            });
+            app.status_message = format!(
+                "Memory Quality Score: {}/100 -> {}",
+                report.quality_score, report.verdict
+            );
+        } else if entry.is_empty() {
             let mut report = String::from("=== 🧠 ORBIT MEMORY ARCHITECTURE ===\n");
             if let Ok(stm) = state.working_memory.lock() {
                 report.push_str("\n--- [SHORT-TERM WORKING MEMORY] ---\n");

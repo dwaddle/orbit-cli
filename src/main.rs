@@ -3252,7 +3252,14 @@ async fn main() -> Result<()> {
                         }
                         "/memory" => {
                             let entry = arg.trim();
-                            if entry.is_empty() {
+                            if entry == "eval" || entry == "benchmark" || entry == "test" {
+                                println!("\n{}", "Running in-depth memory evaluation and diagnostic benchmark...".cyan().bold());
+                                let ltm_guard = state.long_term_memory.lock().ok();
+                                let report = memory::MemoryBenchmarkRunner::run_benchmark(
+                                    ltm_guard.as_deref(),
+                                );
+                                println!("\n{}", report.format_banner().green());
+                            } else if entry.is_empty() {
                                 println!(
                                     "\n{}",
                                     "=== 🧠 ORBIT MEMORY ARCHITECTURE ===".bold().cyan()
