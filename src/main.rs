@@ -41,7 +41,6 @@ pub mod metrics;
 pub mod modal_prompt;
 pub mod notify;
 pub mod outline;
-pub mod owasp_audit;
 pub mod patch;
 pub mod plan;
 pub mod query_cache;
@@ -2115,60 +2114,6 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 Err(e) => println!("Failed to execute command: {}", e),
-                            }
-                            continue;
-                        }
-                        "/owasp" => {
-                            let target_url = arg.trim();
-                            let url = if target_url.is_empty() {
-                                "http://localhost:3000"
-                            } else {
-                                target_url
-                            };
-
-                            println!(
-                                "{}",
-                                format!("🔒 Running OWASP Juice Shop audit against {}...", url)
-                                    .bold()
-                                    .cyan()
-                            );
-
-                            match owasp_audit::OwaspAuditor::new(url).run_full_audit().await {
-                                Ok(result) => {
-                                    println!("\n{}", "=== OWASP AUDIT RESULTS ===".bold().green());
-                                    println!("Total Challenges: {}", result.total_challenges);
-                                    println!(
-                                        "Solved: {} ({:.1}%)",
-                                        result.solved_challenges, result.coverage_percentage
-                                    );
-                                    println!("\n{}", "Module Breakdown:".bold());
-                                    for (module_id, module_result) in result.modules.iter() {
-                                        println!(
-                                            "  Module {}: {} - {}/{} solved",
-                                            module_id,
-                                            module_result.name,
-                                            module_result.solved,
-                                            module_result.total
-                                        );
-                                    }
-
-                                    if result.coverage_percentage >= 80.0 {
-                                        println!(
-                                            "\n{}",
-                                            "✅ TARGET ACHIEVED: ≥80% coverage!".bold().green()
-                                        );
-                                    } else {
-                                        println!(
-                                            "\n{}",
-                                            format!(
-                                                "⚠️  Need {:.1}% more to reach 80% target",
-                                                80.0 - result.coverage_percentage
-                                            )
-                                            .yellow()
-                                        );
-                                    }
-                                }
-                                Err(e) => println!("{}", format!("❌ Audit failed: {}", e).red()),
                             }
                             continue;
                         }
