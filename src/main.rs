@@ -117,6 +117,8 @@ pub struct AppConfig {
     pub diff_approval_required: bool,
     #[serde(default = "default_true")]
     pub live_hud_enabled: bool,
+    #[serde(default)]
+    pub verbosity: highlight::VerbosityLevel,
 }
 
 impl Default for AppConfig {
@@ -137,6 +139,7 @@ impl Default for AppConfig {
             vim_mode: true,
             diff_approval_required: false,
             live_hud_enabled: true,
+            verbosity: highlight::VerbosityLevel::default(),
         }
     }
 }
@@ -560,7 +563,7 @@ impl AgentState {
         }
 
         prompt.push_str(
-            "Keep all responses direct, technical, direct, and concise in GitHub markdown.",
+            "Never duplicate or repeat the full source code of written or modified files in your conversational markdown prose. Explain your changes in 1-2 concise bullet points; let ```tool:write_file or ```tool:apply_patch perform the file modifications directly.\nKeep all responses direct, technical, direct, and concise in GitHub markdown.",
         );
         prompt
     }
@@ -662,7 +665,11 @@ pub async fn execute_tool_quiet(tool_name: &str, body: &str, state: &AgentState)
 }
 
 async fn execute_tool(tool_name: &str, body: &str, state: &AgentState) -> String {
-    execute_tool_internal(tool_name, body, state, false).await
+    let quiet = match state.config.verbosity {
+        highlight::VerbosityLevel::Quiet => true,
+        highlight::VerbosityLevel::Normal | highlight::VerbosityLevel::Verbose => false,
+    };
+    execute_tool_internal(tool_name, body, state, quiet).await
 }
 
 async fn execute_tool_internal(
@@ -1614,7 +1621,10 @@ pub async fn stream_completion_internal(
         let mut highlighter = match &mode {
             StreamOutputMode::TerminalRepl {
                 syntax_highlighting,
-            } => Some(highlight::StreamingHighlighter::new(*syntax_highlighting)),
+            } => Some(highlight::StreamingHighlighter::with_verbosity(
+                *syntax_highlighting,
+                state.config.verbosity,
+            )),
             _ => None,
         };
 
@@ -1754,6 +1764,7 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     let mut target_dir: Option<PathBuf> = None;
+    let mut cli_verbosity: Option<highlight::VerbosityLevel> = None;
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
@@ -1768,6 +1779,19 @@ async fn main() -> Result<()> {
             target_dir = Some(PathBuf::from(val));
         } else if let Some(val) = arg.strip_prefix("--workspace=") {
             target_dir = Some(PathBuf::from(val));
+        } else if arg == "-q" || arg == "--quiet" {
+            cli_verbosity = Some(highlight::VerbosityLevel::Quiet);
+        } else if arg == "-v" || arg == "--verbose" {
+            cli_verbosity = Some(highlight::VerbosityLevel::Verbose);
+        } else if let Some(val) = arg.strip_prefix("--verbosity=") {
+            if let Some(level) = highlight::VerbosityLevel::from_str_loose(val) {
+                cli_verbosity = Some(level);
+            }
+        } else if arg == "--verbosity" && i + 1 < args.len() {
+            if let Some(level) = highlight::VerbosityLevel::from_str_loose(&args[i + 1]) {
+                cli_verbosity = Some(level);
+                i += 1;
+            }
         } else if !arg.starts_with('-') && arg != "watch" {
             let p = PathBuf::from(arg);
             if p.is_dir() {
@@ -1778,6 +1802,9 @@ async fn main() -> Result<()> {
     }
 
     let mut state = AgentState::new(target_dir)?;
+    if let Some(v) = cli_verbosity {
+        state.config.verbosity = v;
+    }
 
     if args
         .iter()
@@ -1937,7 +1964,7 @@ async fn main() -> Result<()> {
         }
     );
     println!(
-        "Engine: Compile Guard: {} | Self-Healing: {} | Checkpoints: READY | Patching: SURGICAL (Aider-style)",
+        "Engine: Compile Guard: {} | Self-Healing: {} | Verbosity: {} | Patching: SURGICAL (Aider-style)",
         if state.config.compile_guard_enabled {
             "ENABLED".green()
         } else {
@@ -1947,7 +1974,8 @@ async fn main() -> Result<()> {
             "ENABLED".green()
         } else {
             "DISABLED".dimmed()
-        }
+        },
+        state.config.verbosity.as_str().to_uppercase().bold().cyan()
     );
     println!("Type `/help` for commands or `/model` to view/select models.\n");
 
@@ -2261,6 +2289,9 @@ async fn main() -> Result<()> {
                             println!("  /file <path>           - Attach file content into context");
                             println!(
                                 "  /cache                 - Toggle prompt caching headers ON/OFF"
+                            );
+                            println!(
+                                "  /verbosity [level]     - Set or view output verbosity (quiet, normal, verbose)"
                             );
                             println!(
                                 "  /cascade               - Toggle hybrid model cascading ON/OFF"
@@ -2735,6 +2766,34 @@ async fn main() -> Result<()> {
                                 );
                             } else {
                                 println!("Context is already compact. No items required pruning.");
+                            }
+                            continue;
+                        }
+                        "/verbosity" => {
+                            let arg_clean = arg.trim();
+                            if arg_clean.is_empty() {
+                                println!("{}", "=== 📢 ORBIT VERBOSITY SETTINGS ===".bold().cyan());
+                                println!(
+                                    "Current Level: {}",
+                                    state.config.verbosity.as_str().bold().green()
+                                );
+                                println!("\nAvailable levels:");
+                                println!("  quiet   - Suppress streaming file writes & tool dumps in chat; concise status only");
+                                println!("  normal  - Balanced: concise file write summaries, standard command results (default)");
+                                println!("  verbose - Stream all raw tool payloads and full execution outputs");
+                                println!("\nUsage: /verbosity <quiet|normal|verbose>");
+                            } else if let Some(level) =
+                                highlight::VerbosityLevel::from_str_loose(arg_clean)
+                            {
+                                state.config.verbosity = level;
+                                let _ = state.save_config();
+                                println!("✅ Verbosity set to: {}", level.as_str().bold().green());
+                            } else {
+                                println!(
+                                    "{}",
+                                    format!("❌ Unknown verbosity level '{}'. Use: quiet, normal, verbose", arg_clean)
+                                        .red()
+                                );
                             }
                             continue;
                         }
@@ -4328,7 +4387,49 @@ async fn main() -> Result<()> {
                                     for (tool_name, tool_result) in results {
                                         let redacted_result =
                                             state.secret_redactor.redact(&tool_result);
-                                        println!("{}\n{}", "Result:".dimmed(), redacted_result);
+                                        match state.config.verbosity {
+                                            highlight::VerbosityLevel::Quiet => {
+                                                let first_line = redacted_result
+                                                    .lines()
+                                                    .next()
+                                                    .unwrap_or("Done")
+                                                    .trim();
+                                                println!(
+                                                    "  {} {}",
+                                                    "✓".green().bold(),
+                                                    first_line.dimmed()
+                                                );
+                                            }
+                                            highlight::VerbosityLevel::Normal => {
+                                                if tool_name == "write_file"
+                                                    || tool_name == "apply_patch"
+                                                {
+                                                    let first_line = redacted_result
+                                                        .lines()
+                                                        .next()
+                                                        .unwrap_or("Done")
+                                                        .trim();
+                                                    println!(
+                                                        "  {} {}",
+                                                        "✓".green().bold(),
+                                                        first_line
+                                                    );
+                                                } else {
+                                                    println!(
+                                                        "{}\n{}",
+                                                        "Result:".dimmed(),
+                                                        redacted_result
+                                                    );
+                                                }
+                                            }
+                                            highlight::VerbosityLevel::Verbose => {
+                                                println!(
+                                                    "{}\n{}",
+                                                    "Result:".dimmed(),
+                                                    redacted_result
+                                                );
+                                            }
+                                        }
                                         state.history.push(Message {
                                             role: "user".to_string(),
                                             content: format!(
