@@ -41,6 +41,7 @@ pub mod metrics;
 pub mod modal_prompt;
 pub mod notify;
 pub mod outline;
+pub mod owasp_audit;
 pub mod patch;
 pub mod plan;
 pub mod query_cache;
@@ -1102,23 +1103,46 @@ async fn execute_tool_internal(
         }
         "run_dag" => {
             let trimmed = body.trim();
-            if trimmed.starts_with("audit") {
+            let maybe_dag = if trimmed.starts_with("audit") {
                 let target = trimmed.strip_prefix("audit").unwrap_or("").trim();
                 let target = if target.is_empty() { "." } else { target };
-                let dag = subagent::create_audit_dag(target);
-                match state.subagent_mgr.run_dag(dag, &state.config.api_key).await {
-                    Ok(rep) => rep,
-                    Err(e) => format!("DAG execution error: {}", e),
-                }
+                Some(subagent::create_audit_dag(target))
             } else if trimmed.starts_with("feature") {
                 let spec = trimmed.strip_prefix("feature").unwrap_or("").trim();
-                let dag = subagent::create_feature_dag(spec);
-                match state.subagent_mgr.run_dag(dag, &state.config.api_key).await {
-                    Ok(rep) => rep,
-                    Err(e) => format!("DAG execution error: {}", e),
-                }
+                Some(subagent::create_feature_dag(spec))
             } else {
-                "Usage: run_dag audit <target> OR run_dag feature <spec>".to_string()
+                None
+            };
+
+            match maybe_dag {
+                Some(dag) => {
+                    let initial_insight_count =
+                        { state.long_term_memory.lock().unwrap().insights.len() };
+                    let rep_res = state
+                        .subagent_mgr
+                        .run_dag_with_memory(
+                            dag,
+                            &state.config.api_key,
+                            Some(&state.long_term_memory),
+                            Some(&state.working_memory),
+                        )
+                        .await;
+
+                    let should_save = {
+                        state.long_term_memory.lock().unwrap().insights.len()
+                            > initial_insight_count
+                    };
+                    if should_save {
+                        let ltm_guard = state.long_term_memory.lock().unwrap();
+                        let _ = ltm_guard.save(&state.workspace_dir);
+                    }
+
+                    match rep_res {
+                        Ok(rep) => rep,
+                        Err(e) => format!("DAG execution error: {}", e),
+                    }
+                }
+                None => "Usage: run_dag audit <target> OR run_dag feature <spec>".to_string(),
             }
         }
         "code_search" => search_index::execute_code_search_tool(&state.get_code_index(), body),
@@ -1160,17 +1184,45 @@ async fn execute_tool_internal(
                 return "Error: Missing prompt for subagent".to_string();
             }
 
+            let mem_injection = {
+                let ltm_guard = state.long_term_memory.lock().unwrap();
+                let stm_guard = state.working_memory.lock().unwrap();
+                let mut parts = Vec::new();
+                if let Some(ltm_text) = ltm_guard.format_prompt_injection(&prompt) {
+                    parts.push(ltm_text);
+                }
+                let scratchpad = stm_guard.format_scratchpad();
+                if !scratchpad.trim().is_empty() {
+                    parts.push(format!(
+                        "<working_memory_scratchpad>\n{}\n</working_memory_scratchpad>",
+                        scratchpad.trim()
+                    ));
+                }
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join("\n\n"))
+                }
+            };
+
+            let is_primed = mem_injection.is_some();
             let task_id = state
                 .subagent_mgr
-                .spawn_subagent(
+                .spawn_subagent_with_memory(
                     role.clone(),
                     model.clone(),
                     prompt.clone(),
                     state.config.api_key.clone(),
+                    mem_injection,
                 )
                 .await;
 
-            format!("Subagent Task #{} spawned in background (Role: {}, Model: {}). Use /subagents to check progress.", task_id, role, model)
+            let prime_badge = if is_primed {
+                " (Cognitive Memory Primed)"
+            } else {
+                ""
+            };
+            format!("Subagent Task #{} spawned in background (Role: {}, Model: {}){}. Use /subagents to check progress.", task_id, role, model, prime_badge)
         }
         "mcp" => {
             let mut server = "".to_string();
@@ -2038,6 +2090,60 @@ async fn main() -> Result<()> {
                             }
                             continue;
                         }
+                        "/owasp" => {
+                            let target_url = arg.trim();
+                            let url = if target_url.is_empty() {
+                                "http://localhost:3000"
+                            } else {
+                                target_url
+                            };
+
+                            println!(
+                                "{}",
+                                format!("🔒 Running OWASP Juice Shop audit against {}...", url)
+                                    .bold()
+                                    .cyan()
+                            );
+
+                            match owasp_audit::OwaspAuditor::new(url).run_full_audit().await {
+                                Ok(result) => {
+                                    println!("\n{}", "=== OWASP AUDIT RESULTS ===".bold().green());
+                                    println!("Total Challenges: {}", result.total_challenges);
+                                    println!(
+                                        "Solved: {} ({:.1}%)",
+                                        result.solved_challenges, result.coverage_percentage
+                                    );
+                                    println!("\n{}", "Module Breakdown:".bold());
+                                    for (module_id, module_result) in result.modules.iter() {
+                                        println!(
+                                            "  Module {}: {} - {}/{} solved",
+                                            module_id,
+                                            module_result.name,
+                                            module_result.solved,
+                                            module_result.total
+                                        );
+                                    }
+
+                                    if result.coverage_percentage >= 80.0 {
+                                        println!(
+                                            "\n{}",
+                                            "✅ TARGET ACHIEVED: ≥80% coverage!".bold().green()
+                                        );
+                                    } else {
+                                        println!(
+                                            "\n{}",
+                                            format!(
+                                                "⚠️  Need {:.1}% more to reach 80% target",
+                                                80.0 - result.coverage_percentage
+                                            )
+                                            .yellow()
+                                        );
+                                    }
+                                }
+                                Err(e) => println!("{}", format!("❌ Audit failed: {}", e).red()),
+                            }
+                            continue;
+                        }
                         "/help" => {
                             println!("{}", "=== ORBIT-CLI COMMANDS ===".bold().cyan());
                             println!(
@@ -2647,10 +2753,15 @@ async fn main() -> Result<()> {
                                         }
                                     };
                                     println!(
-                                        "• Subagent #{} [{}] Status: {}",
+                                        "• Subagent #{} [{}] Status: {}{}",
                                         t.id,
                                         t.role.bold(),
-                                        status_str
+                                        status_str,
+                                        if t.memory_primed {
+                                            " 🧠 [Primed]".magenta()
+                                        } else {
+                                            "".normal()
+                                        }
                                     );
                                     println!("  Model: {} | Prompt: {}", t.model, t.prompt);
                                     if let Some(res) = &t.result {
@@ -2900,7 +3011,28 @@ async fn main() -> Result<()> {
                                 continue;
                             };
 
-                            match state.subagent_mgr.run_dag(dag, &state.config.api_key).await {
+                            let initial_count =
+                                { state.long_term_memory.lock().unwrap().insights.len() };
+                            let rep_res = state
+                                .subagent_mgr
+                                .run_dag_with_memory(
+                                    dag,
+                                    &state.config.api_key,
+                                    Some(&state.long_term_memory),
+                                    Some(&state.working_memory),
+                                )
+                                .await;
+
+                            let should_save = {
+                                state.long_term_memory.lock().unwrap().insights.len()
+                                    > initial_count
+                            };
+                            if should_save {
+                                let ltm_guard = state.long_term_memory.lock().unwrap();
+                                let _ = ltm_guard.save(&state.workspace_dir);
+                            }
+
+                            match rep_res {
                                 Ok(rep) => {
                                     println!("\n{}", rep);
                                     state.history.push(Message {
