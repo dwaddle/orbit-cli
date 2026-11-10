@@ -190,18 +190,18 @@ pub fn execute_git_tool(dir: &Path, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_is_git_repo_on_current_dir() {
-        let current_dir = std::env::current_dir().unwrap();
-        // Since we are in orbit-cli git repo
-        assert!(is_git_repo(&current_dir));
+        let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert!(is_git_repo(&repo_dir));
     }
 
     #[test]
     fn test_git_log_execution() {
-        let current_dir = std::env::current_dir().unwrap();
-        let log = get_git_log(&current_dir, None, None, 5);
+        let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let log = get_git_log(&repo_dir, None, None, 5);
         assert!(log.is_ok());
         let content = log.unwrap();
         assert!(!content.is_empty());
@@ -209,17 +209,17 @@ mod tests {
 
     #[test]
     fn test_execute_git_tool_parsing() {
-        let current_dir = std::env::current_dir().unwrap();
+        let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let body = "action: log\nlimit: 3";
-        let out = execute_git_tool(&current_dir, body);
+        let out = execute_git_tool(&repo_dir, body);
         assert!(out.contains("Git Commit History"));
     }
 
     #[test]
     fn test_execute_git_tool_blame_missing_path() {
-        let current_dir = std::env::current_dir().unwrap();
+        let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let body = "action: blame";
-        let out = execute_git_tool(&current_dir, body);
+        let out = execute_git_tool(&repo_dir, body);
         assert!(out.contains("path:"));
     }
 }

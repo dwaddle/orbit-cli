@@ -280,9 +280,7 @@ impl AgentState {
                 } else {
                     dir
                 };
-                let canonical = fs::canonicalize(&expanded).unwrap_or(expanded);
-                let _ = std::env::set_current_dir(&canonical);
-                canonical
+                fs::canonicalize(&expanded).unwrap_or(expanded)
             }
             None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
@@ -1065,6 +1063,7 @@ async fn main() -> Result<()> {
     }
 
     let mut state = AgentState::new(target_dir)?;
+    let _ = std::env::set_current_dir(&state.workspace_dir);
     if let Some(v) = cli_verbosity {
         state.config.verbosity = v;
     }
