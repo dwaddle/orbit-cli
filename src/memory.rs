@@ -5,6 +5,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Global stop words for keyword extraction and associative graph building (zero-allocation lookup)
+pub const STOP_WORDS: &[&str] = &[
+    "the", "and", "or", "in", "on", "at", "to", "for", "with", "a", "an", "is", "was", "are",
+    "were", "of", "by", "from", "van", "een", "het", "de", "en", "naar", "met", "voor", "niet",
+    "wel", "maar", "als", "om", "te", "dan", "ook", "dit", "dat", "this", "that", "these", "those",
+    "have", "has", "had", "use", "using", "used", "always", "never", "should", "must", "when",
+    "while", "during", "before", "after",
+];
+
+#[inline]
+pub fn is_stop_word(w: &str) -> bool {
+    STOP_WORDS.contains(&w)
+}
+
 /// Categories for Long-Term Memory (LTM) insights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InsightCategory {
@@ -64,6 +78,8 @@ pub struct InsightRecord {
     pub supersedes: Option<usize>,
     #[serde(default)]
     pub superseded_by: Option<usize>,
+    #[serde(default)]
+    pub is_inhibited: bool,
 }
 
 fn default_last_accessed() -> u64 {
@@ -100,6 +116,8 @@ impl InsightRecord {
     pub fn status_label(&self) -> &'static str {
         if self.is_refuted() {
             "REFUTED"
+        } else if self.is_inhibited {
+            "INHIBITED"
         } else if self.verification_score >= 0.8 {
             "VERIFIED"
         } else if self.verification_score < 0.2 {
@@ -118,6 +136,10 @@ pub struct LongTermMemory {
     /// Inverted index mapping lowercase keyword tokens to list of insight IDs for O(1) candidate lookup
     #[serde(skip)]
     keyword_index: HashMap<String, Vec<usize>>,
+    /// Associative semantic graph: maps lowercase concept tokens to related concepts with affinity weights [0.0, 1.0].
+    /// Derived from co-occurring keywords across non-refuted insights.
+    #[serde(skip)]
+    associative_graph: HashMap<String, Vec<(String, f32)>>,
 }
 
 impl Default for LongTermMemory {
@@ -126,6 +148,7 @@ impl Default for LongTermMemory {
             insights: Vec::new(),
             next_id: 1,
             keyword_index: HashMap::new(),
+            associative_graph: HashMap::new(),
         }
     }
 }
@@ -171,13 +194,14 @@ impl LongTermMemory {
                 insights: Vec::new(),
                 next_id: 1,
                 keyword_index: HashMap::new(),
+                associative_graph: HashMap::new(),
             };
             default_ltm.save(workspace_root)?;
             Ok(default_ltm)
         }
     }
 
-    /// Rebuilds the inverted index mapping lowercase tokens to non-refuted insight IDs.
+    /// Rebuilds the inverted index and associative semantic graph from non-refuted insights.
     pub fn rebuild_index(&mut self) {
         self.keyword_index.clear();
         for rec in &self.insights {
@@ -202,6 +226,115 @@ impl LongTermMemory {
                 }
             }
         }
+        self.rebuild_associative_graph();
+    }
+
+    /// Rebuilds the associative semantic graph from co-occurring concepts across active insights.
+    pub fn rebuild_associative_graph(&mut self) {
+        self.associative_graph.clear();
+        let mut co_occurrences: HashMap<(String, String), f32> = HashMap::new();
+
+        for rec in &self.insights {
+            if rec.is_refuted() {
+                continue;
+            }
+            let mut salient_tokens: HashSet<String> = HashSet::new();
+            for kw in &rec.trigger_keywords {
+                let kw_clean = kw.to_lowercase();
+                for part in kw_clean.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
+                    if part.len() >= 3 && !is_stop_word(part) {
+                        salient_tokens.insert(part.to_string());
+                    }
+                }
+            }
+            for token in rec
+                .insight
+                .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            {
+                if token.len() >= 3 {
+                    let tok_lower = token.to_lowercase();
+                    if !is_stop_word(tok_lower.as_str()) {
+                        salient_tokens.insert(tok_lower);
+                    }
+                }
+            }
+
+            let token_vec: Vec<String> = salient_tokens.into_iter().collect();
+            let weight = (rec.occurrence_count as f32).min(5.0) * rec.verification_score.max(0.2);
+            for i in 0..token_vec.len() {
+                for j in (i + 1)..token_vec.len() {
+                    let (a, b) = (&token_vec[i], &token_vec[j]);
+                    *co_occurrences.entry((a.clone(), b.clone())).or_insert(0.0) += weight;
+                    *co_occurrences.entry((b.clone(), a.clone())).or_insert(0.0) += weight;
+                }
+            }
+        }
+
+        let mut temp_adj: HashMap<String, Vec<(String, f32)>> = HashMap::new();
+        for ((a, b), weight) in co_occurrences {
+            temp_adj.entry(a).or_default().push((b, weight));
+        }
+
+        for (src, mut edges) in temp_adj {
+            edges.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+            let max_w = edges.first().map(|e| e.1).unwrap_or(1.0).max(0.1);
+            let normalized: Vec<(String, f32)> = edges
+                .into_iter()
+                .filter_map(|(dst, w)| {
+                    let norm = w / max_w;
+                    if norm >= 0.15 {
+                        Some((dst, norm.min(1.0)))
+                    } else {
+                        None
+                    }
+                })
+                .take(8)
+                .collect();
+            self.associative_graph.insert(src, normalized);
+        }
+    }
+
+    /// Propagates activation energy across the associative graph.
+    /// Initial query tokens receive activation 1.0. Activation spreads to 1-hop neighbors
+    /// with decay factor gamma = 0.5. Returns concepts with activation >= 0.25.
+    pub fn spread_activation(
+        &self,
+        initial_tokens: &HashSet<&str>,
+        max_expansions: usize,
+    ) -> HashMap<String, f32> {
+        let mut activations: HashMap<String, f32> = HashMap::new();
+        for token in initial_tokens {
+            activations.insert(token.to_string(), 1.0);
+        }
+
+        let gamma = 0.5;
+        let threshold = 0.25;
+        let mut spreads: Vec<(String, f32)> = Vec::new();
+
+        for token in initial_tokens {
+            if let Some(edges) = self.associative_graph.get(*token) {
+                for (neighbor, weight) in edges {
+                    let energy = gamma * weight;
+                    if energy >= threshold {
+                        spreads.push((neighbor.clone(), energy));
+                    }
+                }
+            }
+        }
+
+        for (target, energy) in spreads {
+            let entry = activations.entry(target).or_insert(0.0);
+            *entry = (*entry + energy).min(1.0);
+        }
+
+        if activations.len() > max_expansions {
+            let mut sorted: Vec<(String, f32)> = activations.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            sorted.truncate(max_expansions);
+            activations = sorted.into_iter().collect();
+        }
+
+        activations
     }
 
     pub fn save(&self, workspace_root: &Path) -> Result<()> {
@@ -254,7 +387,9 @@ impl LongTermMemory {
                     existing.trigger_keywords.push(kw_clean);
                 }
             }
-            return existing.id;
+            let id = existing.id;
+            self.rebuild_index();
+            return id;
         }
 
         let id = self.next_id;
@@ -282,10 +417,106 @@ impl LongTermMemory {
             refutation_reason: None,
             supersedes: None,
             superseded_by: None,
+            is_inhibited: false,
         });
 
         self.rebuild_index();
         id
+    }
+
+    /// Stores or reinforces a persistent inhibitory anti-pattern (action or trajectory to avoid).
+    pub fn add_inhibition(
+        &mut self,
+        trigger_keywords: Vec<String>,
+        anti_pattern: &str,
+        confidence: f32,
+    ) -> usize {
+        let text_clean = anti_pattern.trim();
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if let Some(existing) = self
+            .insights
+            .iter_mut()
+            .find(|i| i.is_inhibited && i.insight.eq_ignore_ascii_case(text_clean))
+        {
+            existing.occurrence_count += 1;
+            existing.confidence = existing.confidence.max(confidence.clamp(0.0, 1.0));
+            existing.last_accessed = now_ts;
+            existing.stability_days = (existing.stability_days * 1.5).min(90.0);
+            for kw in trigger_keywords {
+                let kw_clean = kw.to_lowercase().trim().to_string();
+                if !kw_clean.is_empty() && !existing.trigger_keywords.iter().any(|k| k == &kw_clean)
+                {
+                    existing.trigger_keywords.push(kw_clean);
+                }
+            }
+            let id = existing.id;
+            self.rebuild_index();
+            return id;
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let clean_keywords: Vec<String> = trigger_keywords
+            .into_iter()
+            .map(|k| k.to_lowercase().trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect();
+
+        self.insights.push(InsightRecord {
+            id,
+            category: InsightCategory::BugPattern,
+            trigger_keywords: clean_keywords,
+            insight: text_clean.to_string(),
+            confidence: confidence.clamp(0.0, 1.0),
+            occurrence_count: 1,
+            created_at: now_ts,
+            last_accessed: now_ts,
+            stability_days: 30.0, // Inhibitions default to higher retention stability (30 days)
+            verification_score: 0.9,
+            refutation_count: 0,
+            refuted_at: None,
+            refutation_reason: None,
+            supersedes: None,
+            superseded_by: None,
+            is_inhibited: true,
+        });
+
+        self.rebuild_index();
+        id
+    }
+
+    /// Checks if a candidate action matches any active inhibitory anti-pattern.
+    pub fn check_inhibition(&self, candidate: &str) -> Option<&InsightRecord> {
+        let cand_lower = candidate.to_lowercase();
+        let tokens: HashSet<&str> = cand_lower
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            .filter(|t| t.len() >= 3 && !is_stop_word(t))
+            .collect();
+
+        self.insights.iter().find(|rec| {
+            if !rec.is_inhibited || rec.is_refuted() {
+                return false;
+            }
+            if cand_lower.contains(&rec.insight.to_lowercase()) {
+                return true;
+            }
+            let mut matches = 0;
+            for kw in &rec.trigger_keywords {
+                let kw_low = kw.to_lowercase();
+                if kw_low.contains(' ') && cand_lower.contains(&kw_low) {
+                    return true;
+                }
+                if tokens.contains(kw_low.as_str()) {
+                    matches += 1;
+                }
+            }
+            matches >= 2 || (matches >= 1 && rec.trigger_keywords.len() == 1 && tokens.len() <= 3)
+        })
     }
 
     /// Marks an insight as refuted and obsolete. It will be excluded from prompt injections and retrieval.
@@ -445,10 +676,13 @@ impl LongTermMemory {
             .filter(|t| t.len() >= 3)
             .collect();
 
-        // 1. O(1) Candidate set extraction using Inverted Index
+        // 1. Spreading Activation: compute direct and associative activation across the semantic network
+        let activated_tokens = self.spread_activation(&query_tokens, 32);
+
+        // 2. O(1) Candidate set extraction using Inverted Index for all activated tokens
         let mut candidate_ids: HashSet<usize> = HashSet::new();
-        for token in &query_tokens {
-            if let Some(ids) = self.keyword_index.get(*token) {
+        for token in activated_tokens.keys() {
+            if let Some(ids) = self.keyword_index.get(token) {
                 for id in ids {
                     candidate_ids.insert(*id);
                 }
@@ -478,13 +712,15 @@ impl LongTermMemory {
             .filter_map(|rec| {
                 let mut match_score: f32 = 0.0;
                 for kw in &rec.trigger_keywords {
-                    if lower_query.contains(kw) || query_tokens.contains(kw.as_str()) {
+                    if let Some(&energy) = activated_tokens.get(kw.as_str()) {
+                        match_score += 3.0 * energy;
+                    } else if lower_query.contains(kw) {
                         match_score += 3.0;
                     }
                 }
-                for token in &query_tokens {
+                for (token, energy) in &activated_tokens {
                     if rec.insight.to_lowercase().contains(token) {
-                        match_score += 1.0;
+                        match_score += 1.0 * energy;
                     }
                 }
                 if match_score > 0.0 {
@@ -513,23 +749,58 @@ impl LongTermMemory {
     }
 
     pub fn format_prompt_injection(&self, query: &str) -> Option<String> {
-        let relevant = self.find_relevant_insights(query, 5);
+        let relevant = self.find_relevant_insights(query, 6);
         if relevant.is_empty() {
             None
         } else {
-            let mut out = String::from("<learned_project_insights>\n");
+            let mut regular = Vec::new();
+            let mut inhibitions = Vec::new();
             for rec in relevant {
-                let sanitized_insight = rec
-                    .insight
-                    .replace("</learned_project_insights>", "[/learned_project_insights]");
+                if rec.is_inhibited {
+                    inhibitions.push(rec);
+                } else {
+                    regular.push(rec);
+                }
+            }
+
+            let sanitize_str = |s: &str| {
+                s.replace("</learned_project_insights>", "[/learned_project_insights]")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+            };
+
+            let mut out = String::from("<learned_project_insights>\n");
+            for rec in regular {
+                let sanitized_insight = sanitize_str(&rec.insight);
+                let sanitized_keywords: Vec<String> = rec
+                    .trigger_keywords
+                    .iter()
+                    .map(|k| sanitize_str(k))
+                    .collect();
                 out.push_str(&format!(
                     "- [{}] [{}] {}: {} (reinforcements: {})\n",
                     rec.category.as_str(),
                     rec.status_label(),
-                    rec.trigger_keywords.join("/"),
+                    sanitized_keywords.join("/"),
                     sanitized_insight,
                     rec.occurrence_count
                 ));
+            }
+            if !inhibitions.is_empty() {
+                out.push_str("⛔ INHIBITED ANTI-PATTERNS (DO NOT ATTEMPT):\n");
+                for rec in inhibitions {
+                    let sanitized = sanitize_str(&rec.insight);
+                    let sanitized_keywords: Vec<String> = rec
+                        .trigger_keywords
+                        .iter()
+                        .map(|k| sanitize_str(k))
+                        .collect();
+                    out.push_str(&format!(
+                        "- [INHIBITED] {}: {}\n",
+                        sanitized_keywords.join("/"),
+                        sanitized
+                    ));
+                }
             }
             out.push_str("</learned_project_insights>");
             Some(out)
@@ -758,6 +1029,15 @@ impl WorkingMemory {
         self.current_subtask = None;
         self.failed_attempts.clear();
         self.observed_events.clear();
+    }
+
+    /// Checks if a candidate action matches an active failure attempt in the current working session.
+    pub fn check_session_inhibition(&self, candidate: &str) -> Option<&FailedAttempt> {
+        let cand_lower = candidate.to_lowercase();
+        self.failed_attempts.iter().find(|att| {
+            let act_lower = att.action.to_lowercase();
+            cand_lower == act_lower || (act_lower.len() >= 8 && cand_lower.contains(&act_lower))
+        })
     }
 
     pub fn format_scratchpad(&self) -> String {
@@ -1068,20 +1348,67 @@ impl MemoryConsolidator {
             }
         }
 
+        // Consolidate repeated failed attempts (>= 2) into persistent inhibitory anti-patterns
+        let mut attempt_counts: HashMap<String, (u32, String)> = HashMap::new();
+        for att in &stm.failed_attempts {
+            let entry = attempt_counts
+                .entry(att.action.clone())
+                .or_insert((0, att.error_summary.clone()));
+            entry.0 += 1;
+        }
+
+        for (action, (count, err_summary)) in attempt_counts {
+            if count >= 2 {
+                let was_self_healed = stm.observed_events.iter().any(|ev| match ev {
+                    StmEvent::SelfHealingSuccess {
+                        target,
+                        initial_error,
+                        resolution_strategy,
+                        ..
+                    } => {
+                        let act_lower = action.to_lowercase();
+                        (!target.is_empty() && act_lower.contains(&target.to_lowercase()))
+                            || (!initial_error.is_empty()
+                                && (act_lower.contains(&initial_error.to_lowercase())
+                                    || err_summary
+                                        .to_lowercase()
+                                        .contains(&initial_error.to_lowercase())))
+                            || (!resolution_strategy.is_empty()
+                                && act_lower.contains(&resolution_strategy.to_lowercase()))
+                    }
+                    _ => false,
+                });
+
+                if !was_self_healed {
+                    let anti_pattern = format!(
+                        "Avoid repeated failure in '{}': {}. Do not repeat without altering parameters or environment.",
+                        action, err_summary
+                    );
+                    let mut keywords = Self::extract_salient_keywords(&action);
+                    keywords.extend(Self::extract_salient_keywords(&err_summary));
+                    keywords.dedup();
+                    if !keywords.is_empty() {
+                        let id = ltm.add_inhibition(keywords, &anti_pattern, 0.9);
+                        outcomes.push(ConsolidationOutcome {
+                            insight_id: id,
+                            category: InsightCategory::BugPattern,
+                            insight_text: anti_pattern,
+                            reason: format!(
+                                "Consolidated repeated failure pattern (failed {} times without resolution)",
+                                count
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
         outcomes
     }
 
     pub fn extract_salient_keywords(text: &str) -> Vec<String> {
-        let stop_words: HashSet<&str> = [
-            "the", "and", "or", "in", "on", "at", "to", "for", "with", "a", "an", "is", "was",
-            "are", "were", "of", "by", "from", "van", "een", "het", "de", "en", "naar", "met",
-            "voor", "niet", "wel", "maar", "als", "om", "te", "dan", "ook", "dit", "dat",
-        ]
-        .into_iter()
-        .collect();
-
         text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-            .filter(|w| w.len() >= 3 && !stop_words.contains(&w.to_lowercase().as_str()))
+            .filter(|w| w.len() >= 3 && !is_stop_word(&w.to_lowercase()))
             .map(|w| w.to_lowercase())
             .collect::<HashSet<_>>()
             .into_iter()
@@ -2201,6 +2528,7 @@ mod tests {
             refutation_reason: None,
             supersedes: None,
             superseded_by: None,
+            is_inhibited: false,
         };
 
         // At t = 0 days since access: R should be 1.0
@@ -2322,6 +2650,7 @@ mod tests {
             refutation_reason: None,
             supersedes: None,
             superseded_by: None,
+            is_inhibited: false,
         };
         ltm.insights.push(old_rec);
         ltm.rebuild_index();
@@ -2622,5 +2951,130 @@ mod tests {
         // The literal closing tag inside content must be sanitized so prompt structure isn't broken
         assert!(!injection.contains("tag </learned_project_insights> closure"));
         assert!(injection.contains("tag [/learned_project_insights] closure"));
+    }
+
+    #[test]
+    fn test_spreading_activation_associative_recall() {
+        let mut ltm = LongTermMemory::default();
+        ltm.add_or_reinforce(
+            InsightCategory::Architecture,
+            vec!["sqlite".to_string(), "wal".to_string(), "pool".to_string()],
+            "Always enable WAL mode on SQLite connections and use connection pooling.",
+            0.95,
+        );
+
+        // Verify graph contains edge between connection/pooling and sqlite/wal
+        assert!(
+            ltm.associative_graph.contains_key("sqlite")
+                || ltm.associative_graph.contains_key("pool")
+        );
+
+        // Query does NOT contain 'sqlite', but contains 'connection' and 'pool'
+        let matched = ltm.find_relevant_insights("pool performance under load", 3);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].category, InsightCategory::Architecture);
+        assert!(matched[0].insight.contains("SQLite"));
+    }
+
+    #[test]
+    fn test_cognitive_inhibition_lifecycle() {
+        let mut ltm = LongTermMemory::default();
+        let id = ltm.add_inhibition(
+            vec!["cargo".to_string(), "update".to_string()],
+            "Do not execute cargo update on pinned core dependencies without explicit approval.",
+            0.95,
+        );
+
+        let rec = ltm.insights.iter().find(|i| i.id == id).unwrap();
+        assert!(rec.is_inhibited);
+        assert_eq!(rec.status_label(), "INHIBITED");
+        assert_eq!(rec.stability_days, 30.0);
+
+        // Verification of inhibition check
+        let detected = ltm.check_inhibition("cargo update -p serde");
+        assert!(detected.is_some());
+        assert_eq!(detected.unwrap().id, id);
+
+        // Verification of prompt injection formatting
+        let injection = ltm.format_prompt_injection("cargo update").unwrap();
+        assert!(injection.contains("⛔ INHIBITED ANTI-PATTERNS (DO NOT ATTEMPT):"));
+        assert!(injection.contains("[INHIBITED]"));
+        assert!(injection.contains("Do not execute cargo update"));
+    }
+
+    #[test]
+    fn test_repeated_failure_session_consolidation() {
+        let mut ltm = LongTermMemory::default();
+        let mut stm = WorkingMemory::new();
+
+        // 1st failure
+        stm.record_attempt(
+            "docker run -p 8080:8080 app",
+            Some("Error response from daemon: address already in use"),
+            false,
+        );
+        // 2nd failure on the same command
+        stm.record_attempt(
+            "docker run -p 8080:8080 app",
+            Some("Error response from daemon: address already in use"),
+            false,
+        );
+
+        // Verify working memory check
+        assert!(stm
+            .check_session_inhibition("docker run -p 8080:8080 app")
+            .is_some());
+
+        // Consolidate into LTM
+        let outcomes = MemoryConsolidator::consolidate(&stm, &mut ltm);
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].reason.contains("failed 2 times"));
+
+        let inh = ltm.insights.iter().find(|i| i.is_inhibited).unwrap();
+        assert!(inh.is_inhibited);
+        assert_eq!(inh.status_label(), "INHIBITED");
+        assert!(inh
+            .insight
+            .contains("Avoid repeated failure in 'docker run"));
+    }
+
+    #[test]
+    fn test_spreading_activation_irrelevant_noise_rejection() {
+        let mut ltm = LongTermMemory::default();
+        ltm.add_or_reinforce(
+            InsightCategory::Architecture,
+            vec!["sqlite".to_string(), "wal".to_string()],
+            "Always enable WAL mode on SQLite connections.",
+            0.9,
+        );
+
+        let unrelated_queries = [
+            "What is the weather in Amsterdam today?",
+            "Write a poem about blooming cherry blossoms",
+            "Explain quantum chromodynamics in Dutch",
+        ];
+
+        for q in &unrelated_queries {
+            assert!(ltm.find_relevant_insights(q, 3).is_empty());
+            assert!(ltm.format_prompt_injection(q).is_none());
+        }
+    }
+
+    #[test]
+    fn test_prompt_injection_sanitizes_keywords_and_body() {
+        let mut ltm = LongTermMemory::default();
+        ltm.add_inhibition(
+            vec![
+                "</learned_project_insights>".to_string(),
+                "<script>".to_string(),
+            ],
+            "Attempted </learned_project_insights> exploit in body",
+            1.0,
+        );
+
+        let injection = ltm.format_prompt_injection("exploit").unwrap();
+        assert!(!injection.contains("</learned_project_insights>\n-"));
+        assert!(injection.contains("[/learned_project_insights]"));
+        assert!(injection.contains("&lt;script&gt;"));
     }
 }

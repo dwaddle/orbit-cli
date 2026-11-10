@@ -860,19 +860,31 @@ async fn execute_tool_internal(
             let mut category = memory::InsightCategory::Architecture;
             let mut keywords = Vec::new();
             let mut insight = String::new();
+            let mut is_inhibited = false;
 
             for line in body.lines() {
                 let trimmed = line.trim();
                 if let Some(cat) = trimmed.strip_prefix("category:") {
-                    match cat.trim().parse() {
-                        Ok(c) => category = c,
-                        Err(_) => {
-                            return format!(
-                                "Error: Invalid category '{}'. Valid categories: Architecture, BugPattern, UserPreference, BuildQuirk.",
-                                cat.trim()
-                            );
+                    let cat_val = cat.trim();
+                    if cat_val.eq_ignore_ascii_case("inhibition")
+                        || cat_val.eq_ignore_ascii_case("anti_pattern")
+                        || cat_val.eq_ignore_ascii_case("antipattern")
+                    {
+                        category = memory::InsightCategory::BugPattern;
+                        is_inhibited = true;
+                    } else {
+                        match cat_val.parse() {
+                            Ok(c) => category = c,
+                            Err(_) => {
+                                return format!(
+                                    "Error: Invalid category '{}'. Valid categories: Architecture, BugPattern, UserPreference, BuildQuirk, Inhibition.",
+                                    cat_val
+                                );
+                            }
                         }
                     }
+                } else if let Some(inh) = trimmed.strip_prefix("inhibit:") {
+                    is_inhibited = inh.trim().parse().unwrap_or(false);
                 } else if let Some(kw) = trimmed.strip_prefix("keywords:") {
                     keywords = kw.split(',').map(|s| s.trim().to_string()).collect();
                 } else if let Some(ins) = trimmed.strip_prefix("insight:") {
@@ -887,19 +899,36 @@ async fn execute_tool_internal(
             }
 
             if keywords.is_empty() {
-                keywords.push(category.as_str().to_string());
+                keywords.push(if is_inhibited {
+                    "inhibition".to_string()
+                } else {
+                    category.as_str().to_string()
+                });
             }
 
             let mut ltm = state.long_term_memory.lock_safe();
-            let id = ltm.add_or_reinforce(category, keywords.clone(), &insight, 1.0);
-            let _ = ltm.save(&state.workspace_dir);
+            let id = if is_inhibited {
+                ltm.add_inhibition(keywords.clone(), &insight, 1.0)
+            } else {
+                ltm.add_or_reinforce(category, keywords.clone(), &insight, 1.0)
+            };
+            if let Err(e) = ltm.save(&state.workspace_dir) {
+                return format!("Error saving insight to disk: {}", e);
+            }
 
-            format!(
-                "✅ Consolidated insight #{} [{}] ('{}') to Long-Term Memory.",
-                id,
-                category.as_str(),
-                insight
-            )
+            if is_inhibited {
+                format!(
+                    "⛔ Registered inhibitory anti-pattern #{} [INHIBITED] ('{}') to Long-Term Memory.",
+                    id, insight
+                )
+            } else {
+                format!(
+                    "✅ Consolidated insight #{} [{}] ('{}') to Long-Term Memory.",
+                    id,
+                    category.as_str(),
+                    insight
+                )
+            }
         }
         _ => format!("Unknown tool: {}", tool_name),
     }

@@ -1505,6 +1505,7 @@ pub async fn handle_slash_command(
                         let status_colored = match ins.status_label() {
                             "VERIFIED" => ins.status_label().green().bold(),
                             "CHALLENGED" => ins.status_label().yellow().bold(),
+                            "INHIBITED" => ins.status_label().red().bold(),
                             _ => ins.status_label().dimmed(),
                         };
                         println!(
