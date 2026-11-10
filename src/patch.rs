@@ -195,6 +195,16 @@ pub fn apply_patch_to_file_in_workspace(
     raw_patch: &str,
     workspace: Option<&Path>,
 ) -> Result<PatchResult> {
+    apply_patch_to_file_with_mode(path_str, raw_patch, workspace, None)
+}
+
+/// Applies a surgical patch to a file on disk with a specific SandboxMode.
+pub fn apply_patch_to_file_with_mode(
+    path_str: &str,
+    raw_patch: &str,
+    workspace: Option<&Path>,
+    mode: Option<crate::security::SandboxMode>,
+) -> Result<PatchResult> {
     let (embedded_path, blocks) = parse_patch_blocks(raw_patch)?;
     let raw_target = if !path_str.trim().is_empty() {
         path_str.trim()
@@ -205,8 +215,14 @@ pub fn apply_patch_to_file_in_workspace(
     };
 
     let p = if let Some(ws) = workspace {
-        crate::security::WorkspaceSandbox::sanitize_path(Path::new(raw_target), ws)
-            .map_err(|e| anyhow!("{}", e))?
+        let sandbox_mode = mode.unwrap_or(crate::security::SandboxMode::Workspace);
+        crate::security::WorkspaceSandbox::sanitize_path_with_mode(
+            Path::new(raw_target),
+            ws,
+            sandbox_mode,
+            true,
+        )
+        .map_err(|e| anyhow!("{}", e))?
     } else {
         PathBuf::from(raw_target)
     };

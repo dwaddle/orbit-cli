@@ -1,6 +1,64 @@
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxMode {
+    Strict,
+    Workspace,
+    User,
+    Off,
+}
+
+impl Default for SandboxMode {
+    fn default() -> Self {
+        Self::Workspace
+    }
+}
+
+impl std::str::FromStr for SandboxMode {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().trim() {
+            "strict" => Ok(Self::Strict),
+            "workspace" | "repo" => Ok(Self::Workspace),
+            "user" | "home" => Ok(Self::User),
+            "off" | "none" | "disabled" => Ok(Self::Off),
+            _ => Err(()),
+        }
+    }
+}
+
+impl SandboxMode {
+    pub fn parse_mode(s: &str) -> Option<Self> {
+        s.parse().ok()
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Workspace => "workspace",
+            Self::User => "user",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Strict => "Strict: Reads and writes locked strictly to workspace directory",
+            Self::Workspace => {
+                "Workspace: Reads open globally, writes locked to workspace directory"
+            }
+            Self::User => "User: Reads and writes allowed anywhere within user home ($HOME)",
+            Self::Off => {
+                "Off: Unrestricted filesystem access (runs with user's full OS permissions)"
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolPolicy {
@@ -114,15 +172,68 @@ pub fn prompt_tool_approval(tool_name: &str) -> std::io::Result<bool> {
 pub struct WorkspaceSandbox;
 
 impl WorkspaceSandbox {
+    /// Legacy 2-argument helper for backward compatibility. Enforces strict boundary check.
     pub fn sanitize_path(target: &Path, workspace_root: &Path) -> Result<PathBuf, String> {
-        let root = workspace_root
+        Self::sanitize_path_with_mode(target, workspace_root, SandboxMode::Strict, true)
+    }
+
+    /// Evaluates `target` against `workspace_root` under the specified `SandboxMode` and access type (`is_write`).
+    pub fn sanitize_path_with_mode(
+        target: &Path,
+        workspace_root: &Path,
+        mode: SandboxMode,
+        is_write: bool,
+    ) -> Result<PathBuf, String> {
+        // Mode: Off -> completely unrestricted filesystem access
+        if mode == SandboxMode::Off {
+            let root = workspace_root
+                .canonicalize()
+                .unwrap_or_else(|_| workspace_root.to_path_buf());
+            let resolved = if target.is_absolute() {
+                target.to_path_buf()
+            } else {
+                root.join(target)
+            };
+            return Ok(resolved);
+        }
+
+        // Mode: Workspace with read access -> allow global read access across the filesystem
+        if mode == SandboxMode::Workspace && !is_write {
+            let root = workspace_root
+                .canonicalize()
+                .unwrap_or_else(|_| workspace_root.to_path_buf());
+            let resolved = if target.is_absolute() {
+                target.to_path_buf()
+            } else {
+                root.join(target)
+            };
+            if resolved.exists() {
+                let canonical = resolved.canonicalize().map_err(|e| e.to_string())?;
+                return Ok(canonical);
+            }
+            return Ok(resolved);
+        }
+
+        // Determine effective root boundary
+        let (boundary_root, boundary_name) = match mode {
+            SandboxMode::User => {
+                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/home"));
+                (home, "user home boundary")
+            }
+            _ => (workspace_root.to_path_buf(), "workspace boundary"),
+        };
+
+        let root = boundary_root
             .canonicalize()
-            .map_err(|e| format!("Failed to canonicalize workspace root: {}", e))?;
+            .map_err(|e| format!("Failed to canonicalize {}: {}", boundary_name, e))?;
 
         let resolved = if target.is_absolute() {
             target.to_path_buf()
         } else {
-            root.join(target)
+            let ws_root = workspace_root
+                .canonicalize()
+                .unwrap_or_else(|_| workspace_root.to_path_buf());
+            ws_root.join(target)
         };
 
         if resolved.exists() {
@@ -131,9 +242,10 @@ impl WorkspaceSandbox {
                 return Ok(canonical);
             } else {
                 return Err(format!(
-                    "Access denied: path '{}' escapes workspace boundary '{}'",
+                    "Access denied: path '{}' escapes {} '{}'",
                     target.display(),
-                    workspace_root.display()
+                    boundary_name,
+                    boundary_root.display()
                 ));
             }
         }
@@ -163,9 +275,10 @@ impl WorkspaceSandbox {
 
         if !canonical_base.starts_with(&root) {
             return Err(format!(
-                "Access denied: path '{}' escapes workspace boundary '{}'",
+                "Access denied: path '{}' escapes {} '{}'",
                 target.display(),
-                workspace_root.display()
+                boundary_name,
+                boundary_root.display()
             ));
         }
 
@@ -178,9 +291,10 @@ impl WorkspaceSandbox {
             Ok(final_path)
         } else {
             Err(format!(
-                "Access denied: path '{}' escapes workspace boundary '{}'",
+                "Access denied: path '{}' escapes {} '{}'",
                 target.display(),
-                workspace_root.display()
+                boundary_name,
+                boundary_root.display()
             ))
         }
     }
@@ -300,5 +414,138 @@ mod tests {
         let auth_header = "Authorization: Bearer secret_access_token_value_long_enough_12345";
         let redacted_auth = redactor.redact(auth_header);
         assert!(redacted_auth.contains("Bearer [REDACTED_SECRET]"));
+    }
+
+    #[test]
+    fn test_sandbox_mode_parsing_and_descriptions() {
+        assert_eq!(
+            "strict".parse::<SandboxMode>().unwrap(),
+            SandboxMode::Strict
+        );
+        assert_eq!(
+            "workspace".parse::<SandboxMode>().unwrap(),
+            SandboxMode::Workspace
+        );
+        assert_eq!(
+            "repo".parse::<SandboxMode>().unwrap(),
+            SandboxMode::Workspace
+        );
+        assert_eq!("user".parse::<SandboxMode>().unwrap(), SandboxMode::User);
+        assert_eq!("home".parse::<SandboxMode>().unwrap(), SandboxMode::User);
+        assert_eq!("off".parse::<SandboxMode>().unwrap(), SandboxMode::Off);
+        assert_eq!("disabled".parse::<SandboxMode>().unwrap(), SandboxMode::Off);
+        assert!("invalid".parse::<SandboxMode>().is_err());
+
+        assert_eq!(SandboxMode::default(), SandboxMode::Workspace);
+        assert_eq!(SandboxMode::Strict.as_str(), "strict");
+        assert_eq!(SandboxMode::Workspace.as_str(), "workspace");
+        assert_eq!(SandboxMode::User.as_str(), "user");
+        assert_eq!(SandboxMode::Off.as_str(), "off");
+    }
+
+    #[test]
+    fn test_sandbox_mode_modes_evaluation() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+
+        let in_ws_file = ws.join("test.txt");
+        std::fs::write(&in_ws_file, "inside").unwrap();
+
+        // 1. Strict Mode
+        assert!(WorkspaceSandbox::sanitize_path_with_mode(
+            Path::new("test.txt"),
+            ws,
+            SandboxMode::Strict,
+            false
+        )
+        .is_ok());
+        assert!(WorkspaceSandbox::sanitize_path_with_mode(
+            Path::new("test.txt"),
+            ws,
+            SandboxMode::Strict,
+            true
+        )
+        .is_ok());
+        assert!(WorkspaceSandbox::sanitize_path_with_mode(
+            Path::new("../../etc/passwd"),
+            ws,
+            SandboxMode::Strict,
+            false
+        )
+        .is_err());
+        assert!(WorkspaceSandbox::sanitize_path_with_mode(
+            Path::new("../../etc/passwd"),
+            ws,
+            SandboxMode::Strict,
+            true
+        )
+        .is_err());
+
+        // 2. Workspace Mode (Reads global, Writes locked)
+        assert!(WorkspaceSandbox::sanitize_path_with_mode(
+            Path::new("test.txt"),
+            ws,
+            SandboxMode::Workspace,
+            false
+        )
+        .is_ok());
+        assert!(WorkspaceSandbox::sanitize_path_with_mode(
+            Path::new("test.txt"),
+            ws,
+            SandboxMode::Workspace,
+            true
+        )
+        .is_ok());
+        // Reading external file is allowed in Workspace mode
+        assert!(WorkspaceSandbox::sanitize_path_with_mode(
+            Path::new("/etc/hosts"),
+            ws,
+            SandboxMode::Workspace,
+            false
+        )
+        .is_ok());
+        // Writing outside workspace is denied in Workspace mode
+        assert!(WorkspaceSandbox::sanitize_path_with_mode(
+            Path::new("/etc/hosts"),
+            ws,
+            SandboxMode::Workspace,
+            true
+        )
+        .is_err());
+
+        // 3. User Mode (Inside HOME allowed, outside HOME denied)
+        if let Some(home) = dirs::home_dir() {
+            let user_file = home.join("some_user_test_path.txt");
+            assert!(WorkspaceSandbox::sanitize_path_with_mode(
+                &user_file,
+                ws,
+                SandboxMode::User,
+                false
+            )
+            .is_ok());
+            assert!(WorkspaceSandbox::sanitize_path_with_mode(
+                Path::new("/etc/passwd"),
+                ws,
+                SandboxMode::User,
+                true
+            )
+            .is_err());
+        }
+
+        // 4. Off Mode (Unrestricted)
+        assert!(WorkspaceSandbox::sanitize_path_with_mode(
+            Path::new("/etc/hosts"),
+            ws,
+            SandboxMode::Off,
+            false
+        )
+        .is_ok());
+        assert!(WorkspaceSandbox::sanitize_path_with_mode(
+            Path::new("/etc/hosts"),
+            ws,
+            SandboxMode::Off,
+            true
+        )
+        .is_ok());
     }
 }

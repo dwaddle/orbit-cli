@@ -118,6 +118,8 @@ pub struct AppConfig {
     pub live_hud_enabled: bool,
     #[serde(default)]
     pub verbosity: highlight::VerbosityLevel,
+    #[serde(default)]
+    pub sandbox_mode: security::SandboxMode,
 }
 
 impl Default for AppConfig {
@@ -139,6 +141,7 @@ impl Default for AppConfig {
             diff_approval_required: false,
             live_hud_enabled: true,
             verbosity: highlight::VerbosityLevel::default(),
+            sandbox_mode: security::SandboxMode::default(),
         }
     }
 }
@@ -766,9 +769,11 @@ async fn execute_tool_internal(
         }
         "view_file" => {
             let path_str = body.trim();
-            let safe_path = match security::WorkspaceSandbox::sanitize_path(
+            let safe_path = match security::WorkspaceSandbox::sanitize_path_with_mode(
                 Path::new(path_str),
                 &state.workspace_dir,
+                state.config.sandbox_mode,
+                false,
             ) {
                 Ok(p) => p,
                 Err(e) => return format!("Security Sandbox Error: {}", e),
@@ -801,9 +806,11 @@ async fn execute_tool_internal(
                 return "Error: Empty path specified for write_file".to_string();
             }
 
-            let safe_path = match security::WorkspaceSandbox::sanitize_path(
+            let safe_path = match security::WorkspaceSandbox::sanitize_path_with_mode(
                 Path::new(path_str),
                 &state.workspace_dir,
+                state.config.sandbox_mode,
+                true,
             ) {
                 Ok(p) => p,
                 Err(e) => return format!("Security Sandbox Error: {}", e),
@@ -935,9 +942,11 @@ async fn execute_tool_internal(
             };
 
             let safe_target = if !target_path.is_empty() {
-                match security::WorkspaceSandbox::sanitize_path(
+                match security::WorkspaceSandbox::sanitize_path_with_mode(
                     Path::new(&target_path),
                     &state.workspace_dir,
+                    state.config.sandbox_mode,
+                    true,
                 ) {
                     Ok(p) => p.display().to_string(),
                     Err(e) => return format!("Security Sandbox Error: {}", e),
@@ -956,10 +965,11 @@ async fn execute_tool_internal(
                 }
             }
 
-            match patch::apply_patch_to_file_in_workspace(
+            match patch::apply_patch_to_file_with_mode(
                 &safe_target,
                 &patch_payload,
                 Some(&state.workspace_dir),
+                Some(state.config.sandbox_mode),
             ) {
                 Ok(patch_res) => {
                     let mut res = format!(
@@ -1769,6 +1779,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut target_dir: Option<PathBuf> = None;
     let mut cli_verbosity: Option<highlight::VerbosityLevel> = None;
+    let mut cli_sandbox: Option<security::SandboxMode> = None;
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
@@ -1796,6 +1807,17 @@ async fn main() -> Result<()> {
                 cli_verbosity = Some(level);
                 i += 1;
             }
+        } else if let Some(val) = arg.strip_prefix("--sandbox=") {
+            if let Some(mode) = security::SandboxMode::parse_mode(val) {
+                cli_sandbox = Some(mode);
+            }
+        } else if arg == "--sandbox" && i + 1 < args.len() {
+            if let Some(mode) = security::SandboxMode::parse_mode(&args[i + 1]) {
+                cli_sandbox = Some(mode);
+                i += 1;
+            }
+        } else if arg == "--no-sandbox" {
+            cli_sandbox = Some(security::SandboxMode::Off);
         } else if !arg.starts_with('-') && arg != "watch" {
             let p = PathBuf::from(arg);
             if p.is_dir() {
@@ -1808,6 +1830,9 @@ async fn main() -> Result<()> {
     let mut state = AgentState::new(target_dir)?;
     if let Some(v) = cli_verbosity {
         state.config.verbosity = v;
+    }
+    if let Some(sb) = cli_sandbox {
+        state.config.sandbox_mode = sb;
     }
 
     if args
@@ -1847,6 +1872,10 @@ async fn main() -> Result<()> {
         println!(
             "  -p, --pipe <PROMPT>   Non-interactive pipe mode (reads stdin and streams response)"
         );
+        println!("  -q, --quiet           Quiet mode (suppress full file write buffer dumps)");
+        println!("  -v, --verbose         Verbose mode (full debug output)");
+        println!("  --sandbox <MODE>      Filesystem sandbox mode (strict, workspace, user, off)");
+        println!("  --no-sandbox          Disable filesystem sandbox (alias for --sandbox off)");
         println!("  -h, --help            Print help information\n");
         println!("In interactive mode, type `/help` for the full command list.");
         return Ok(());
@@ -2239,6 +2268,12 @@ async fn main() -> Result<()> {
                             println!("  /file <path>           - Attach file content into context");
                             println!(
                                 "  /cache                 - Toggle prompt caching headers ON/OFF"
+                            );
+                            println!(
+                                "  /sandbox [mode]        - View or configure filesystem sandbox (strict, workspace, user, off)"
+                            );
+                            println!(
+                                "  /permissions           - View or configure tool execution policies (auto, ask, deny)"
                             );
                             println!(
                                 "  /verbosity [level]     - Set or view output verbosity (quiet, normal, verbose)"
@@ -3833,6 +3868,50 @@ async fn main() -> Result<()> {
                             }
                             continue;
                         }
+                        "/sandbox" => {
+                            let parts: Vec<&str> = arg.split_whitespace().collect();
+                            if parts.is_empty() {
+                                println!("{}", "=== ORBIT FILESYSTEM SANDBOX ===".bold().cyan());
+                                println!(
+                                    "  Active Mode : {}",
+                                    state.config.sandbox_mode.as_str().bold().yellow()
+                                );
+                                println!(
+                                    "  Description : {}",
+                                    state.config.sandbox_mode.description().dimmed()
+                                );
+                                println!();
+                                println!("  Available Modes:");
+                                println!("    strict    - Reads & writes locked strictly to workspace directory");
+                                println!("    workspace - Reads open globally, writes locked to workspace (default)");
+                                println!("    user      - Reads & writes allowed anywhere in user's home ($HOME)");
+                                println!("    off       - Unrestricted filesystem access (no boundary checks)");
+                                println!();
+                                println!("  Usage: /sandbox <strict|workspace|user|off>");
+                            } else {
+                                let requested = parts[0];
+                                if let Some(mode) = security::SandboxMode::parse_mode(requested) {
+                                    state.config.sandbox_mode = mode;
+                                    let _ = state.save_config();
+                                    println!(
+                                        "{} {}",
+                                        "Updated sandbox mode to:".green(),
+                                        mode.as_str().bold().cyan()
+                                    );
+                                    println!("  {}", mode.description().dimmed());
+                                } else {
+                                    println!(
+                                        "{}",
+                                        format!(
+                                            "Invalid sandbox mode '{}'. Options: strict, workspace, user, off",
+                                            requested
+                                        )
+                                        .red()
+                                    );
+                                }
+                            }
+                            continue;
+                        }
                         "/session" => {
                             let parts: Vec<&str> = arg.split_whitespace().collect();
                             match parts.first().copied().unwrap_or("list") {
@@ -4575,16 +4654,17 @@ mod tests {
         state
             .tool_permissions
             .set_policy("write_file", security::ToolPolicy::Auto);
+        state.config.sandbox_mode = security::SandboxMode::Strict;
 
-        // 1. view_file escaping boundary
+        // 1. view_file escaping boundary (under Strict mode)
         let view_res = execute_tool_quiet("view_file", "../../etc/passwd", &state).await;
         assert!(
             view_res.contains("Security Sandbox Error"),
-            "Expected sandbox error on view_file: {}",
+            "Expected sandbox error on view_file in strict mode: {}",
             view_res
         );
 
-        // 2. write_file escaping boundary
+        // 2. write_file escaping boundary (under Strict mode)
         let write_res = execute_tool_quiet(
             "write_file",
             "../../etc/evil.txt\nmalicious payload",
@@ -4593,10 +4673,37 @@ mod tests {
         .await;
         assert!(
             write_res.contains("Security Sandbox Error"),
-            "Expected sandbox error on write_file: {}",
+            "Expected sandbox error on write_file in strict mode: {}",
             write_res
         );
 
+        // 3. Workspace mode allows reading external readable files without sandbox error
+        state.config.sandbox_mode = security::SandboxMode::Workspace;
+        let view_res_ws = execute_tool_quiet("view_file", "/etc/hosts", &state).await;
+        assert!(
+            !view_res_ws.contains("Security Sandbox Error"),
+            "Workspace mode should allow view_file on readable external paths: {}",
+            view_res_ws
+        );
+
+        // 4. Off mode allows write without sandbox boundary error
+        state.config.sandbox_mode = security::SandboxMode::Off;
+        let dummy_out = temp_dir
+            .parent()
+            .unwrap()
+            .join(format!("orbit_off_test_{}.txt", std::process::id()));
+        let write_res_off = execute_tool_quiet(
+            "write_file",
+            &format!("{}\nunrestricted write", dummy_out.display()),
+            &state,
+        )
+        .await;
+        assert!(
+            !write_res_off.contains("Security Sandbox Error"),
+            "Off mode should not return sandbox error on writes: {}",
+            write_res_off
+        );
+        let _ = std::fs::remove_file(&dummy_out);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
