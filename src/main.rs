@@ -699,6 +699,11 @@ async fn execute_tool_internal(
                     Ok(true) => {}
                     _ => return format!("Tool '{}' execution rejected by user.", tool_name),
                 }
+            } else {
+                return format!(
+                    "⛔ Security Policy: Execution of tool '{}' requires interactive confirmation (ToolPolicy::Ask). In non-interactive or quiet mode, this tool is blocked. To allow, configure tool policy to 'auto' via `/policy {} auto`.",
+                    tool_name, tool_name
+                );
             }
         }
         security::ToolPolicy::Auto => {}
@@ -2743,7 +2748,7 @@ async fn main() -> Result<()> {
                             continue;
                         }
                         "/subagents" => {
-                            let tasks = state.subagent_mgr.list_subagents().await;
+                            let tasks = state.subagent_mgr.list_subagents();
                             println!("{}", "=== 🤖 SUBAGENT TASKS ===".bold().cyan());
                             if tasks.is_empty() {
                                 println!("No subagents spawned yet.");
@@ -4484,7 +4489,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_command_execution() {
-        let state = AgentState::new(Some(std::env::temp_dir())).unwrap();
+        let mut state = AgentState::new(Some(std::env::temp_dir())).unwrap();
+        state
+            .tool_permissions
+            .set_policy("run_command", security::ToolPolicy::Auto);
         let res = execute_tool_quiet("run_command", "echo 'orbit_local_ok'", &state).await;
         assert!(
             res.contains("Exit Code: 0"),
@@ -4494,6 +4502,17 @@ mod tests {
         assert!(
             res.contains("orbit_local_ok"),
             "Expected stdout output: {}",
+            res
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_permission_gate_blocks_ask_in_quiet_mode() {
+        let state = AgentState::new(Some(std::env::temp_dir())).unwrap();
+        let res = execute_tool_quiet("run_command", "echo 'fail_closed'", &state).await;
+        assert!(
+            res.contains("requires interactive confirmation (ToolPolicy::Ask)"),
+            "Expected fail-closed block in quiet mode: {}",
             res
         );
     }
@@ -4552,7 +4571,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        let state = AgentState::new(Some(temp_dir.clone())).unwrap();
+        let mut state = AgentState::new(Some(temp_dir.clone())).unwrap();
+        state
+            .tool_permissions
+            .set_policy("write_file", security::ToolPolicy::Auto);
 
         // 1. view_file escaping boundary
         let view_res = execute_tool_quiet("view_file", "../../etc/passwd", &state).await;

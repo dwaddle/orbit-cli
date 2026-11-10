@@ -2,7 +2,6 @@ use anyhow::Result;
 use colored::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum SubagentStatus {
@@ -24,15 +23,15 @@ pub struct SubagentTask {
 
 #[derive(Clone, Default)]
 pub struct SubagentManager {
-    tasks: Arc<Mutex<Vec<SubagentTask>>>,
-    next_id: Arc<Mutex<usize>>,
+    tasks: Arc<std::sync::Mutex<Vec<SubagentTask>>>,
+    next_id: Arc<std::sync::Mutex<usize>>,
 }
 
 impl SubagentManager {
     pub fn new() -> Self {
         Self {
-            tasks: Arc::new(Mutex::new(Vec::new())),
-            next_id: Arc::new(Mutex::new(1)),
+            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            next_id: Arc::new(std::sync::Mutex::new(1)),
         }
     }
 
@@ -55,9 +54,12 @@ impl SubagentManager {
         api_key: String,
         memory_context: Option<String>,
     ) -> usize {
-        let mut id_guard = self.next_id.lock().await;
-        let id = *id_guard;
-        *id_guard += 1;
+        let id = {
+            let mut id_guard = self.next_id.lock().unwrap();
+            let id = *id_guard;
+            *id_guard += 1;
+            id
+        };
 
         let is_primed = memory_context.is_some();
         let task = SubagentTask {
@@ -71,7 +73,7 @@ impl SubagentManager {
         };
 
         {
-            let mut tasks_guard = self.tasks.lock().await;
+            let mut tasks_guard = self.tasks.lock().unwrap();
             tasks_guard.push(task);
         }
 
@@ -87,7 +89,7 @@ impl SubagentManager {
                 memory_context.as_deref(),
             )
             .await;
-            let mut tasks_guard = tasks_clone.lock().await;
+            let mut tasks_guard = tasks_clone.lock().unwrap();
             if let Some(t) = tasks_guard.iter_mut().find(|t| t.id == id_copy) {
                 match res {
                     Ok(output) => {
@@ -105,8 +107,8 @@ impl SubagentManager {
         id
     }
 
-    pub async fn list_subagents(&self) -> Vec<SubagentTask> {
-        let tasks_guard = self.tasks.lock().await;
+    pub fn list_subagents(&self) -> Vec<SubagentTask> {
+        let tasks_guard = self.tasks.lock().unwrap();
         tasks_guard.clone()
     }
 
@@ -229,11 +231,13 @@ impl SubagentManager {
                 }));
             }
 
-            for handle in join_handles {
-                let (node_id, res) = handle.await?;
-                if let Some(node) = dag.nodes.iter_mut().find(|n| n.id == node_id) {
-                    match res {
-                        Ok(out) => {
+            let mut failed_err = None;
+
+            for i in 0..join_handles.len() {
+                let await_res = (&mut join_handles[i]).await;
+                match await_res {
+                    Ok((node_id, Ok(out))) => {
+                        if let Some(node) = dag.nodes.iter_mut().find(|n| n.id == node_id) {
                             println!(
                                 "  ✅ Completed DAG Node #{} [{}]",
                                 node.id,
@@ -256,7 +260,9 @@ impl SubagentManager {
                                 }
                             }
                         }
-                        Err(e) => {
+                    }
+                    Ok((node_id, Err(e))) => {
+                        if let Some(node) = dag.nodes.iter_mut().find(|n| n.id == node_id) {
                             println!(
                                 "  ❌ Failed DAG Node #{} [{}]: {}",
                                 node.id,
@@ -277,16 +283,35 @@ impl SubagentManager {
                                     );
                                 }
                             }
-
-                            return Err(anyhow::anyhow!(
+                            failed_err = Some(anyhow::anyhow!(
                                 "DAG task #{} '{}' failed: {}",
                                 node.id,
                                 node.name,
                                 e
                             ));
+                        } else {
+                            failed_err =
+                                Some(anyhow::anyhow!("DAG task #{} failed: {}", node_id, e));
                         }
+
+                        // Abort all remaining handles to prevent zombie leaks
+                        for h in join_handles.iter().skip(i + 1) {
+                            h.abort();
+                        }
+                        break;
+                    }
+                    Err(join_err) => {
+                        failed_err = Some(anyhow::anyhow!("DAG task join error: {}", join_err));
+                        for h in join_handles.iter().skip(i + 1) {
+                            h.abort();
+                        }
+                        break;
                     }
                 }
+            }
+
+            if let Some(err) = failed_err {
+                return Err(err);
             }
         }
 

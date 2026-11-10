@@ -28,9 +28,11 @@ pub fn find_project_root(start_dir: &Path) -> Option<(PathBuf, String, Vec<Strin
             ));
         }
         if current.join("tsconfig.json").exists() {
-            let runner = if Path::new("/usr/bin/bun").exists()
-                || Path::new("/home/rene/.bun/bin/bun").exists()
-            {
+            let bun_installed = Path::new("/usr/bin/bun").exists()
+                || std::env::var("HOME")
+                    .map(|h| PathBuf::from(h).join(".bun/bin/bun").exists())
+                    .unwrap_or(false);
+            let runner = if bun_installed {
                 ("bun".to_string(), vec!["check".to_string()])
             } else {
                 (
