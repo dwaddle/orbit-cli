@@ -1328,6 +1328,18 @@ pub async fn handle_slash_command(
                 let ltm_guard = state.long_term_memory.lock_safe();
                 let report = memory::MemoryBenchmarkRunner::run_benchmark(Some(&ltm_guard));
                 println!("\n{}", report.format_banner().green());
+            } else if entry == "prune" {
+                let mut ltm = state.long_term_memory.lock_safe();
+                match ltm.prune_and_archive(&state.workspace_dir, 0.05) {
+                    Ok(count) => {
+                        let _ = ltm.save(&state.workspace_dir);
+                        println!(
+                            "🧹 Pruned {} decayed/refuted insights to .orbit/insights_archive.json.",
+                            count
+                        );
+                    }
+                    Err(e) => println!("Error during memory pruning: {}", e),
+                }
             } else if entry.is_empty() {
                 println!("\n{}", "=== 🧠 ORBIT MEMORY ARCHITECTURE ===".bold().cyan());
                 {
@@ -1419,6 +1431,62 @@ pub async fn handle_slash_command(
                 ltm.insights.clear();
                 let _ = ltm.save(&state.workspace_dir);
                 println!("🗑️ Cleared all long-term insights.");
+            } else if subcmd == "refuted" || subcmd == "archive" {
+                println!(
+                    "{}",
+                    "=== 🗄️ REFUTED & SUPERSEDED INSIGHTS ===".bold().yellow()
+                );
+                let refuted: Vec<&memory::InsightRecord> =
+                    ltm.insights.iter().filter(|i| i.is_refuted()).collect();
+                if refuted.is_empty() {
+                    println!("No refuted insights. All recorded insights remain active.");
+                } else {
+                    for ins in refuted {
+                        println!(
+                            "• #{} [{}] [{}] (used: {}x)\n  Insight: {}\n  Refutation Reason: {}\n",
+                            ins.id,
+                            ins.category.as_str().cyan().bold(),
+                            ins.status_label().red().bold(),
+                            ins.occurrence_count,
+                            ins.insight,
+                            ins.refutation_reason
+                                .as_deref()
+                                .unwrap_or("No reason specified")
+                                .dimmed()
+                        );
+                    }
+                }
+            } else if let Some(rest) = subcmd.strip_prefix("refute ") {
+                let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+                if let Ok(id) = parts[0].parse::<usize>() {
+                    let reason = if parts.len() > 1 {
+                        parts[1]
+                    } else {
+                        "Manually refuted by user"
+                    };
+                    if ltm.refute_insight(id, reason, None) {
+                        let _ = ltm.save(&state.workspace_dir);
+                        println!(
+                            "🚫 Insight #{} has been marked REFUTED and deactivated from guidance.",
+                            id
+                        );
+                    } else {
+                        println!("Insight #{} not found.", id);
+                    }
+                } else {
+                    println!("Usage: /insights refute <id> [reason]");
+                }
+            } else if let Some(rest) = subcmd.strip_prefix("verify ") {
+                if let Ok(id) = rest.trim().parse::<usize>() {
+                    if ltm.verify_insight(id, 0.4) {
+                        let _ = ltm.save(&state.workspace_dir);
+                        println!("✅ Insight #{} verified and reinforced.", id);
+                    } else {
+                        println!("Insight #{} not found.", id);
+                    }
+                } else {
+                    println!("Usage: /insights verify <id>");
+                }
             } else {
                 println!(
                     "{}",
@@ -1426,20 +1494,36 @@ pub async fn handle_slash_command(
                         .bold()
                         .cyan()
                 );
-                if ltm.insights.is_empty() {
-                    println!("No insights recorded yet. Store with `/remember <text>` or tool `store_insight`.");
+                let active: Vec<&memory::InsightRecord> =
+                    ltm.insights.iter().filter(|i| !i.is_refuted()).collect();
+                let refuted_count = ltm.insights.iter().filter(|i| i.is_refuted()).count();
+
+                if active.is_empty() {
+                    println!("No active insights recorded yet. Store with `/remember <text>` or tool `store_insight`.");
                 } else {
-                    for ins in &ltm.insights {
+                    for ins in active {
+                        let status_colored = match ins.status_label() {
+                            "VERIFIED" => ins.status_label().green().bold(),
+                            "CHALLENGED" => ins.status_label().yellow().bold(),
+                            _ => ins.status_label().dimmed(),
+                        };
                         println!(
-                            "• #{} [{}] (conf: {:.1}, used: {}x)\n  Insight: {}\n  Keywords: {}\n",
+                            "• #{} [{}] [{}] (conf: {:.1}, used: {}x)\n  Insight: {}\n  Keywords: {}\n",
                             ins.id,
                             ins.category.as_str().cyan().bold(),
+                            status_colored,
                             ins.confidence,
                             ins.occurrence_count,
                             ins.insight,
                             ins.trigger_keywords.join(", ").dimmed()
                         );
                     }
+                }
+                if refuted_count > 0 {
+                    println!(
+                        "ℹ️ {} refuted/superseded insights filtered out. Use `/insights refuted` to inspect.\n",
+                        refuted_count
+                    );
                 }
             }
             Ok(CommandAction::Handled)

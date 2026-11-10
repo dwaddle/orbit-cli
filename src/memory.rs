@@ -31,8 +31,8 @@ impl std::str::FromStr for InsightCategory {
         match s.to_lowercase().trim() {
             "architecture" | "arch" => Ok(Self::Architecture),
             "bug_pattern" | "bug" | "fix" => Ok(Self::BugPattern),
-            "user_preference" | "user" | "pref" => Ok(Self::UserPreference),
-            "build_quirk" | "build" | "quirk" => Ok(Self::BuildQuirk),
+            "user_preference" | "user" | "pref" | "preference" => Ok(Self::UserPreference),
+            "build_quirk" | "build" | "quirk" | "workaround" => Ok(Self::BuildQuirk),
             _ => Err(()),
         }
     }
@@ -52,6 +52,18 @@ pub struct InsightRecord {
     pub last_accessed: u64,
     #[serde(default = "default_stability")]
     pub stability_days: f32,
+    #[serde(default = "default_verification_score")]
+    pub verification_score: f32,
+    #[serde(default)]
+    pub refutation_count: u32,
+    #[serde(default)]
+    pub refuted_at: Option<u64>,
+    #[serde(default)]
+    pub refutation_reason: Option<String>,
+    #[serde(default)]
+    pub supersedes: Option<usize>,
+    #[serde(default)]
+    pub superseded_by: Option<usize>,
 }
 
 fn default_last_accessed() -> u64 {
@@ -65,6 +77,10 @@ fn default_stability() -> f32 {
     14.0 // Baseline half-life: 14 days
 }
 
+fn default_verification_score() -> f32 {
+    0.5 // Baseline unverified initial state
+}
+
 impl InsightRecord {
     /// Calculates the Ebbinghaus memory retrievability R in [0.0, 1.0]
     /// Formula: R = exp( - delta_t / stability )
@@ -72,7 +88,25 @@ impl InsightRecord {
         let delta_secs = now_secs.saturating_sub(self.last_accessed);
         let delta_days = delta_secs as f32 / 86400.0;
         let stability = self.stability_days.max(1.0);
-        (-delta_days / stability).exp().clamp(0.01, 1.0)
+        (-delta_days / stability).exp().clamp(0.0, 1.0)
+    }
+
+    /// Determines whether this insight has been refuted or replaced by newer evidence.
+    pub fn is_refuted(&self) -> bool {
+        self.refuted_at.is_some() || self.verification_score <= -0.5 || self.superseded_by.is_some()
+    }
+
+    /// Returns a human-readable cognitive status label.
+    pub fn status_label(&self) -> &'static str {
+        if self.is_refuted() {
+            "REFUTED"
+        } else if self.verification_score >= 0.8 {
+            "VERIFIED"
+        } else if self.verification_score < 0.2 {
+            "CHALLENGED"
+        } else {
+            "UNVERIFIED"
+        }
     }
 }
 
@@ -101,11 +135,32 @@ impl LongTermMemory {
         workspace_root.join(".orbit").join("insights.json")
     }
 
+    pub fn archive_path(workspace_root: &Path) -> PathBuf {
+        workspace_root.join(".orbit").join("insights_archive.json")
+    }
+
     pub fn load_or_init(workspace_root: &Path) -> Result<Self> {
         let file_path = Self::memory_path(workspace_root);
         if file_path.exists() {
             let data = fs::read_to_string(&file_path)?;
-            let mut ltm: Self = serde_json::from_str(&data).unwrap_or_default();
+            let mut ltm: Self = match serde_json::from_str(&data) {
+                Ok(loaded) => loaded,
+                Err(err) => {
+                    let ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let corrupt_path =
+                        file_path.with_file_name(format!("insights.json.corrupt.{}", ts));
+                    let _ = fs::copy(&file_path, &corrupt_path);
+                    eprintln!(
+                        "⚠️ Warning: Corrupt insights.json detected ({}). Backed up to {}. Reinitializing clean store.",
+                        err,
+                        corrupt_path.display()
+                    );
+                    Self::default()
+                }
+            };
             if ltm.next_id == 0 {
                 ltm.next_id = ltm.insights.iter().map(|i| i.id).max().unwrap_or(0) + 1;
             }
@@ -122,10 +177,13 @@ impl LongTermMemory {
         }
     }
 
-    /// Rebuilds the inverted index mapping lowercase tokens to insight IDs.
+    /// Rebuilds the inverted index mapping lowercase tokens to non-refuted insight IDs.
     pub fn rebuild_index(&mut self) {
         self.keyword_index.clear();
         for rec in &self.insights {
+            if rec.is_refuted() {
+                continue;
+            }
             for kw in &rec.trigger_keywords {
                 let kw_clean = kw.to_lowercase();
                 self.keyword_index.entry(kw_clean).or_default().push(rec.id);
@@ -182,6 +240,13 @@ impl LongTermMemory {
             existing.last_accessed = now_ts;
             // Spaced repetition: memory stability increases by 50% with each reinforcement
             existing.stability_days = (existing.stability_days * 1.5).min(365.0);
+            if existing.is_refuted() && existing.superseded_by.is_none() {
+                existing.refuted_at = None;
+                existing.refutation_reason = None;
+                existing.verification_score = 0.5;
+            } else {
+                existing.verification_score = (existing.verification_score + 0.1).min(1.0);
+            }
             for kw in trigger_keywords {
                 let kw_clean = kw.to_lowercase().trim().to_string();
                 if !kw_clean.is_empty() && !existing.trigger_keywords.iter().any(|k| k == &kw_clean)
@@ -211,10 +276,161 @@ impl LongTermMemory {
             created_at: now_ts,
             last_accessed: now_ts,
             stability_days: 14.0,
+            verification_score: 0.5,
+            refutation_count: 0,
+            refuted_at: None,
+            refutation_reason: None,
+            supersedes: None,
+            superseded_by: None,
         });
 
         self.rebuild_index();
         id
+    }
+
+    /// Marks an insight as refuted and obsolete. It will be excluded from prompt injections and retrieval.
+    pub fn refute_insight(
+        &mut self,
+        id: usize,
+        reason: &str,
+        superseded_by: Option<usize>,
+    ) -> bool {
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if let Some(rec) = self.insights.iter_mut().find(|r| r.id == id) {
+            rec.refuted_at = Some(now_ts);
+            rec.refutation_reason = Some(reason.to_string());
+            rec.refutation_count += 1;
+            rec.verification_score = -1.0;
+            rec.confidence = 0.0;
+            if superseded_by.is_some() {
+                rec.superseded_by = superseded_by;
+            }
+            self.rebuild_index();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Challenges an insight with a penalty. If verification_score drops <= -0.5, it is automatically marked refuted.
+    pub fn challenge_insight(&mut self, id: usize, penalty: f32, reason: Option<&str>) -> bool {
+        if let Some(rec) = self.insights.iter_mut().find(|r| r.id == id) {
+            rec.refutation_count += 1;
+            rec.verification_score = (rec.verification_score - penalty).clamp(-1.0, 1.0);
+            rec.confidence = (rec.confidence - (penalty * 0.5)).clamp(0.0, 1.0);
+            if let Some(r) = reason {
+                rec.refutation_reason = Some(r.to_string());
+            }
+            if rec.verification_score <= -0.5 && rec.refuted_at.is_none() {
+                let now_ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                rec.refuted_at = Some(now_ts);
+            }
+            self.rebuild_index();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Verifies and reinforces an insight with positive evidence.
+    pub fn verify_insight(&mut self, id: usize, boost: f32) -> bool {
+        let mut resurrected = false;
+        let found = if let Some(rec) = self.insights.iter_mut().find(|r| r.id == id) {
+            let was_refuted = rec.is_refuted();
+            rec.verification_score = (rec.verification_score + boost).clamp(-1.0, 1.0);
+            rec.confidence = (rec.confidence + (boost * 0.2)).clamp(0.0, 1.0);
+            rec.stability_days = (rec.stability_days * 1.2).min(365.0);
+            if rec.verification_score > -0.5 && rec.superseded_by.is_none() {
+                rec.refuted_at = None;
+                rec.refutation_reason = None;
+            }
+            if was_refuted && !rec.is_refuted() {
+                resurrected = true;
+            }
+            true
+        } else {
+            false
+        };
+
+        if resurrected {
+            self.rebuild_index();
+        }
+        found
+    }
+
+    /// Identifies active insights that conflict with a new corrective instruction.
+    pub fn find_conflicting_insights(&self, new_text: &str) -> Vec<usize> {
+        let lower = new_text.to_lowercase();
+        let negation_markers = [
+            "niet meer",
+            "geen ",
+            "stop met",
+            "vervang ",
+            "don't ",
+            "do not ",
+            "never ",
+            "instead of",
+            "in plaats van",
+            "deprecated",
+            "obsolete",
+            "verkeerd",
+            "incorrect",
+            "is wrong",
+            "stop using",
+            "vermijd ",
+            "not use",
+        ];
+
+        let has_negation = negation_markers.iter().any(|m| lower.contains(m));
+        if !has_negation {
+            return Vec::new();
+        }
+
+        let new_tokens: HashSet<&str> = lower
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            .filter(|t| t.len() >= 3)
+            .collect();
+
+        let mut conflicts = Vec::new();
+        for rec in &self.insights {
+            if rec.is_refuted() {
+                continue;
+            }
+            let mut match_count = 0;
+            for kw in &rec.trigger_keywords {
+                if new_tokens.contains(kw.as_str()) || lower.contains(kw) {
+                    match_count += 1;
+                }
+            }
+            for token in rec
+                .insight
+                .to_lowercase()
+                .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+                .filter(|t| t.len() >= 4)
+            {
+                if new_tokens.contains(token) {
+                    match_count += 1;
+                }
+            }
+
+            if match_count >= 2
+                || (match_count >= 1
+                    && rec
+                        .trigger_keywords
+                        .iter()
+                        .any(|k| lower.contains(k) && k.len() >= 4))
+            {
+                conflicts.push(rec.id);
+            }
+        }
+        conflicts
     }
 
     pub fn find_relevant_insights(&self, query: &str, max_results: usize) -> Vec<&InsightRecord> {
@@ -241,6 +457,9 @@ impl LongTermMemory {
 
         // Also check if any trigger keywords are multi-word substrings in lower_query
         for rec in &self.insights {
+            if rec.is_refuted() {
+                continue;
+            }
             for kw in &rec.trigger_keywords {
                 if kw.contains(' ') && lower_query.contains(kw) {
                     candidate_ids.insert(rec.id);
@@ -255,6 +474,7 @@ impl LongTermMemory {
         let mut scored: Vec<(&InsightRecord, f32)> = candidate_ids
             .into_iter()
             .filter_map(|id| self.insights.iter().find(|r| r.id == id))
+            .filter(|rec| !rec.is_refuted())
             .filter_map(|rec| {
                 let mut match_score: f32 = 0.0;
                 for kw in &rec.trigger_keywords {
@@ -280,7 +500,11 @@ impl LongTermMemory {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.0.id.cmp(&a.0.id))
+        });
         scored
             .into_iter()
             .take(max_results)
@@ -295,11 +519,15 @@ impl LongTermMemory {
         } else {
             let mut out = String::from("<learned_project_insights>\n");
             for rec in relevant {
+                let sanitized_insight = rec
+                    .insight
+                    .replace("</learned_project_insights>", "[/learned_project_insights]");
                 out.push_str(&format!(
-                    "- [{}] {}: {} (reinforcements: {})\n",
+                    "- [{}] [{}] {}: {} (reinforcements: {})\n",
                     rec.category.as_str(),
+                    rec.status_label(),
                     rec.trigger_keywords.join("/"),
-                    rec.insight,
+                    sanitized_insight,
                     rec.occurrence_count
                 ));
             }
@@ -308,7 +536,7 @@ impl LongTermMemory {
         }
     }
 
-    /// Synaptic Pruning: removes or archives inactive insights whose Ebbinghaus retrievability
+    /// Synaptic Pruning: removes inactive or refuted insights whose Ebbinghaus retrievability
     /// has dropped below `min_retrievability` (e.g. 0.05). Returns count of pruned records.
     pub fn prune_decayed_insights(&mut self, min_retrievability: f32) -> usize {
         let now_ts = SystemTime::now()
@@ -318,12 +546,82 @@ impl LongTermMemory {
 
         let initial_len = self.insights.len();
         self.insights
-            .retain(|rec| rec.retrievability(now_ts) >= min_retrievability);
+            .retain(|rec| !rec.is_refuted() && rec.retrievability(now_ts) >= min_retrievability);
         let pruned = initial_len.saturating_sub(self.insights.len());
         if pruned > 0 {
             self.rebuild_index();
         }
         pruned
+    }
+
+    /// Prunes decayed or refuted insights and moves them to `.orbit/insights_archive.json` for permanent cold storage.
+    pub fn prune_and_archive(
+        &mut self,
+        workspace_root: &Path,
+        min_retrievability: f32,
+    ) -> Result<usize> {
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // 1. Identify records to prune without mutating self.insights yet
+        let prune_ids: HashSet<usize> = self
+            .insights
+            .iter()
+            .filter(|rec| rec.is_refuted() || rec.retrievability(now_ts) < min_retrievability)
+            .map(|rec| rec.id)
+            .collect();
+
+        if prune_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let to_archive: Vec<InsightRecord> = self
+            .insights
+            .iter()
+            .filter(|rec| prune_ids.contains(&rec.id))
+            .cloned()
+            .collect();
+
+        // 2. Load and safely merge into archive FIRST
+        let arch_path = Self::archive_path(workspace_root);
+        let mut archive: Vec<InsightRecord> = if arch_path.exists() {
+            let data = fs::read_to_string(&arch_path)?;
+            match serde_json::from_str(&data) {
+                Ok(records) => records,
+                Err(e) => {
+                    let corrupt_path = arch_path
+                        .with_file_name(format!("insights_archive.json.corrupt.{}", now_ts));
+                    let _ = fs::copy(&arch_path, &corrupt_path);
+                    eprintln!(
+                        "⚠️ Corrupt insights_archive.json detected ({}). Backed up to {}.",
+                        e,
+                        corrupt_path.display()
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        archive.extend(to_archive);
+
+        if let Some(parent) = arch_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let data = serde_json::to_string_pretty(&archive)?;
+        let temp_arch = arch_path.with_extension("json.tmp");
+        fs::write(&temp_arch, data)?;
+        fs::rename(&temp_arch, &arch_path)?;
+
+        // 3. ONLY after disk persistence succeeds, mutate self.insights
+        let pruned_count = prune_ids.len();
+        self.insights.retain(|rec| !prune_ids.contains(&rec.id));
+        self.rebuild_index();
+
+        Ok(pruned_count)
     }
 }
 
@@ -512,20 +810,59 @@ impl MemoryConsolidator {
                 StmEvent::UserCorrection { instruction } => {
                     let clean = instruction.trim();
                     if clean.len() >= 10 && !Self::is_trivial_remark(clean) {
+                        // 1. Detect and refute any existing insights contradicted by this correction
+                        let conflicts = ltm.find_conflicting_insights(clean);
+                        let mut primary_superseded = None;
+                        for conflict_id in conflicts {
+                            let (conflict_cat, conflict_text) = if let Some(r) =
+                                ltm.insights.iter().find(|i| i.id == conflict_id)
+                            {
+                                (r.category, r.insight.clone())
+                            } else {
+                                (InsightCategory::UserPreference, String::new())
+                            };
+                            let refutation_reason =
+                                format!("Contradicted by user correction: '{}'", clean);
+                            ltm.refute_insight(conflict_id, &refutation_reason, None);
+                            primary_superseded = Some(conflict_id);
+                            outcomes.push(ConsolidationOutcome {
+                                insight_id: conflict_id,
+                                category: conflict_cat,
+                                insight_text: conflict_text,
+                                reason: refutation_reason,
+                            });
+                        }
+
                         let keywords = Self::extract_salient_keywords(clean);
                         // Require at least one meaningful non-stopword keyword
                         if !keywords.is_empty() {
-                            let id = ltm.add_or_reinforce(
+                            let new_id = ltm.add_or_reinforce(
                                 InsightCategory::UserPreference,
                                 keywords,
                                 clean,
                                 1.0,
                             );
+                            if let Some(superseded_id) = primary_superseded {
+                                if let Some(new_rec) =
+                                    ltm.insights.iter_mut().find(|i| i.id == new_id)
+                                {
+                                    new_rec.supersedes = Some(superseded_id);
+                                }
+                                if let Some(old_rec) =
+                                    ltm.insights.iter_mut().find(|i| i.id == superseded_id)
+                                {
+                                    old_rec.superseded_by = Some(new_id);
+                                }
+                            }
                             outcomes.push(ConsolidationOutcome {
-                                insight_id: id,
+                                insight_id: new_id,
                                 category: InsightCategory::UserPreference,
                                 insight_text: clean.to_string(),
-                                reason: "Learned directly from user correction".to_string(),
+                                reason: if primary_superseded.is_some() {
+                                    "Learned correction superseding refuted insight".to_string()
+                                } else {
+                                    "Learned directly from user correction".to_string()
+                                },
                             });
                         }
                     }
@@ -536,6 +873,23 @@ impl MemoryConsolidator {
                     initial_error,
                     resolution_strategy,
                 } => {
+                    // Positive verification for any active insight matching the error keywords
+                    let err_lower = initial_error.to_lowercase();
+                    let mut matched_ids = Vec::new();
+                    for rec in &ltm.insights {
+                        if !rec.is_refuted()
+                            && rec
+                                .trigger_keywords
+                                .iter()
+                                .any(|k| err_lower.contains(k.as_str()))
+                        {
+                            matched_ids.push(rec.id);
+                        }
+                    }
+                    for mid in matched_ids {
+                        ltm.verify_insight(mid, 0.2);
+                    }
+
                     if Self::is_systemic_error(initial_error) {
                         let insight_text = format!(
                             "When encountering '{}' during {}, resolve by {}",
@@ -565,39 +919,74 @@ impl MemoryConsolidator {
                     }
                 }
                 StmEvent::ToolExecution {
-                    tool: _,
-                    target: _,
+                    tool,
+                    target,
                     succeeded,
                     error,
                 } => {
-                    if !succeeded {
-                        if let Some(err) = error {
-                            if err.contains("pre-commit")
-                                || err.contains("cargo fmt")
-                                || err.contains("formatting check failed")
+                    if *succeeded {
+                        // Check if any active insight was exercised and reinforce verification
+                        let lower_target = target.to_lowercase();
+                        let mut verified_ids = Vec::new();
+                        for rec in &ltm.insights {
+                            if !rec.is_refuted()
+                                && (rec.trigger_keywords.iter().any(|k| {
+                                    lower_target.contains(k) || tool.eq_ignore_ascii_case(k)
+                                }))
                             {
-                                let insight_text =
-                                    "Run 'cargo fmt' before committing changes to pass repository pre-commit hooks.";
-                                let keywords = vec![
-                                    "git".to_string(),
-                                    "commit".to_string(),
-                                    "cargo fmt".to_string(),
-                                    "pre-commit".to_string(),
-                                ];
-                                let id = ltm.add_or_reinforce(
-                                    InsightCategory::BuildQuirk,
-                                    keywords,
-                                    insight_text,
-                                    0.9,
-                                );
-                                outcomes.push(ConsolidationOutcome {
-                                    insight_id: id,
-                                    category: InsightCategory::BuildQuirk,
-                                    insight_text: insight_text.to_string(),
-                                    reason: "Consolidated repository pre-commit requirement"
-                                        .to_string(),
-                                });
+                                verified_ids.push(rec.id);
                             }
+                        }
+                        for vid in verified_ids {
+                            ltm.verify_insight(vid, 0.1);
+                        }
+                    } else if let Some(err) = error {
+                        // Challenge any insight whose advice was followed and resulted in failure
+                        let lower_err = err.to_lowercase();
+                        let mut challenged_ids = Vec::new();
+                        for rec in &ltm.insights {
+                            if !rec.is_refuted()
+                                && rec
+                                    .trigger_keywords
+                                    .iter()
+                                    .any(|k| lower_err.contains(k.as_str()))
+                            {
+                                challenged_ids.push(rec.id);
+                            }
+                        }
+                        for cid in challenged_ids {
+                            ltm.challenge_insight(
+                                cid,
+                                0.25,
+                                Some("Tool execution failed while matching insight keywords"),
+                            );
+                        }
+
+                        if err.contains("pre-commit")
+                            || err.contains("cargo fmt")
+                            || err.contains("formatting check failed")
+                        {
+                            let insight_text =
+                                "Run 'cargo fmt' before committing changes to pass repository pre-commit hooks.";
+                            let keywords = vec![
+                                "git".to_string(),
+                                "commit".to_string(),
+                                "cargo fmt".to_string(),
+                                "pre-commit".to_string(),
+                            ];
+                            let id = ltm.add_or_reinforce(
+                                InsightCategory::BuildQuirk,
+                                keywords,
+                                insight_text,
+                                0.9,
+                            );
+                            outcomes.push(ConsolidationOutcome {
+                                insight_id: id,
+                                category: InsightCategory::BuildQuirk,
+                                insight_text: insight_text.to_string(),
+                                reason: "Consolidated repository pre-commit requirement"
+                                    .to_string(),
+                            });
                         }
                     }
                 }
@@ -802,8 +1191,14 @@ Persistent architectural decisions, discovered constraints, and codebase pattern
     pub fn append_entry(&mut self, heading: &str, entry: &str) -> Result<()> {
         let date = chrono_date();
         let formatted = format!("\n### [{}] {}\n- {}\n", date, heading, entry);
-        self.content.push_str(&formatted);
-        fs::write(&self.file_path, &self.content)?;
+        let mut new_content = self.content.clone();
+        new_content.push_str(&formatted);
+
+        let temp_path = self.file_path.with_extension("md.tmp");
+        fs::write(&temp_path, &new_content)?;
+        fs::rename(&temp_path, &self.file_path)?;
+
+        self.content = new_content;
         Ok(())
     }
 
@@ -812,7 +1207,17 @@ Persistent architectural decisions, discovered constraints, and codebase pattern
         if trimmed.is_empty() {
             None
         } else {
-            Some(format!("<project_memory>\n{}\n</project_memory>", trimmed))
+            let lines: Vec<&str> = trimmed.lines().collect();
+            if lines.len() <= 120 {
+                Some(format!("<project_memory>\n{}\n</project_memory>", trimmed))
+            } else {
+                let header = lines[..40.min(lines.len())].join("\n");
+                let recent = lines[lines.len().saturating_sub(60)..].join("\n");
+                Some(format!(
+                    "<project_memory>\n{}\n\n[... earlier project notes condensed for token efficiency ...]\n\n{}\n</project_memory>",
+                    header, recent
+                ))
+            }
         }
     }
 }
@@ -1097,16 +1502,29 @@ impl MemoryBenchmarkRunner {
 }
 
 fn chrono_date() -> String {
-    let out = std::process::Command::new("date")
-        .arg("+%Y-%m-%d %H:%M")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "2026-10-24 08:00".to_string());
-    if out.is_empty() {
-        "2026-10-24 08:00".to_string()
-    } else {
-        out
-    }
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let days = (secs / 86400) as i64;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+
+    // Euclidean affine algorithm for civil date (zero external crates or subprocesses)
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1024 + doe / 1460 - doe / 36524) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hours, minutes)
 }
 
 #[cfg(test)]
@@ -1777,6 +2195,12 @@ mod tests {
             created_at: 1000,
             last_accessed: 1000,
             stability_days: 14.0,
+            verification_score: 0.5,
+            refutation_count: 0,
+            refuted_at: None,
+            refutation_reason: None,
+            supersedes: None,
+            superseded_by: None,
         };
 
         // At t = 0 days since access: R should be 1.0
@@ -1892,6 +2316,12 @@ mod tests {
             created_at: ancient_ts,
             last_accessed: ancient_ts,
             stability_days: 7.0, // R = exp(-120/7) ~= 3.8e-8 < 0.05
+            verification_score: 0.5,
+            refutation_count: 0,
+            refuted_at: None,
+            refutation_reason: None,
+            supersedes: None,
+            superseded_by: None,
         };
         ltm.insights.push(old_rec);
         ltm.rebuild_index();
@@ -1931,5 +2361,266 @@ mod tests {
         assert!(report.precision_rate >= 1.0);
         assert!(report.specificity_rate >= 1.0);
         assert!(report.deduplication_rate >= 1.0);
+    }
+
+    #[test]
+    fn test_cognitive_refutation_and_superseding() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+
+        // 1. Initially Orbit learns a rule that is later discovered to be wrong
+        let old_id = ltm.add_or_reinforce(
+            InsightCategory::UserPreference,
+            vec!["venv".to_string(), "python".to_string()],
+            "Always create virtualenvs using python -m venv",
+            0.9,
+        );
+        assert_eq!(ltm.insights.len(), 1);
+        assert!(!ltm.insights[0].is_refuted());
+        assert_eq!(ltm.insights[0].status_label(), "UNVERIFIED");
+
+        // 2. User later confronts the agent with contradictory instructions:
+        let mut stm = WorkingMemory::new();
+        stm.record_event(StmEvent::UserCorrection {
+            instruction: "Stop met python venv, gebruik uv venv in plaats van python -m venv"
+                .to_string(),
+        });
+
+        // 3. Consolidate: belief revision must trigger
+        let outcomes = MemoryConsolidator::consolidate(&stm, &mut ltm);
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes[0]
+            .reason
+            .contains("Contradicted by user correction"));
+
+        // 4. Verify old insight is marked REFUTED and linked to new insight
+        let old_rec = ltm.insights.iter().find(|i| i.id == old_id).unwrap();
+        assert!(old_rec.is_refuted());
+        assert_eq!(old_rec.status_label(), "REFUTED");
+        assert!(old_rec.refuted_at.is_some());
+        assert!(old_rec.superseded_by.is_some());
+
+        // 5. Verify new insight supersedes old
+        let new_rec = ltm.insights.iter().find(|i| i.id != old_id).unwrap();
+        assert_eq!(new_rec.supersedes, Some(old_id));
+
+        // 6. Refuted insight must NEVER be returned in relevant insights for guidance
+        let matched = ltm.find_relevant_insights("how to create python venv?", 5);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].id, new_rec.id);
+        assert!(matched[0].insight.contains("uv venv"));
+
+        // Prompt injection must only inject the active valid insight
+        let injection = ltm.format_prompt_injection("python venv").unwrap();
+        assert!(!injection.contains("Always create virtualenvs using python -m venv"));
+        assert!(injection.contains("uv venv"));
+    }
+
+    #[test]
+    fn test_challenge_and_verification_scoring() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+
+        let id = ltm.add_or_reinforce(
+            InsightCategory::BugPattern,
+            vec!["tokio".to_string(), "spawn".to_string()],
+            "Use tokio::spawn for background tasks",
+            0.7,
+        );
+        assert_eq!(ltm.insights[0].verification_score, 0.5);
+
+        // Positive verification
+        ltm.verify_insight(id, 0.4);
+        assert!((ltm.insights[0].verification_score - 0.9).abs() < 1e-4);
+        assert_eq!(ltm.insights[0].status_label(), "VERIFIED");
+
+        // Tool failure challenges the insight
+        ltm.challenge_insight(id, 0.4, Some("Task panicked in runtime"));
+        assert!((ltm.insights[0].verification_score - 0.5).abs() < 1e-4);
+        assert_eq!(ltm.insights[0].status_label(), "UNVERIFIED");
+
+        // Severe challenge drops verification score <= -0.5, auto-refuting
+        ltm.challenge_insight(id, 1.1, Some("Repeated segmentation faults"));
+        assert!(ltm.insights[0].is_refuted());
+        assert_eq!(ltm.insights[0].status_label(), "REFUTED");
+        assert!(ltm.insights[0].refuted_at.is_some());
+    }
+
+    #[test]
+    fn test_corrupt_insights_json_backup_fail_safe() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+        let orbit_dir = ws.join(".orbit");
+        fs::create_dir_all(&orbit_dir).unwrap();
+        let file_path = orbit_dir.join("insights.json");
+        fs::write(&file_path, "INVALID JSON DATA { broken: ").unwrap();
+
+        // Load must gracefully recover and create backup
+        let ltm = LongTermMemory::load_or_init(ws).unwrap();
+        assert!(ltm.insights.is_empty());
+
+        // Verify backup exists on disk
+        let corrupt_files: Vec<_> = fs::read_dir(&orbit_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("insights.json.corrupt")
+            })
+            .collect();
+        assert_eq!(
+            corrupt_files.len(),
+            1,
+            "Expected corrupt backup to be created"
+        );
+    }
+
+    #[test]
+    fn test_project_memory_bounded_windowing() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+        let mut mem = ProjectMemory::load_or_init(ws).unwrap();
+
+        // Add 150 entries to exceed the 120-line window threshold
+        for i in 0..150 {
+            mem.append_entry("Note", &format!("Log entry number {}", i))
+                .unwrap();
+        }
+
+        let injection = mem.format_prompt_injection().unwrap();
+        assert!(injection.contains("<project_memory>"));
+        assert!(injection.contains("Architecture & Conventions"));
+        assert!(injection.contains("earlier project notes condensed for token efficiency"));
+        assert!(injection.contains("Log entry number 149"));
+
+        // Total lines in injection must be bounded (less than 130 lines)
+        let injection_lines = injection.lines().count();
+        assert!(
+            injection_lines <= 130,
+            "Prompt injection must remain bounded; got {} lines",
+            injection_lines
+        );
+    }
+
+    #[test]
+    fn test_prune_and_archive_to_disk() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+
+        let id = ltm.add_or_reinforce(
+            InsightCategory::Architecture,
+            vec!["obsolete".to_string()],
+            "Deprecated architectural assumption",
+            0.5,
+        );
+        ltm.refute_insight(id, "Disproven by user tests", None);
+
+        let archived = ltm.prune_and_archive(ws, 0.05).unwrap();
+        assert_eq!(archived, 1);
+        assert!(ltm.insights.is_empty());
+
+        let arch_path = ws.join(".orbit").join("insights_archive.json");
+        assert!(arch_path.exists());
+        let arch_data = fs::read_to_string(&arch_path).unwrap();
+        assert!(arch_data.contains("Deprecated architectural assumption"));
+        assert!(arch_data.contains("Disproven by user tests"));
+    }
+
+    #[test]
+    fn test_verify_insight_resurrection_rebuilds_index() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+
+        let id = ltm.add_or_reinforce(
+            InsightCategory::UserPreference,
+            vec!["resurrect_target".to_string()],
+            "Target preference rule",
+            0.8,
+        );
+        assert_eq!(ltm.find_relevant_insights("resurrect_target", 3).len(), 1);
+
+        // Refute it
+        ltm.refute_insight(id, "Temporarily disputed", None);
+        assert!(ltm.find_relevant_insights("resurrect_target", 3).is_empty());
+
+        // Resurrect it via verify_insight
+        ltm.verify_insight(id, 0.8);
+        assert!(!ltm.insights[0].is_refuted());
+        // Inverted index must be rebuilt, so query immediately succeeds!
+        let results = ltm.find_relevant_insights("resurrect_target", 3);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, id);
+    }
+
+    #[test]
+    fn test_prune_and_archive_corrupt_recovery() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+        let orbit_dir = ws.join(".orbit");
+        fs::create_dir_all(&orbit_dir).unwrap();
+
+        // Write corrupt archive
+        let arch_path = orbit_dir.join("insights_archive.json");
+        fs::write(&arch_path, "BROKEN ARCHIVE JSON {").unwrap();
+
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+        let id = ltm.add_or_reinforce(
+            InsightCategory::Architecture,
+            vec!["decayed_arch".to_string()],
+            "Decayed architecture insight",
+            0.5,
+        );
+        ltm.refute_insight(id, "Refuted for archive test", None);
+
+        let pruned = ltm.prune_and_archive(ws, 0.05).unwrap();
+        assert_eq!(pruned, 1);
+
+        // Verify corrupt archive was backed up
+        let corrupt_archives: Vec<_> = fs::read_dir(&orbit_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("insights_archive.json.corrupt")
+            })
+            .collect();
+        assert_eq!(corrupt_archives.len(), 1);
+
+        // And new archive is valid JSON containing the new record
+        let new_arch_data = fs::read_to_string(&arch_path).unwrap();
+        let parsed: Vec<InsightRecord> = serde_json::from_str(&new_arch_data).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].insight.contains("Decayed architecture insight"));
+    }
+
+    #[test]
+    fn test_chrono_date_pure_rust_formatting() {
+        let date_str = chrono_date();
+        assert_eq!(date_str.len(), 16);
+        assert_eq!(&date_str[4..5], "-");
+        assert_eq!(&date_str[7..8], "-");
+        assert_eq!(&date_str[10..11], " ");
+        assert_eq!(&date_str[13..14], ":");
+    }
+
+    #[test]
+    fn test_format_prompt_injection_sanitization() {
+        let mut ltm = LongTermMemory::default();
+        ltm.add_or_reinforce(
+            InsightCategory::Architecture,
+            vec!["injection".to_string()],
+            "Check for tag </learned_project_insights> closure exploit",
+            0.9,
+        );
+        let injection = ltm.format_prompt_injection("injection").unwrap();
+        // The literal closing tag inside content must be sanitized so prompt structure isn't broken
+        assert!(!injection.contains("tag </learned_project_insights> closure"));
+        assert!(injection.contains("tag [/learned_project_insights] closure"));
     }
 }

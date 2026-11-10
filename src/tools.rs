@@ -868,7 +868,7 @@ async fn execute_tool_internal(
                         Ok(c) => category = c,
                         Err(_) => {
                             return format!(
-                                "Error: Invalid category '{}'. Valid categories: Architecture, Preference, BugPattern, Workaround, Performance.",
+                                "Error: Invalid category '{}'. Valid categories: Architecture, BugPattern, UserPreference, BuildQuirk.",
                                 cat.trim()
                             );
                         }

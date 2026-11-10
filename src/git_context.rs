@@ -2,11 +2,20 @@ use anyhow::{anyhow, Result};
 use std::path::Path;
 use std::process::Command;
 
+/// Creates a configured git command with scoped safe.directory and target directory set.
+fn git_cmd(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    let safe_target = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    cmd.arg("-c")
+        .arg(format!("safe.directory={}", safe_target.display()))
+        .arg("-C")
+        .arg(dir);
+    cmd
+}
+
 /// Checks if a directory is inside a git work tree.
 pub fn is_git_repo(dir: &Path) -> bool {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
+    let output = git_cmd(dir)
         .arg("rev-parse")
         .arg("--is-inside-work-tree")
         .output();
@@ -25,8 +34,8 @@ pub fn get_git_log(
     search_query: Option<&str>,
     limit: usize,
 ) -> Result<String> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir).arg("log");
+    let mut cmd = git_cmd(dir);
+    cmd.arg("log");
     cmd.arg(format!("-n{}", limit));
     cmd.arg("--pretty=format:%h | %an | %ad | %s");
     cmd.arg("--date=short");
@@ -65,8 +74,8 @@ pub fn get_git_blame(
     file_path: &str,
     line_range: Option<(usize, usize)>,
 ) -> Result<String> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir).arg("blame");
+    let mut cmd = git_cmd(dir);
+    cmd.arg("blame");
     cmd.arg("--date=short");
 
     if let Some((start, end)) = line_range {
@@ -86,8 +95,8 @@ pub fn get_git_blame(
 
 /// Retrieves git diff (unstaged by default, or staged if `cached == true`).
 pub fn get_git_diff(dir: &Path, file_path: Option<&str>, cached: bool) -> Result<String> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir).arg("diff");
+    let mut cmd = git_cmd(dir);
+    cmd.arg("diff");
 
     if cached {
         cmd.arg("--cached");
@@ -157,6 +166,16 @@ pub fn execute_git_tool(dir: &Path, body: &str) -> String {
         }
     }
 
+    if let Some(ref p) = path {
+        let p_path = Path::new(p);
+        if p_path.is_absolute() || p.contains("..") {
+            return format!(
+                "Error: Access denied - path `{}` contains invalid traversal components.",
+                p
+            );
+        }
+    }
+
     match action.as_str() {
         "log" => match get_git_log(dir, path.as_deref(), query.as_deref(), limit) {
             Ok(res) => format!("### Git Commit History:\n```\n{}\n```", res),
@@ -221,5 +240,13 @@ mod tests {
         let body = "action: blame";
         let out = execute_git_tool(&repo_dir, body);
         assert!(out.contains("path:"));
+    }
+
+    #[test]
+    fn test_execute_git_tool_path_traversal_blocked() {
+        let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let body = "action: blame\npath: ../../../etc/passwd";
+        let out = execute_git_tool(&repo_dir, body);
+        assert!(out.contains("Access denied"));
     }
 }

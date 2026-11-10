@@ -17,6 +17,7 @@ use std::path::Path;
 
 use crate::modal_prompt::{is_line_continuation, strip_line_continuation};
 use crate::outline::{is_home_or_root, is_ignored_path};
+use crate::security::SafeLock;
 use crate::subagent::SubagentStatus;
 use crate::AgentState;
 
@@ -412,8 +413,8 @@ async fn submit_input(
     } else if input == "/memory" || input.starts_with("/memory ") {
         let entry = input.strip_prefix("/memory").unwrap_or("").trim();
         if entry == "eval" || entry == "benchmark" || entry == "test" {
-            let ltm_guard = state.long_term_memory.lock().ok();
-            let report = crate::memory::MemoryBenchmarkRunner::run_benchmark(ltm_guard.as_deref());
+            let ltm_guard = state.long_term_memory.lock_safe();
+            let report = crate::memory::MemoryBenchmarkRunner::run_benchmark(Some(&ltm_guard));
             state.history.push(crate::Message {
                 role: "system".to_string(),
                 content: report.format_banner(),
@@ -422,9 +423,30 @@ async fn submit_input(
                 "Memory Quality Score: {}/100 -> {}",
                 report.quality_score, report.verdict
             );
+        } else if entry == "prune" {
+            let mut ltm = state.long_term_memory.lock_safe();
+            match ltm.prune_and_archive(&state.workspace_dir, 0.05) {
+                Ok(count) => {
+                    let _ = ltm.save(&state.workspace_dir);
+                    state.history.push(crate::Message {
+                        role: "system".to_string(),
+                        content: format!(
+                            "🧹 Pruned {} decayed/refuted insights to .orbit/insights_archive.json.",
+                            count
+                        ),
+                    });
+                }
+                Err(e) => {
+                    state.history.push(crate::Message {
+                        role: "system".to_string(),
+                        content: format!("Error during memory pruning: {}", e),
+                    });
+                }
+            }
         } else if entry.is_empty() {
             let mut report = String::from("=== 🧠 ORBIT MEMORY ARCHITECTURE ===\n");
-            if let Ok(stm) = state.working_memory.lock() {
+            {
+                let stm = state.working_memory.lock_safe();
                 report.push_str("\n--- [SHORT-TERM WORKING MEMORY] ---\n");
                 let scratch = stm.format_scratchpad();
                 if scratch.trim().is_empty() {
@@ -433,7 +455,8 @@ async fn submit_input(
                     report.push_str(&scratch);
                 }
             }
-            if let Ok(ltm) = state.long_term_memory.lock() {
+            {
+                let ltm = state.long_term_memory.lock_safe();
                 report.push_str("\n--- [LONG-TERM MEMORY (INSIGHTS)] ---\n");
                 report.push_str(&format!("Stored Insights: {}\n", ltm.insights.len()));
                 for ins in ltm.insights.iter().take(10) {
@@ -488,7 +511,7 @@ async fn submit_input(
                 content: "Usage: /remember <rule, user preference or permanent lesson>".to_string(),
             });
         } else {
-            let mut ltm = state.long_term_memory.lock().unwrap();
+            let mut ltm = state.long_term_memory.lock_safe();
             let keywords = vec!["user_preference".to_string(), "manual".to_string()];
             let id = ltm.add_or_reinforce(
                 crate::memory::InsightCategory::UserPreference,
@@ -519,7 +542,7 @@ async fn submit_input(
         return Ok(());
     } else if input == "/insights" || input.starts_with("/insights ") {
         let subcmd = input.strip_prefix("/insights").unwrap_or("").trim();
-        let mut ltm = state.long_term_memory.lock().unwrap();
+        let mut ltm = state.long_term_memory.lock_safe();
         if subcmd == "clear" {
             ltm.insights.clear();
             let _ = ltm.save(&state.workspace_dir);
@@ -527,22 +550,97 @@ async fn submit_input(
                 role: "system".to_string(),
                 content: "🗑️ Cleared all long-term insights.".to_string(),
             });
-        } else {
-            let mut report = String::from("=== 💡 LONG-TERM INSIGHTS (.orbit/insights.json) ===\n");
-            if ltm.insights.is_empty() {
-                report.push_str("No insights recorded yet. Store with `/remember <text>` or tool `store_insight`.\n");
+        } else if subcmd == "refuted" || subcmd == "archive" {
+            let mut report = String::from("=== 🗄️ REFUTED & SUPERSEDED INSIGHTS ===\n");
+            let refuted: Vec<&crate::memory::InsightRecord> =
+                ltm.insights.iter().filter(|i| i.is_refuted()).collect();
+            if refuted.is_empty() {
+                report.push_str("No refuted insights. All recorded insights remain active.\n");
             } else {
-                for ins in &ltm.insights {
+                for ins in refuted {
                     report.push_str(&format!(
-                        "• #{} [{}] (conf: {:.1}, used: {}x)\n  Insight: {}\n  Keywords: {}\n\n",
+                        "• #{} [{}] [{}] (used: {}x)\n  Insight: {}\n  Refutation Reason: {}\n\n",
                         ins.id,
                         ins.category.as_str(),
+                        ins.status_label(),
+                        ins.occurrence_count,
+                        ins.insight,
+                        ins.refutation_reason
+                            .as_deref()
+                            .unwrap_or("No reason specified")
+                    ));
+                }
+            }
+            state.history.push(crate::Message {
+                role: "system".to_string(),
+                content: report.trim_end().to_string(),
+            });
+        } else if let Some(rest) = subcmd.strip_prefix("refute ") {
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            if let Ok(id) = parts[0].parse::<usize>() {
+                let reason = if parts.len() > 1 {
+                    parts[1]
+                } else {
+                    "Manually refuted by user"
+                };
+                if ltm.refute_insight(id, reason, None) {
+                    let _ = ltm.save(&state.workspace_dir);
+                    state.history.push(crate::Message {
+                        role: "system".to_string(),
+                        content: format!(
+                            "🚫 Insight #{} marked REFUTED and deactivated from guidance.",
+                            id
+                        ),
+                    });
+                } else {
+                    state.history.push(crate::Message {
+                        role: "system".to_string(),
+                        content: format!("Insight #{} not found.", id),
+                    });
+                }
+            }
+        } else if let Some(rest) = subcmd.strip_prefix("verify ") {
+            if let Ok(id) = rest.trim().parse::<usize>() {
+                if ltm.verify_insight(id, 0.4) {
+                    let _ = ltm.save(&state.workspace_dir);
+                    state.history.push(crate::Message {
+                        role: "system".to_string(),
+                        content: format!("✅ Insight #{} verified and reinforced.", id),
+                    });
+                } else {
+                    state.history.push(crate::Message {
+                        role: "system".to_string(),
+                        content: format!("Insight #{} not found.", id),
+                    });
+                }
+            }
+        } else {
+            let mut report = String::from("=== 💡 LONG-TERM INSIGHTS (.orbit/insights.json) ===\n");
+            let active: Vec<&crate::memory::InsightRecord> =
+                ltm.insights.iter().filter(|i| !i.is_refuted()).collect();
+            let refuted_count = ltm.insights.iter().filter(|i| i.is_refuted()).count();
+
+            if active.is_empty() {
+                report.push_str("No active insights recorded yet. Store with `/remember <text>` or tool `store_insight`.\n");
+            } else {
+                for ins in active {
+                    report.push_str(&format!(
+                        "• #{} [{}] [{}] (conf: {:.1}, used: {}x)\n  Insight: {}\n  Keywords: {}\n\n",
+                        ins.id,
+                        ins.category.as_str(),
+                        ins.status_label(),
                         ins.confidence,
                         ins.occurrence_count,
                         ins.insight,
                         ins.trigger_keywords.join(", ")
                     ));
                 }
+            }
+            if refuted_count > 0 {
+                report.push_str(&format!(
+                    "ℹ️ {} refuted/superseded insights filtered out. Use `/insights refuted` to inspect.\n",
+                    refuted_count
+                ));
             }
             state.history.push(crate::Message {
                 role: "system".to_string(),
@@ -553,7 +651,7 @@ async fn submit_input(
         return Ok(());
     } else if input == "/stm" || input.starts_with("/stm ") {
         let subcmd = input.strip_prefix("/stm").unwrap_or("").trim();
-        let mut stm = state.working_memory.lock().unwrap();
+        let mut stm = state.working_memory.lock_safe();
         if subcmd.is_empty() {
             let scratch = stm.format_scratchpad();
             let content = if scratch.trim().is_empty() {
@@ -593,16 +691,19 @@ async fn submit_input(
         app.auto_scroll = true;
         return Ok(());
     } else if input == "/consolidate" {
-        let stm = state.working_memory.lock().unwrap().clone();
-        let mut ltm = state.long_term_memory.lock().unwrap();
+        let mut stm = state.working_memory.lock_safe();
+        let mut ltm = state.long_term_memory.lock_safe();
         let outcomes = crate::memory::MemoryConsolidator::consolidate(&stm, &mut ltm);
         if outcomes.is_empty() {
+            let _ = stm.drain_events();
             state.history.push(crate::Message {
                 role: "system".to_string(),
                 content: "No salient events in working memory required consolidation to long-term memory.".to_string(),
             });
         } else {
-            let _ = ltm.save(&state.workspace_dir);
+            if ltm.save(&state.workspace_dir).is_ok() {
+                let _ = stm.drain_events();
+            }
             let mut report = String::from("=== 🧠 CONSOLIDATION COMPLETED ===\n");
             for o in outcomes {
                 report.push_str(&format!(
@@ -649,12 +750,12 @@ async fn submit_input(
         || input_lower.starts_with("onthoud dat");
 
     if is_correction {
-        if let Ok(mut stm) = state.working_memory.lock() {
-            stm.record_event(crate::memory::StmEvent::UserCorrection {
-                instruction: input.trim().to_string(),
-            });
-        }
-    } else if let Ok(mut stm) = state.working_memory.lock() {
+        let mut stm = state.working_memory.lock_safe();
+        stm.record_event(crate::memory::StmEvent::UserCorrection {
+            instruction: input.trim().to_string(),
+        });
+    } else {
+        let mut stm = state.working_memory.lock_safe();
         if stm.current_goal.is_none() && input.trim().len() > 15 {
             stm.set_goal(input.trim());
         }
@@ -825,27 +926,30 @@ async fn submit_input(
                 );
 
                 // Autonomous consolidation hook in TUI mode
-                let stm_copy = state.working_memory.lock().map(|s| s.clone()).ok();
-                if let Some(stm) = stm_copy {
-                    if !stm.observed_events.is_empty() {
-                        if let Ok(mut ltm) = state.long_term_memory.lock() {
-                            let outcomes =
-                                crate::memory::MemoryConsolidator::consolidate(&stm, &mut ltm);
-                            if !outcomes.is_empty() {
-                                let _ = ltm.save(&state.workspace_dir);
-                                for o in outcomes {
-                                    state.history.push(crate::Message {
-                                        role: "system".to_string(),
-                                        content: format!(
-                                            "💡 [Auto-Consolidated LTM #{}] [{}]: {}",
-                                            o.insight_id,
-                                            o.category.as_str(),
-                                            o.insight_text
-                                        ),
-                                    });
-                                }
+                let consolidation_needed =
+                    !state.working_memory.lock_safe().observed_events.is_empty();
+
+                if consolidation_needed {
+                    let mut stm = state.working_memory.lock_safe();
+                    let mut ltm = state.long_term_memory.lock_safe();
+                    let outcomes = crate::memory::MemoryConsolidator::consolidate(&stm, &mut ltm);
+                    if !outcomes.is_empty() {
+                        if ltm.save(&state.workspace_dir).is_ok() {
+                            let _ = stm.drain_events();
+                            for o in outcomes {
+                                state.history.push(crate::Message {
+                                    role: "system".to_string(),
+                                    content: format!(
+                                        "💡 [Auto-Consolidated LTM #{}] [{}]: {}",
+                                        o.insight_id,
+                                        o.category.as_str(),
+                                        o.insight_text
+                                    ),
+                                });
                             }
                         }
+                    } else {
+                        let _ = stm.drain_events();
                     }
                 }
 
