@@ -9,7 +9,14 @@ pub struct ParsedTool {
 pub fn is_read_only(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "view_file" | "code_search" | "code_outline" | "code_map" | "git_context" | "code_grep"
+        "view_file"
+            | "code_search"
+            | "code_outline"
+            | "code_map"
+            | "git_context"
+            | "code_grep"
+            | "lsp_query"
+            | "adversarial_review"
     )
 }
 

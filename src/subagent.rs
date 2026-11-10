@@ -1,3 +1,4 @@
+use crate::security::SafeLock;
 use anyhow::Result;
 use colored::*;
 use serde::{Deserialize, Serialize};
@@ -55,7 +56,7 @@ impl SubagentManager {
         memory_context: Option<String>,
     ) -> usize {
         let id = {
-            let mut id_guard = self.next_id.lock().unwrap();
+            let mut id_guard = self.next_id.lock_safe();
             let id = *id_guard;
             *id_guard += 1;
             id
@@ -73,7 +74,7 @@ impl SubagentManager {
         };
 
         {
-            let mut tasks_guard = self.tasks.lock().unwrap();
+            let mut tasks_guard = self.tasks.lock_safe();
             tasks_guard.push(task);
         }
 
@@ -89,7 +90,7 @@ impl SubagentManager {
                 memory_context.as_deref(),
             )
             .await;
-            let mut tasks_guard = tasks_clone.lock().unwrap();
+            let mut tasks_guard = tasks_clone.lock_safe();
             if let Some(t) = tasks_guard.iter_mut().find(|t| t.id == id_copy) {
                 match res {
                     Ok(output) => {
@@ -108,7 +109,7 @@ impl SubagentManager {
     }
 
     pub fn list_subagents(&self) -> Vec<SubagentTask> {
-        let tasks_guard = self.tasks.lock().unwrap();
+        let tasks_guard = self.tasks.lock_safe();
         tasks_guard.clone()
     }
 
@@ -132,8 +133,8 @@ impl SubagentManager {
 
         // Dynamic cognitive memory priming across all nodes prior to execution
         if ltm.is_some() || stm.is_some() {
-            let ltm_guard = ltm.map(|m| m.lock().unwrap());
-            let stm_guard = stm.map(|m| m.lock().unwrap());
+            let ltm_guard = ltm.map(|m| m.lock_safe());
+            let stm_guard = stm.map(|m| m.lock_safe());
             dag.prime_nodes(ltm_guard.as_deref(), stm_guard.as_deref());
         }
 

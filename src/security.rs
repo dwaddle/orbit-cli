@@ -3,19 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxMode {
     Strict,
+    #[default]
     Workspace,
     User,
     Off,
-}
-
-impl Default for SandboxMode {
-    fn default() -> Self {
-        Self::Workspace
-    }
 }
 
 impl std::str::FromStr for SandboxMode {
@@ -297,6 +292,106 @@ impl WorkspaceSandbox {
                 boundary_root.display()
             ))
         }
+    }
+
+    /// Best-effort heuristic command safety linter for Strict sandbox mode.
+    ///
+    /// NOTE: This is an accidental mistake prevention heuristic / linter designed
+    /// to catch common escape sequences, credential targets, and directory traversal.
+    /// It is NOT a cryptographic, seccomp, or container-level security boundary against
+    /// adversarial code execution.
+    pub fn validate_command(cmd: &str, mode: SandboxMode) -> Result<(), String> {
+        if mode != SandboxMode::Strict {
+            return Ok(());
+        }
+        let lower = cmd.trim().to_lowercase();
+        // 1. Guard against any relative traversal sequence
+        if lower.contains("..") {
+            return Err(
+                "Strict sandbox prohibits relative directory traversal ('..').".to_string(),
+            );
+        }
+
+        let raw_tokens: Vec<&str> = lower.split_whitespace().collect();
+
+        // 2. Guard against cd/pushd navigation outside workspace (skipping flags like -P, -L, --)
+        for (i, raw_token) in raw_tokens.iter().enumerate() {
+            let unquoted_token = raw_token.trim_matches(|c| c == '\'' || c == '"');
+            if unquoted_token == "cd" || unquoted_token == "pushd" {
+                for arg_token in raw_tokens.iter().skip(i + 1) {
+                    let target = arg_token.trim_matches(|c| c == '\'' || c == '"');
+                    if target == "--" || target.starts_with('-') {
+                        continue;
+                    }
+                    if target.starts_with('/')
+                        || target.starts_with('~')
+                        || target.starts_with("$home")
+                        || target.starts_with("${home}")
+                        || target.starts_with("$pwd")
+                        || target.starts_with("${pwd}")
+                    {
+                        return Err(format!(
+                            "Strict sandbox prohibits directory navigation outside workspace via '{} {}'.",
+                            unquoted_token, target
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+
+        // 3. Guard against sensitive system paths and credential targets (dynamically expanded with user home)
+        let mut sensitive: Vec<String> = vec![
+            "/etc".to_string(),
+            "/var".to_string(),
+            "/root".to_string(),
+            "/proc".to_string(),
+            "/sys".to_string(),
+            "/dev".to_string(),
+            "~/.ssh".to_string(),
+            "~/.gnupg".to_string(),
+            "~/.aws".to_string(),
+            "$home/.ssh".to_string(),
+            "$home/.aws".to_string(),
+            "$home/.gnupg".to_string(),
+            "${home}/.ssh".to_string(),
+            "${home}/.aws".to_string(),
+            "${home}/.gnupg".to_string(),
+        ];
+        if let Some(home) = dirs::home_dir() {
+            let home_lower = home.to_string_lossy().to_lowercase();
+            sensitive.push(format!("{}/.ssh", home_lower));
+            sensitive.push(format!("{}/.aws", home_lower));
+            sensitive.push(format!("{}/.gnupg", home_lower));
+        }
+
+        for raw_token in &raw_tokens {
+            let token = raw_token.trim_matches(|c| c == '\'' || c == '"');
+            for target in &sensitive {
+                if token.starts_with(target)
+                    || token.contains(&format!("{}/", target))
+                    || token == target.as_str()
+                {
+                    return Err(format!(
+                        "Strict sandbox prohibits targeting sensitive location '{}'.",
+                        target
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Extension trait to eliminate mutex poisoning panics across all concurrent agent subsystems.
+pub trait SafeLock<T> {
+    fn lock_safe(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> SafeLock<T> for std::sync::Mutex<T> {
+    fn lock_safe(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
