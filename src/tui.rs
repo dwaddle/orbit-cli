@@ -705,6 +705,7 @@ async fn submit_input(
 
             let mut res: Option<Result<String>> = None;
             let mut last_spin = std::time::Instant::now();
+            let mut last_draw = std::time::Instant::now();
             while res.is_none() {
                 tokio::select! {
                     result = &mut stream_fut => {
@@ -720,7 +721,10 @@ async fn submit_input(
                         let s_char = spinner_frames[app.spinner_frame % spinner_frames.len()];
                         let elapsed = start_time.elapsed().as_secs_f32();
                         app.status_message = format!("{} Streaming from {} ({:.1}s)...", s_char, state.config.active_model, elapsed);
-                        terminal.draw(|frame| render_ui(frame, app, state))?;
+                        if now.duration_since(last_draw) >= std::time::Duration::from_millis(33) {
+                            last_draw = now;
+                            terminal.draw(|frame| render_ui(frame, app, state))?;
+                        }
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(30)) => {
                         let now = std::time::Instant::now();
@@ -734,7 +738,10 @@ async fn submit_input(
                             } else {
                                 app.status_message = format!("{} Streaming from {} ({:.1}s)...", s_char, state.config.active_model, elapsed);
                             }
-                            terminal.draw(|frame| render_ui(frame, app, state))?;
+                            if now.duration_since(last_draw) >= std::time::Duration::from_millis(33) {
+                                last_draw = now;
+                                terminal.draw(|frame| render_ui(frame, app, state))?;
+                            }
                         }
 
                         if event::poll(std::time::Duration::from_millis(0))? {
@@ -1485,9 +1492,7 @@ fn render_subagents(frame: &mut ratatui::Frame, area: Rect, app: &TuiApp, state:
         Color::Blue
     };
 
-    let tasks = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(state.subagent_mgr.list_subagents())
-    });
+    let tasks = state.subagent_mgr.list_subagents();
 
     let items: Vec<ListItem> = if tasks.is_empty() {
         vec![ListItem::new("No active subagent tasks.").style(Style::default().fg(Color::Cyan))]

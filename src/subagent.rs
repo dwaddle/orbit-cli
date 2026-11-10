@@ -2,7 +2,6 @@ use anyhow::Result;
 use colored::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum SubagentStatus {
@@ -19,19 +18,20 @@ pub struct SubagentTask {
     pub prompt: String,
     pub status: SubagentStatus,
     pub result: Option<String>,
+    pub memory_primed: bool,
 }
 
 #[derive(Clone, Default)]
 pub struct SubagentManager {
-    tasks: Arc<Mutex<Vec<SubagentTask>>>,
-    next_id: Arc<Mutex<usize>>,
+    tasks: Arc<std::sync::Mutex<Vec<SubagentTask>>>,
+    next_id: Arc<std::sync::Mutex<usize>>,
 }
 
 impl SubagentManager {
     pub fn new() -> Self {
         Self {
-            tasks: Arc::new(Mutex::new(Vec::new())),
-            next_id: Arc::new(Mutex::new(1)),
+            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            next_id: Arc::new(std::sync::Mutex::new(1)),
         }
     }
 
@@ -42,10 +42,26 @@ impl SubagentManager {
         prompt: String,
         api_key: String,
     ) -> usize {
-        let mut id_guard = self.next_id.lock().await;
-        let id = *id_guard;
-        *id_guard += 1;
+        self.spawn_subagent_with_memory(role, model, prompt, api_key, None)
+            .await
+    }
 
+    pub async fn spawn_subagent_with_memory(
+        &self,
+        role: String,
+        model: String,
+        prompt: String,
+        api_key: String,
+        memory_context: Option<String>,
+    ) -> usize {
+        let id = {
+            let mut id_guard = self.next_id.lock().unwrap();
+            let id = *id_guard;
+            *id_guard += 1;
+            id
+        };
+
+        let is_primed = memory_context.is_some();
         let task = SubagentTask {
             id,
             role: role.clone(),
@@ -53,10 +69,11 @@ impl SubagentManager {
             prompt: prompt.clone(),
             status: SubagentStatus::Running,
             result: None,
+            memory_primed: is_primed,
         };
 
         {
-            let mut tasks_guard = self.tasks.lock().await;
+            let mut tasks_guard = self.tasks.lock().unwrap();
             tasks_guard.push(task);
         }
 
@@ -64,8 +81,15 @@ impl SubagentManager {
         let id_copy = id;
 
         tokio::spawn(async move {
-            let res = run_subagent_task(&model, &role, &prompt, &api_key).await;
-            let mut tasks_guard = tasks_clone.lock().await;
+            let res = run_subagent_task_with_memory(
+                &model,
+                &role,
+                &prompt,
+                &api_key,
+                memory_context.as_deref(),
+            )
+            .await;
+            let mut tasks_guard = tasks_clone.lock().unwrap();
             if let Some(t) = tasks_guard.iter_mut().find(|t| t.id == id_copy) {
                 match res {
                     Ok(output) => {
@@ -83,14 +107,36 @@ impl SubagentManager {
         id
     }
 
-    pub async fn list_subagents(&self) -> Vec<SubagentTask> {
-        let tasks_guard = self.tasks.lock().await;
+    pub fn list_subagents(&self) -> Vec<SubagentTask> {
+        let tasks_guard = self.tasks.lock().unwrap();
         tasks_guard.clone()
     }
 
     /// Executes a directed acyclic graph (DAG) of subagent tasks concurrently with channel messaging.
-    pub async fn run_dag(&self, mut dag: SubagentDag, api_key: &str) -> Result<String> {
+    pub async fn run_dag(&self, dag: SubagentDag, api_key: &str) -> Result<String> {
+        self.run_dag_with_memory(dag, api_key, None, None).await
+    }
+
+    /// Executes a DAG with full neurocognitive memory integration:
+    /// - Dynamic prompt priming from Long-Term Memory (LTM) and Working Memory (STM).
+    /// - Working memory episodic event recording and failure tracking.
+    /// - Autonomous post-DAG knowledge consolidation.
+    pub async fn run_dag_with_memory(
+        &self,
+        mut dag: SubagentDag,
+        api_key: &str,
+        ltm: Option<&std::sync::Mutex<crate::memory::LongTermMemory>>,
+        stm: Option<&std::sync::Mutex<crate::memory::WorkingMemory>>,
+    ) -> Result<String> {
         dag.validate()?;
+
+        // Dynamic cognitive memory priming across all nodes prior to execution
+        if ltm.is_some() || stm.is_some() {
+            let ltm_guard = ltm.map(|m| m.lock().unwrap());
+            let stm_guard = stm.map(|m| m.lock().unwrap());
+            dag.prime_nodes(ltm_guard.as_deref(), stm_guard.as_deref());
+        }
+
         println!(
             "\n{}",
             format!(
@@ -157,35 +203,66 @@ impl SubagentManager {
                 }
                 full_prompt.push_str(&node.prompt);
 
+                let memory_context = node.memory_injected.clone();
                 let key = api_key.to_string();
+                let primed_badge = if memory_context.is_some() {
+                    " [Cognitive Priming Active]".magenta()
+                } else {
+                    "".normal()
+                };
                 println!(
-                    "  🚀 Starting DAG Node #{} [{}] ({})",
+                    "  🚀 Starting DAG Node #{} [{}] ({}){}",
                     node_id,
                     name.bold(),
-                    role.cyan()
+                    role.cyan(),
+                    primed_badge
                 );
 
                 join_handles.push(tokio::spawn(async move {
-                    let res = run_subagent_task(&model, &role, &full_prompt, &key).await;
+                    let res = run_subagent_task_with_memory(
+                        &model,
+                        &role,
+                        &full_prompt,
+                        &key,
+                        memory_context.as_deref(),
+                    )
+                    .await;
                     (node_id, res)
                 }));
             }
 
-            for handle in join_handles {
-                let (node_id, res) = handle.await?;
-                if let Some(node) = dag.nodes.iter_mut().find(|n| n.id == node_id) {
-                    match res {
-                        Ok(out) => {
+            let mut failed_err = None;
+
+            for i in 0..join_handles.len() {
+                let await_res = (&mut join_handles[i]).await;
+                match await_res {
+                    Ok((node_id, Ok(out))) => {
+                        if let Some(node) = dag.nodes.iter_mut().find(|n| n.id == node_id) {
                             println!(
                                 "  ✅ Completed DAG Node #{} [{}]",
                                 node.id,
                                 node.name.green()
                             );
                             node.status = SubagentStatus::Completed;
-                            node.output = Some(out);
+                            node.output = Some(out.clone());
                             completed_count += 1;
+
+                            if let Some(stm_mutex) = stm {
+                                if let Ok(mut stm_guard) = stm_mutex.lock() {
+                                    let summary = out
+                                        .lines()
+                                        .find(|l| !l.trim().is_empty())
+                                        .unwrap_or(&out)
+                                        .trim();
+                                    stm_guard.record_subagent(
+                                        &dag.name, &node.name, &node.role, true, summary,
+                                    );
+                                }
+                            }
                         }
-                        Err(e) => {
+                    }
+                    Ok((node_id, Err(e))) => {
+                        if let Some(node) = dag.nodes.iter_mut().find(|n| n.id == node_id) {
                             println!(
                                 "  ❌ Failed DAG Node #{} [{}]: {}",
                                 node.id,
@@ -194,13 +271,64 @@ impl SubagentManager {
                             );
                             node.status = SubagentStatus::Failed(e.to_string());
                             node.output = Some(format!("Error: {}", e));
-                            return Err(anyhow::anyhow!(
+
+                            if let Some(stm_mutex) = stm {
+                                if let Ok(mut stm_guard) = stm_mutex.lock() {
+                                    stm_guard.record_subagent(
+                                        &dag.name,
+                                        &node.name,
+                                        &node.role,
+                                        false,
+                                        &e.to_string(),
+                                    );
+                                }
+                            }
+                            failed_err = Some(anyhow::anyhow!(
                                 "DAG task #{} '{}' failed: {}",
                                 node.id,
                                 node.name,
                                 e
                             ));
+                        } else {
+                            failed_err =
+                                Some(anyhow::anyhow!("DAG task #{} failed: {}", node_id, e));
                         }
+
+                        // Abort all remaining handles to prevent zombie leaks
+                        for h in join_handles.iter().skip(i + 1) {
+                            h.abort();
+                        }
+                        break;
+                    }
+                    Err(join_err) => {
+                        failed_err = Some(anyhow::anyhow!("DAG task join error: {}", join_err));
+                        for h in join_handles.iter().skip(i + 1) {
+                            h.abort();
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if let Some(err) = failed_err {
+                return Err(err);
+            }
+        }
+
+        // Autonomous post-DAG memory consolidation
+        let mut consolidations = Vec::new();
+        if let Some(ltm_mutex) = ltm {
+            if let Ok(mut ltm_guard) = ltm_mutex.lock() {
+                let direct_outcomes = consolidate_dag_nodes(&dag, &mut ltm_guard);
+                consolidations.extend(direct_outcomes);
+
+                if let Some(stm_mutex) = stm {
+                    if let Ok(stm_guard) = stm_mutex.lock() {
+                        let stm_outcomes = crate::memory::MemoryConsolidator::consolidate(
+                            &stm_guard,
+                            &mut ltm_guard,
+                        );
+                        consolidations.extend(stm_outcomes);
                     }
                 }
             }
@@ -213,8 +341,26 @@ impl SubagentManager {
                 node.id, node.name, node.role
             ));
             report.push_str(&format!("**Dependencies**: {:?}\n\n", node.depends_on));
+            if let Some(ref mem) = node.memory_injected {
+                report.push_str(&format!(
+                    "*Cognitive Memory Priming Active ({} bytes)*\n\n",
+                    mem.len()
+                ));
+            }
             if let Some(ref out) = node.output {
                 report.push_str(&format!("{}\n\n---\n\n", out.trim()));
+            }
+        }
+
+        if !consolidations.is_empty() {
+            report.push_str("### 🧠 Neurocognitive Long-Term Memory Consolidations\n\n");
+            for outcome in &consolidations {
+                report.push_str(&format!(
+                    "- **[{}]** {} *(Reason: {})*\n",
+                    outcome.category.as_str(),
+                    outcome.insight_text,
+                    outcome.reason
+                ));
             }
         }
 
@@ -232,6 +378,8 @@ pub struct DagNode {
     pub depends_on: Vec<usize>,
     pub status: SubagentStatus,
     pub output: Option<String>,
+    #[serde(default)]
+    pub memory_injected: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,8 +414,37 @@ impl SubagentDag {
             depends_on,
             status: SubagentStatus::Running,
             output: None,
+            memory_injected: None,
         });
         id
+    }
+
+    /// Primes all DAG nodes with Long-Term Memory (LTM) insights and Short-Term Working Memory (STM) context.
+    pub fn prime_nodes(
+        &mut self,
+        ltm: Option<&crate::memory::LongTermMemory>,
+        stm: Option<&crate::memory::WorkingMemory>,
+    ) {
+        for node in &mut self.nodes {
+            let mut parts = Vec::new();
+            if let Some(ltm_ref) = ltm {
+                if let Some(injected) = ltm_ref.format_prompt_injection(&node.prompt) {
+                    parts.push(injected);
+                }
+            }
+            if let Some(stm_ref) = stm {
+                let scratchpad = stm_ref.format_scratchpad();
+                if !scratchpad.trim().is_empty() {
+                    parts.push(format!(
+                        "<working_memory_scratchpad>\n{}\n</working_memory_scratchpad>",
+                        scratchpad.trim()
+                    ));
+                }
+            }
+            if !parts.is_empty() {
+                node.memory_injected = Some(parts.join("\n\n"));
+            }
+        }
     }
 
     /// Validates DAG for acyclicity and valid dependency IDs.
@@ -293,6 +470,84 @@ impl SubagentDag {
         }
         Ok(())
     }
+}
+
+/// Autonomous consolidation of findings from completed DAG nodes directly into LongTermMemory.
+pub fn consolidate_dag_nodes(
+    dag: &SubagentDag,
+    ltm: &mut crate::memory::LongTermMemory,
+) -> Vec<crate::memory::ConsolidationOutcome> {
+    let mut outcomes = Vec::new();
+    for node in &dag.nodes {
+        if let Some(ref output) = node.output {
+            for line in output.lines() {
+                let trimmed = line.trim();
+                let is_vuln = trimmed.starts_with("- [CRITICAL]")
+                    || trimmed.starts_with("- [VULNERABILITY]")
+                    || trimmed.starts_with("- [SECURITY]")
+                    || trimmed.starts_with("CRITICAL:")
+                    || trimmed.starts_with("VULNERABILITY:")
+                    || (trimmed.starts_with("- ")
+                        && (trimmed.contains("vulnerability")
+                            || trimmed.contains("security risk")
+                            || trimmed.contains("SQL injection")));
+
+                let is_arch = trimmed.starts_with("- [ARCHITECTURE]")
+                    || trimmed.starts_with("- [INVARIANT]")
+                    || trimmed.starts_with("ARCHITECTURE:")
+                    || (trimmed.starts_with("- ")
+                        && (trimmed.contains("architectural invariant")
+                            || trimmed.contains("design requirement")));
+
+                if is_vuln {
+                    let clean = trimmed.trim_start_matches(['-', '*', ' ']).trim();
+                    let mut keywords =
+                        crate::memory::MemoryConsolidator::extract_salient_keywords(clean);
+                    keywords.push(node.role.to_lowercase());
+                    if !keywords.is_empty() {
+                        let id = ltm.add_or_reinforce(
+                            crate::memory::InsightCategory::BugPattern,
+                            keywords,
+                            clean,
+                            0.90,
+                        );
+                        outcomes.push(crate::memory::ConsolidationOutcome {
+                            insight_id: id,
+                            category: crate::memory::InsightCategory::BugPattern,
+                            insight_text: clean.to_string(),
+                            reason: format!(
+                                "Consolidated security finding from DAG '{}' ({})",
+                                dag.name, node.name
+                            ),
+                        });
+                    }
+                } else if is_arch {
+                    let clean = trimmed.trim_start_matches(['-', '*', ' ']).trim();
+                    let mut keywords =
+                        crate::memory::MemoryConsolidator::extract_salient_keywords(clean);
+                    keywords.push(node.role.to_lowercase());
+                    if !keywords.is_empty() {
+                        let id = ltm.add_or_reinforce(
+                            crate::memory::InsightCategory::Architecture,
+                            keywords,
+                            clean,
+                            0.85,
+                        );
+                        outcomes.push(crate::memory::ConsolidationOutcome {
+                            insight_id: id,
+                            category: crate::memory::InsightCategory::Architecture,
+                            insight_text: clean.to_string(),
+                            reason: format!(
+                                "Consolidated architectural invariant from DAG '{}' ({})",
+                                dag.name, node.name
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    outcomes
 }
 
 pub fn create_audit_dag(target: &str) -> SubagentDag {
@@ -369,6 +624,16 @@ pub async fn run_subagent_task(
     prompt: &str,
     api_key: &str,
 ) -> Result<String> {
+    run_subagent_task_with_memory(model, role, prompt, api_key, None).await
+}
+
+pub async fn run_subagent_task_with_memory(
+    model: &str,
+    role: &str,
+    prompt: &str,
+    api_key: &str,
+    memory_context: Option<&str>,
+) -> Result<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(45))
         .connect_timeout(std::time::Duration::from_secs(5))
@@ -387,10 +652,25 @@ pub async fn run_subagent_task(
     ];
     let candidates = crate::routing::get_failover_candidates(target_model, &default_fallbacks);
 
-    let sys_prompt = format!(
-        "You are a subagent with role '{}'. Execute the requested task thoroughly, direct, and concisely.",
-        role
-    );
+    let sys_prompt = if let Some(mem) = memory_context {
+        if !mem.trim().is_empty() {
+            format!(
+                "You are a subagent with role '{}'. Execute the requested task thoroughly, direct, and concisely.\n\n{}",
+                role,
+                mem.trim()
+            )
+        } else {
+            format!(
+                "You are a subagent with role '{}'. Execute the requested task thoroughly, direct, and concisely.",
+                role
+            )
+        }
+    } else {
+        format!(
+            "You are a subagent with role '{}'. Execute the requested task thoroughly, direct, and concisely.",
+            role
+        )
+    };
 
     for (idx, candidate) in candidates.iter().enumerate() {
         let payload = serde_json::json!({
@@ -506,5 +786,89 @@ mod tests {
         assert!(dag.validate().is_ok());
         // Integration Lead depends on test specifier and implementation coder
         assert_eq!(dag.nodes[3].depends_on, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_subagent_dag_node_memory_priming() {
+        use tempfile::tempdir;
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+
+        let mut ltm = crate::memory::LongTermMemory::load_or_init(ws).unwrap();
+        ltm.add_or_reinforce(
+            crate::memory::InsightCategory::BuildQuirk,
+            vec![
+                "async".to_string(),
+                "tokio".to_string(),
+                "cache".to_string(),
+            ],
+            "Always use tokio::sync::RwLock for async multi-reader cache",
+            0.9,
+        );
+
+        let mut stm = crate::memory::WorkingMemory::new();
+        stm.set_goal("Implement async cache");
+        stm.record_attempt(
+            "cargo test cache",
+            Some("error: deadlock detected in std::sync::RwLock"),
+            false,
+        );
+
+        let mut dag = create_feature_dag("async cache subsystem");
+        dag.prime_nodes(Some(&ltm), Some(&stm));
+
+        let first_node = &dag.nodes[0];
+        assert!(first_node.memory_injected.is_some());
+        let injection = first_node.memory_injected.as_ref().unwrap();
+        assert!(injection.contains("<learned_project_insights>"));
+        assert!(injection.contains("tokio::sync::RwLock"));
+        assert!(injection.contains("<working_memory_scratchpad>"));
+        assert!(injection.contains("Active Goal: Implement async cache"));
+        assert!(injection.contains("deadlock detected"));
+    }
+
+    #[test]
+    fn test_consolidate_dag_nodes_into_ltm() {
+        use tempfile::tempdir;
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+
+        let mut ltm = crate::memory::LongTermMemory::load_or_init(ws).unwrap();
+
+        let mut dag = SubagentDag::new("Security & Invariant Audit");
+        let t1 = dag.add_node("Auditor", "Security Engineer", "model-a", "prompt", vec![]);
+        let _t2 = dag.add_node(
+            "Architect",
+            "System Architect",
+            "model-b",
+            "prompt",
+            vec![t1],
+        );
+
+        dag.nodes[0].output = Some(
+            "Audit complete.\n- [CRITICAL] Hardcoded credentials in staging config bypass auth\n- Regular note"
+                .to_string(),
+        );
+        dag.nodes[1].output = Some(
+            "Review done.\n- [ARCHITECTURE] Maintain strict tenant isolation across all query boundaries\n- All good"
+                .to_string(),
+        );
+
+        let outcomes = consolidate_dag_nodes(&dag, &mut ltm);
+        assert_eq!(outcomes.len(), 2);
+
+        let vuln_insight = ltm
+            .insights
+            .iter()
+            .find(|i| i.category == crate::memory::InsightCategory::BugPattern)
+            .expect("Expected BugPattern insight from critical vulnerability");
+        assert!(vuln_insight.insight.contains("Hardcoded credentials"));
+
+        let arch_insight = ltm
+            .insights
+            .iter()
+            .find(|i| i.category == crate::memory::InsightCategory::Architecture)
+            .expect("Expected Architecture insight from invariant");
+        assert!(arch_insight.insight.contains("tenant isolation"));
     }
 }

@@ -1,4 +1,5 @@
 use colored::Colorize;
+use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,22 +67,67 @@ impl Language {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VerbosityLevel {
+    /// Suppresses streaming file contents and raw tool payloads; displays only concise status lines.
+    Quiet,
+    /// Balanced: suppresses full write_file/apply_patch code dumps, but shows standard summaries & diffs.
+    #[default]
+    Normal,
+    /// Verbose debug mode: streams full code bodies and complete tool outputs into the terminal.
+    Verbose,
+}
+
+impl VerbosityLevel {
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "quiet" | "q" | "silent" | "minimal" => Some(VerbosityLevel::Quiet),
+            "normal" | "n" | "default" => Some(VerbosityLevel::Normal),
+            "verbose" | "v" | "debug" | "all" => Some(VerbosityLevel::Verbose),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VerbosityLevel::Quiet => "quiet",
+            VerbosityLevel::Normal => "normal",
+            VerbosityLevel::Verbose => "verbose",
+        }
+    }
+}
+
 pub struct StreamingHighlighter {
     pub enabled: bool,
+    pub verbosity: VerbosityLevel,
     buffer: String,
-    in_code_block: bool,
-    current_lang: Language,
-    code_line_count: usize,
+    pub in_code_block: bool,
+    pub current_lang: Language,
+    pub code_line_count: usize,
+    pub is_tool_suppressed: bool,
+    pub suppressed_tool_name: Option<String>,
+    pub suppressed_path: Option<String>,
+    pub suppressed_line_count: usize,
 }
 
 impl StreamingHighlighter {
     pub fn new(enabled: bool) -> Self {
+        Self::with_verbosity(enabled, VerbosityLevel::Normal)
+    }
+
+    pub fn with_verbosity(enabled: bool, verbosity: VerbosityLevel) -> Self {
         Self {
             enabled,
+            verbosity,
             buffer: String::new(),
             in_code_block: false,
             current_lang: Language::Unknown,
             code_line_count: 0,
+            is_tool_suppressed: false,
+            suppressed_tool_name: None,
+            suppressed_path: None,
+            suppressed_line_count: 0,
         }
     }
 
@@ -109,9 +155,25 @@ impl StreamingHighlighter {
             if !self.in_code_block {
                 // Entering code block
                 let tag = trimmed_start.trim_start_matches('`').trim();
+                let should_suppress_tool = (self.verbosity == VerbosityLevel::Quiet
+                    || self.verbosity == VerbosityLevel::Normal)
+                    && (tag.starts_with("tool:write_file") || tag.starts_with("tool:apply_patch"));
+
+                if should_suppress_tool {
+                    self.in_code_block = true;
+                    self.is_tool_suppressed = true;
+                    self.suppressed_tool_name = Some(tag.to_string());
+                    self.suppressed_path = None;
+                    self.suppressed_line_count = 0;
+                    print!("  ⚡ [{}] Preparing changes...", tag.cyan().bold());
+                    let _ = io::stdout().flush();
+                    return;
+                }
+
                 self.current_lang = Language::from_tag(tag);
                 self.in_code_block = true;
                 self.code_line_count = 0;
+                self.is_tool_suppressed = false;
 
                 let lang_label = if tag.is_empty() {
                     "code"
@@ -123,6 +185,24 @@ impl StreamingHighlighter {
                 println!("{}", header.cyan().bold());
             } else {
                 // Exiting code block
+                if self.is_tool_suppressed {
+                    let tool_label = self.suppressed_tool_name.as_deref().unwrap_or("tool");
+                    let path_label = self.suppressed_path.as_deref().unwrap_or("file");
+                    println!(
+                        "\r\x1b[2K  ⚡ [{}] Captured {} lines for {}",
+                        tool_label.cyan().bold(),
+                        self.suppressed_line_count,
+                        path_label.bold()
+                    );
+                    self.is_tool_suppressed = false;
+                    self.in_code_block = false;
+                    self.suppressed_tool_name = None;
+                    self.suppressed_path = None;
+                    self.suppressed_line_count = 0;
+                    let _ = io::stdout().flush();
+                    return;
+                }
+
                 self.in_code_block = false;
                 self.current_lang = Language::Unknown;
                 self.code_line_count = 0;
@@ -135,6 +215,39 @@ impl StreamingHighlighter {
         }
 
         if self.in_code_block {
+            if self.is_tool_suppressed {
+                self.suppressed_line_count += 1;
+                if self.suppressed_path.is_none() {
+                    let tool_name = self.suppressed_tool_name.as_deref().unwrap_or("");
+                    if tool_name == "tool:write_file" {
+                        let path = line.trim();
+                        if !path.is_empty() {
+                            self.suppressed_path = Some(path.to_string());
+                            print!(
+                                "\r\x1b[2K  ⚡ [{}] Writing {}...",
+                                "write_file".cyan().bold(),
+                                path.bold()
+                            );
+                            let _ = io::stdout().flush();
+                        }
+                    } else if tool_name == "tool:apply_patch"
+                        && line.trim_start().starts_with("path:")
+                    {
+                        let path = line.trim_start().strip_prefix("path:").unwrap_or("").trim();
+                        if !path.is_empty() {
+                            self.suppressed_path = Some(path.to_string());
+                            print!(
+                                "\r\x1b[2K  ⚡ [{}] Patching {}...",
+                                "apply_patch".cyan().bold(),
+                                path.bold()
+                            );
+                            let _ = io::stdout().flush();
+                        }
+                    }
+                }
+                return;
+            }
+
             self.code_line_count += 1;
             let highlighted = highlight_code_line(line, self.current_lang);
             let border = "│ ".dimmed();
@@ -155,11 +268,11 @@ impl StreamingHighlighter {
 
         if !self.buffer.is_empty() {
             let remaining = std::mem::take(&mut self.buffer);
-            if self.in_code_block {
+            if self.in_code_block && !self.is_tool_suppressed {
                 let highlighted = highlight_code_line(&remaining, self.current_lang);
                 let border = "│ ".dimmed();
                 print!("{}{}", border, highlighted);
-            } else {
+            } else if !self.in_code_block {
                 let highlighted = highlight_markdown_line(&remaining);
                 print!("{}", highlighted);
             }
@@ -167,10 +280,22 @@ impl StreamingHighlighter {
         }
 
         if self.in_code_block {
-            // Unclosed code block guard
-            let footer = format!("╰{}", "─".repeat(60));
-            println!("{}", footer.cyan().bold());
-            self.in_code_block = false;
+            if self.is_tool_suppressed {
+                let tool_label = self.suppressed_tool_name.as_deref().unwrap_or("tool");
+                let path_label = self.suppressed_path.as_deref().unwrap_or("file");
+                println!(
+                    "\r\x1b[2K  ⚡ [{}] Captured {} lines for {}",
+                    tool_label.cyan().bold(),
+                    self.suppressed_line_count,
+                    path_label.bold()
+                );
+                self.is_tool_suppressed = false;
+                self.in_code_block = false;
+            } else {
+                let footer = format!("╰{}", "─".repeat(60));
+                println!("{}", footer.cyan().bold());
+                self.in_code_block = false;
+            }
             let _ = io::stdout().flush();
         }
     }
@@ -975,5 +1100,58 @@ mod tests {
         highlighter.flush();
         // Flush should close unclosed blocks cleanly
         assert!(!highlighter.in_code_block);
+    }
+
+    #[test]
+    fn test_verbosity_parsing() {
+        assert_eq!(
+            VerbosityLevel::from_str_loose("quiet"),
+            Some(VerbosityLevel::Quiet)
+        );
+        assert_eq!(
+            VerbosityLevel::from_str_loose("Q"),
+            Some(VerbosityLevel::Quiet)
+        );
+        assert_eq!(
+            VerbosityLevel::from_str_loose("minimal"),
+            Some(VerbosityLevel::Quiet)
+        );
+        assert_eq!(
+            VerbosityLevel::from_str_loose("normal"),
+            Some(VerbosityLevel::Normal)
+        );
+        assert_eq!(
+            VerbosityLevel::from_str_loose("default"),
+            Some(VerbosityLevel::Normal)
+        );
+        assert_eq!(
+            VerbosityLevel::from_str_loose("verbose"),
+            Some(VerbosityLevel::Verbose)
+        );
+        assert_eq!(
+            VerbosityLevel::from_str_loose("DEBUG"),
+            Some(VerbosityLevel::Verbose)
+        );
+        assert_eq!(VerbosityLevel::from_str_loose("invalid_val"), None);
+    }
+
+    #[test]
+    fn test_streaming_highlighter_suppresses_tool_write_file_in_quiet_mode() {
+        let mut highlighter = StreamingHighlighter::with_verbosity(true, VerbosityLevel::Quiet);
+        assert_eq!(highlighter.verbosity, VerbosityLevel::Quiet);
+
+        // Feed tool block
+        highlighter.feed("```tool:write_file\nsrc/lib.rs\npub fn hello() {}\n```\nDone!");
+        assert!(!highlighter.in_code_block);
+        assert!(!highlighter.is_tool_suppressed);
+    }
+
+    #[test]
+    fn test_streaming_highlighter_allows_tool_in_verbose_mode() {
+        let mut highlighter = StreamingHighlighter::with_verbosity(true, VerbosityLevel::Verbose);
+        highlighter.feed("```tool:write_file\nsrc/lib.rs\npub fn hello() {}\n");
+        assert!(highlighter.in_code_block);
+        assert!(!highlighter.is_tool_suppressed);
+        highlighter.flush();
     }
 }

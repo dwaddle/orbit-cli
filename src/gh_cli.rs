@@ -84,8 +84,12 @@ mod tests {
 
     #[test]
     fn test_gh_availability_check() {
-        // gh is installed on this Linux environment
+        let expected = std::process::Command::new("gh")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
         let avail = GhCli::is_available();
-        assert!(avail);
+        assert_eq!(avail, expected);
     }
 }

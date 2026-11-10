@@ -116,6 +116,8 @@ pub struct AppConfig {
     pub diff_approval_required: bool,
     #[serde(default = "default_true")]
     pub live_hud_enabled: bool,
+    #[serde(default)]
+    pub verbosity: highlight::VerbosityLevel,
 }
 
 impl Default for AppConfig {
@@ -136,6 +138,7 @@ impl Default for AppConfig {
             vim_mode: true,
             diff_approval_required: false,
             live_hud_enabled: true,
+            verbosity: highlight::VerbosityLevel::default(),
         }
     }
 }
@@ -559,7 +562,7 @@ impl AgentState {
         }
 
         prompt.push_str(
-            "Keep all responses direct, technical, direct, and concise in GitHub markdown.",
+            "Never duplicate or repeat the full source code of written or modified files in your conversational markdown prose. Explain your changes in 1-2 concise bullet points; let ```tool:write_file or ```tool:apply_patch perform the file modifications directly.\nKeep all responses direct, technical, direct, and concise in GitHub markdown.",
         );
         prompt
     }
@@ -661,7 +664,11 @@ pub async fn execute_tool_quiet(tool_name: &str, body: &str, state: &AgentState)
 }
 
 async fn execute_tool(tool_name: &str, body: &str, state: &AgentState) -> String {
-    execute_tool_internal(tool_name, body, state, false).await
+    let quiet = match state.config.verbosity {
+        highlight::VerbosityLevel::Quiet => true,
+        highlight::VerbosityLevel::Normal | highlight::VerbosityLevel::Verbose => false,
+    };
+    execute_tool_internal(tool_name, body, state, quiet).await
 }
 
 async fn execute_tool_internal(
@@ -692,6 +699,11 @@ async fn execute_tool_internal(
                     Ok(true) => {}
                     _ => return format!("Tool '{}' execution rejected by user.", tool_name),
                 }
+            } else {
+                return format!(
+                    "⛔ Security Policy: Execution of tool '{}' requires interactive confirmation (ToolPolicy::Ask). In non-interactive or quiet mode, this tool is blocked. To allow, configure tool policy to 'auto' via `/policy {} auto`.",
+                    tool_name, tool_name
+                );
             }
         }
         security::ToolPolicy::Auto => {}
@@ -1102,23 +1114,46 @@ async fn execute_tool_internal(
         }
         "run_dag" => {
             let trimmed = body.trim();
-            if trimmed.starts_with("audit") {
+            let maybe_dag = if trimmed.starts_with("audit") {
                 let target = trimmed.strip_prefix("audit").unwrap_or("").trim();
                 let target = if target.is_empty() { "." } else { target };
-                let dag = subagent::create_audit_dag(target);
-                match state.subagent_mgr.run_dag(dag, &state.config.api_key).await {
-                    Ok(rep) => rep,
-                    Err(e) => format!("DAG execution error: {}", e),
-                }
+                Some(subagent::create_audit_dag(target))
             } else if trimmed.starts_with("feature") {
                 let spec = trimmed.strip_prefix("feature").unwrap_or("").trim();
-                let dag = subagent::create_feature_dag(spec);
-                match state.subagent_mgr.run_dag(dag, &state.config.api_key).await {
-                    Ok(rep) => rep,
-                    Err(e) => format!("DAG execution error: {}", e),
-                }
+                Some(subagent::create_feature_dag(spec))
             } else {
-                "Usage: run_dag audit <target> OR run_dag feature <spec>".to_string()
+                None
+            };
+
+            match maybe_dag {
+                Some(dag) => {
+                    let initial_insight_count =
+                        { state.long_term_memory.lock().unwrap().insights.len() };
+                    let rep_res = state
+                        .subagent_mgr
+                        .run_dag_with_memory(
+                            dag,
+                            &state.config.api_key,
+                            Some(&state.long_term_memory),
+                            Some(&state.working_memory),
+                        )
+                        .await;
+
+                    let should_save = {
+                        state.long_term_memory.lock().unwrap().insights.len()
+                            > initial_insight_count
+                    };
+                    if should_save {
+                        let ltm_guard = state.long_term_memory.lock().unwrap();
+                        let _ = ltm_guard.save(&state.workspace_dir);
+                    }
+
+                    match rep_res {
+                        Ok(rep) => rep,
+                        Err(e) => format!("DAG execution error: {}", e),
+                    }
+                }
+                None => "Usage: run_dag audit <target> OR run_dag feature <spec>".to_string(),
             }
         }
         "code_search" => search_index::execute_code_search_tool(&state.get_code_index(), body),
@@ -1160,17 +1195,45 @@ async fn execute_tool_internal(
                 return "Error: Missing prompt for subagent".to_string();
             }
 
+            let mem_injection = {
+                let ltm_guard = state.long_term_memory.lock().unwrap();
+                let stm_guard = state.working_memory.lock().unwrap();
+                let mut parts = Vec::new();
+                if let Some(ltm_text) = ltm_guard.format_prompt_injection(&prompt) {
+                    parts.push(ltm_text);
+                }
+                let scratchpad = stm_guard.format_scratchpad();
+                if !scratchpad.trim().is_empty() {
+                    parts.push(format!(
+                        "<working_memory_scratchpad>\n{}\n</working_memory_scratchpad>",
+                        scratchpad.trim()
+                    ));
+                }
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join("\n\n"))
+                }
+            };
+
+            let is_primed = mem_injection.is_some();
             let task_id = state
                 .subagent_mgr
-                .spawn_subagent(
+                .spawn_subagent_with_memory(
                     role.clone(),
                     model.clone(),
                     prompt.clone(),
                     state.config.api_key.clone(),
+                    mem_injection,
                 )
                 .await;
 
-            format!("Subagent Task #{} spawned in background (Role: {}, Model: {}). Use /subagents to check progress.", task_id, role, model)
+            let prime_badge = if is_primed {
+                " (Cognitive Memory Primed)"
+            } else {
+                ""
+            };
+            format!("Subagent Task #{} spawned in background (Role: {}, Model: {}){}. Use /subagents to check progress.", task_id, role, model, prime_badge)
         }
         "mcp" => {
             let mut server = "".to_string();
@@ -1562,7 +1625,10 @@ pub async fn stream_completion_internal(
         let mut highlighter = match &mode {
             StreamOutputMode::TerminalRepl {
                 syntax_highlighting,
-            } => Some(highlight::StreamingHighlighter::new(*syntax_highlighting)),
+            } => Some(highlight::StreamingHighlighter::with_verbosity(
+                *syntax_highlighting,
+                state.config.verbosity,
+            )),
             _ => None,
         };
 
@@ -1702,6 +1768,7 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     let mut target_dir: Option<PathBuf> = None;
+    let mut cli_verbosity: Option<highlight::VerbosityLevel> = None;
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
@@ -1716,6 +1783,19 @@ async fn main() -> Result<()> {
             target_dir = Some(PathBuf::from(val));
         } else if let Some(val) = arg.strip_prefix("--workspace=") {
             target_dir = Some(PathBuf::from(val));
+        } else if arg == "-q" || arg == "--quiet" {
+            cli_verbosity = Some(highlight::VerbosityLevel::Quiet);
+        } else if arg == "-v" || arg == "--verbose" {
+            cli_verbosity = Some(highlight::VerbosityLevel::Verbose);
+        } else if let Some(val) = arg.strip_prefix("--verbosity=") {
+            if let Some(level) = highlight::VerbosityLevel::from_str_loose(val) {
+                cli_verbosity = Some(level);
+            }
+        } else if arg == "--verbosity" && i + 1 < args.len() {
+            if let Some(level) = highlight::VerbosityLevel::from_str_loose(&args[i + 1]) {
+                cli_verbosity = Some(level);
+                i += 1;
+            }
         } else if !arg.starts_with('-') && arg != "watch" {
             let p = PathBuf::from(arg);
             if p.is_dir() {
@@ -1726,6 +1806,9 @@ async fn main() -> Result<()> {
     }
 
     let mut state = AgentState::new(target_dir)?;
+    if let Some(v) = cli_verbosity {
+        state.config.verbosity = v;
+    }
 
     if args
         .iter()
@@ -1885,7 +1968,7 @@ async fn main() -> Result<()> {
         }
     );
     println!(
-        "Engine: Compile Guard: {} | Self-Healing: {} | Checkpoints: READY | Patching: SURGICAL (Aider-style)",
+        "Engine: Compile Guard: {} | Self-Healing: {} | Verbosity: {} | Patching: SURGICAL (Aider-style)",
         if state.config.compile_guard_enabled {
             "ENABLED".green()
         } else {
@@ -1895,7 +1978,8 @@ async fn main() -> Result<()> {
             "ENABLED".green()
         } else {
             "DISABLED".dimmed()
-        }
+        },
+        state.config.verbosity.as_str().to_uppercase().bold().cyan()
     );
     println!("Type `/help` for commands or `/model` to view/select models.\n");
 
@@ -2155,6 +2239,9 @@ async fn main() -> Result<()> {
                             println!("  /file <path>           - Attach file content into context");
                             println!(
                                 "  /cache                 - Toggle prompt caching headers ON/OFF"
+                            );
+                            println!(
+                                "  /verbosity [level]     - Set or view output verbosity (quiet, normal, verbose)"
                             );
                             println!(
                                 "  /cascade               - Toggle hybrid model cascading ON/OFF"
@@ -2632,8 +2719,36 @@ async fn main() -> Result<()> {
                             }
                             continue;
                         }
+                        "/verbosity" => {
+                            let arg_clean = arg.trim();
+                            if arg_clean.is_empty() {
+                                println!("{}", "=== 📢 ORBIT VERBOSITY SETTINGS ===".bold().cyan());
+                                println!(
+                                    "Current Level: {}",
+                                    state.config.verbosity.as_str().bold().green()
+                                );
+                                println!("\nAvailable levels:");
+                                println!("  quiet   - Suppress streaming file writes & tool dumps in chat; concise status only");
+                                println!("  normal  - Balanced: concise file write summaries, standard command results (default)");
+                                println!("  verbose - Stream all raw tool payloads and full execution outputs");
+                                println!("\nUsage: /verbosity <quiet|normal|verbose>");
+                            } else if let Some(level) =
+                                highlight::VerbosityLevel::from_str_loose(arg_clean)
+                            {
+                                state.config.verbosity = level;
+                                let _ = state.save_config();
+                                println!("✅ Verbosity set to: {}", level.as_str().bold().green());
+                            } else {
+                                println!(
+                                    "{}",
+                                    format!("❌ Unknown verbosity level '{}'. Use: quiet, normal, verbose", arg_clean)
+                                        .red()
+                                );
+                            }
+                            continue;
+                        }
                         "/subagents" => {
-                            let tasks = state.subagent_mgr.list_subagents().await;
+                            let tasks = state.subagent_mgr.list_subagents();
                             println!("{}", "=== 🤖 SUBAGENT TASKS ===".bold().cyan());
                             if tasks.is_empty() {
                                 println!("No subagents spawned yet.");
@@ -2647,10 +2762,15 @@ async fn main() -> Result<()> {
                                         }
                                     };
                                     println!(
-                                        "• Subagent #{} [{}] Status: {}",
+                                        "• Subagent #{} [{}] Status: {}{}",
                                         t.id,
                                         t.role.bold(),
-                                        status_str
+                                        status_str,
+                                        if t.memory_primed {
+                                            " 🧠 [Primed]".magenta()
+                                        } else {
+                                            "".normal()
+                                        }
                                     );
                                     println!("  Model: {} | Prompt: {}", t.model, t.prompt);
                                     if let Some(res) = &t.result {
@@ -2900,7 +3020,28 @@ async fn main() -> Result<()> {
                                 continue;
                             };
 
-                            match state.subagent_mgr.run_dag(dag, &state.config.api_key).await {
+                            let initial_count =
+                                { state.long_term_memory.lock().unwrap().insights.len() };
+                            let rep_res = state
+                                .subagent_mgr
+                                .run_dag_with_memory(
+                                    dag,
+                                    &state.config.api_key,
+                                    Some(&state.long_term_memory),
+                                    Some(&state.working_memory),
+                                )
+                                .await;
+
+                            let should_save = {
+                                state.long_term_memory.lock().unwrap().insights.len()
+                                    > initial_count
+                            };
+                            if should_save {
+                                let ltm_guard = state.long_term_memory.lock().unwrap();
+                                let _ = ltm_guard.save(&state.workspace_dir);
+                            }
+
+                            match rep_res {
                                 Ok(rep) => {
                                     println!("\n{}", rep);
                                     state.history.push(Message {
@@ -4196,7 +4337,49 @@ async fn main() -> Result<()> {
                                     for (tool_name, tool_result) in results {
                                         let redacted_result =
                                             state.secret_redactor.redact(&tool_result);
-                                        println!("{}\n{}", "Result:".dimmed(), redacted_result);
+                                        match state.config.verbosity {
+                                            highlight::VerbosityLevel::Quiet => {
+                                                let first_line = redacted_result
+                                                    .lines()
+                                                    .next()
+                                                    .unwrap_or("Done")
+                                                    .trim();
+                                                println!(
+                                                    "  {} {}",
+                                                    "✓".green().bold(),
+                                                    first_line.dimmed()
+                                                );
+                                            }
+                                            highlight::VerbosityLevel::Normal => {
+                                                if tool_name == "write_file"
+                                                    || tool_name == "apply_patch"
+                                                {
+                                                    let first_line = redacted_result
+                                                        .lines()
+                                                        .next()
+                                                        .unwrap_or("Done")
+                                                        .trim();
+                                                    println!(
+                                                        "  {} {}",
+                                                        "✓".green().bold(),
+                                                        first_line
+                                                    );
+                                                } else {
+                                                    println!(
+                                                        "{}\n{}",
+                                                        "Result:".dimmed(),
+                                                        redacted_result
+                                                    );
+                                                }
+                                            }
+                                            highlight::VerbosityLevel::Verbose => {
+                                                println!(
+                                                    "{}\n{}",
+                                                    "Result:".dimmed(),
+                                                    redacted_result
+                                                );
+                                            }
+                                        }
                                         state.history.push(Message {
                                             role: "user".to_string(),
                                             content: format!(
@@ -4306,7 +4489,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_command_execution() {
-        let state = AgentState::new(Some(std::env::temp_dir())).unwrap();
+        let mut state = AgentState::new(Some(std::env::temp_dir())).unwrap();
+        state
+            .tool_permissions
+            .set_policy("run_command", security::ToolPolicy::Auto);
         let res = execute_tool_quiet("run_command", "echo 'orbit_local_ok'", &state).await;
         assert!(
             res.contains("Exit Code: 0"),
@@ -4316,6 +4502,17 @@ mod tests {
         assert!(
             res.contains("orbit_local_ok"),
             "Expected stdout output: {}",
+            res
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_permission_gate_blocks_ask_in_quiet_mode() {
+        let state = AgentState::new(Some(std::env::temp_dir())).unwrap();
+        let res = execute_tool_quiet("run_command", "echo 'fail_closed'", &state).await;
+        assert!(
+            res.contains("requires interactive confirmation (ToolPolicy::Ask)"),
+            "Expected fail-closed block in quiet mode: {}",
             res
         );
     }
@@ -4374,7 +4571,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        let state = AgentState::new(Some(temp_dir.clone())).unwrap();
+        let mut state = AgentState::new(Some(temp_dir.clone())).unwrap();
+        state
+            .tool_permissions
+            .set_policy("write_file", security::ToolPolicy::Auto);
 
         // 1. view_file escaping boundary
         let view_res = execute_tool_quiet("view_file", "../../etc/passwd", &state).await;

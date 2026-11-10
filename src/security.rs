@@ -49,6 +49,16 @@ impl Default for ToolPermissions {
         policies.insert("write_file".to_string(), ToolPolicy::Ask);
         policies.insert("run_command".to_string(), ToolPolicy::Ask);
         policies.insert("invoke_subagent".to_string(), ToolPolicy::Auto);
+        policies.insert("code_outline".to_string(), ToolPolicy::Auto);
+        policies.insert("code_grep".to_string(), ToolPolicy::Auto);
+        policies.insert("code_map".to_string(), ToolPolicy::Auto);
+        policies.insert("lsp_query".to_string(), ToolPolicy::Auto);
+        policies.insert("store_insight".to_string(), ToolPolicy::Auto);
+        policies.insert("adversarial_review".to_string(), ToolPolicy::Auto);
+        policies.insert("tdd_cycle".to_string(), ToolPolicy::Auto);
+        policies.insert("apply_patch".to_string(), ToolPolicy::Ask);
+        policies.insert("worktree_sandbox".to_string(), ToolPolicy::Ask);
+        policies.insert("run_dag".to_string(), ToolPolicy::Ask);
         Self {
             policies,
             default_policy: ToolPolicy::Ask,

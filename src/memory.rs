@@ -361,6 +361,13 @@ pub enum StmEvent {
         initial_error: String,
         resolution_strategy: String,
     },
+    SubagentExecution {
+        dag_name: String,
+        node_name: String,
+        role: String,
+        succeeded: bool,
+        summary: String,
+    },
 }
 
 impl WorkingMemory {
@@ -415,6 +422,31 @@ impl WorkingMemory {
 
     pub fn record_event(&mut self, event: StmEvent) {
         self.observed_events.push(event);
+    }
+
+    pub fn record_subagent(
+        &mut self,
+        dag_name: &str,
+        node_name: &str,
+        role: &str,
+        succeeded: bool,
+        summary: &str,
+    ) {
+        self.observed_events.push(StmEvent::SubagentExecution {
+            dag_name: dag_name.to_string(),
+            node_name: node_name.to_string(),
+            role: role.to_string(),
+            succeeded,
+            summary: summary.to_string(),
+        });
+
+        if !succeeded {
+            self.record_attempt(
+                &format!("{}: {}", dag_name, node_name),
+                Some(summary),
+                false,
+            );
+        }
     }
 
     /// Drains all observed events that have been processed during consolidation,
@@ -569,13 +601,88 @@ impl MemoryConsolidator {
                         }
                     }
                 }
+                StmEvent::SubagentExecution {
+                    dag_name,
+                    node_name,
+                    role,
+                    succeeded,
+                    summary,
+                } => {
+                    if !succeeded {
+                        let clean_summary = Self::summarize_error(summary);
+                        let insight_text = format!(
+                            "Subagent '{}' [{}] failed during DAG '{}': {}",
+                            node_name, role, dag_name, clean_summary
+                        );
+                        let mut keywords = Self::extract_salient_keywords(summary);
+                        keywords.push(node_name.to_lowercase());
+                        keywords.push(role.to_lowercase());
+                        let id = ltm.add_or_reinforce(
+                            InsightCategory::BugPattern,
+                            keywords,
+                            &insight_text,
+                            0.85,
+                        );
+                        outcomes.push(ConsolidationOutcome {
+                            insight_id: id,
+                            category: InsightCategory::BugPattern,
+                            insight_text,
+                            reason: format!(
+                                "Consolidated subagent execution failure from DAG '{}'",
+                                dag_name
+                            ),
+                        });
+                    } else {
+                        let upper = summary.to_uppercase();
+                        if upper.contains("CRITICAL")
+                            || upper.contains("VULNERABILITY")
+                            || upper.contains("FINDING")
+                            || upper.contains("ARCHITECTURE")
+                            || upper.contains("SECURITY")
+                        {
+                            let first_line = summary
+                                .lines()
+                                .find(|l| !l.trim().is_empty())
+                                .unwrap_or(summary)
+                                .trim();
+                            let truncated = if first_line.len() > 140 {
+                                format!("{}...", &first_line[..140])
+                            } else {
+                                first_line.to_string()
+                            };
+                            let insight_text = format!(
+                                "In DAG '{}', {} [{}] identified: {}",
+                                dag_name, node_name, role, truncated
+                            );
+                            let mut keywords = Self::extract_salient_keywords(&truncated);
+                            keywords.push(role.to_lowercase());
+                            if !keywords.is_empty() {
+                                let id = ltm.add_or_reinforce(
+                                    InsightCategory::Architecture,
+                                    keywords,
+                                    &insight_text,
+                                    0.80,
+                                );
+                                outcomes.push(ConsolidationOutcome {
+                                    insight_id: id,
+                                    category: InsightCategory::Architecture,
+                                    insight_text,
+                                    reason: format!(
+                                        "Consolidated salient subagent finding from DAG '{}'",
+                                        dag_name
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
 
         outcomes
     }
 
-    fn extract_salient_keywords(text: &str) -> Vec<String> {
+    pub fn extract_salient_keywords(text: &str) -> Vec<String> {
         let stop_words: HashSet<&str> = [
             "the", "and", "or", "in", "on", "at", "to", "for", "with", "a", "an", "is", "was",
             "are", "were", "of", "by", "from", "van", "een", "het", "de", "en", "naar", "met",
@@ -643,7 +750,7 @@ impl MemoryConsolidator {
             || lower.contains("linker")
     }
 
-    fn summarize_error(err: &str) -> String {
+    pub fn summarize_error(err: &str) -> String {
         let first_line = err.lines().next().unwrap_or(err).trim();
         if first_line.len() > 80 {
             format!("{}...", &first_line[..80])
@@ -1146,6 +1253,70 @@ mod tests {
             .find(|i| i.category == InsightCategory::BugPattern)
             .unwrap();
         assert!(bug_pattern.insight.contains("unresolved import"));
+    }
+
+    #[test]
+    fn test_subagent_memory_recording_and_consolidation() {
+        let temp = tempdir().unwrap();
+        let ws = temp.path();
+
+        let mut ltm = LongTermMemory::load_or_init(ws).unwrap();
+        let mut stm = WorkingMemory::new();
+
+        // 1. Record successful subagent finding with salient security/architecture discovery
+        stm.record_subagent(
+            "Security Audit",
+            "Vulnerability Scanner",
+            "Security Researcher",
+            true,
+            "CRITICAL VULNERABILITY: Raw SQL query in auth endpoint allows SQL injection bypass",
+        );
+
+        // 2. Record failed subagent node execution
+        stm.record_subagent(
+            "Feature Pipeline",
+            "Code Compiler",
+            "Build Engineer",
+            false,
+            "error[E0308]: mismatched types: expected usize, found u64 in file parser",
+        );
+
+        // Verify STM state
+        assert_eq!(stm.observed_events.len(), 2);
+        assert_eq!(stm.failed_attempts.len(), 1);
+        assert!(stm.failed_attempts[0]
+            .action
+            .contains("Feature Pipeline: Code Compiler"));
+
+        // Verify scratchpad formatting includes the failure
+        let scratchpad = stm.format_scratchpad();
+        assert!(scratchpad.contains("Previous Failed Attempts"));
+        assert!(scratchpad.contains("mismatched types"));
+
+        // Run consolidation
+        let outcomes = MemoryConsolidator::consolidate(&stm, &mut ltm);
+        assert_eq!(outcomes.len(), 2);
+
+        // Verify LTM consolidation outcomes
+        let arch = ltm
+            .insights
+            .iter()
+            .find(|i| i.category == InsightCategory::Architecture)
+            .expect("Expected Architecture insight from critical finding");
+        assert!(arch.insight.contains("SQL injection"));
+
+        let bug = ltm
+            .insights
+            .iter()
+            .find(|i| i.category == InsightCategory::BugPattern)
+            .expect("Expected BugPattern insight from subagent failure");
+        assert!(bug.insight.contains("Code Compiler"));
+        assert!(bug.insight.contains("mismatched types"));
+
+        // Verify relevance retrieval primes queries mentioning sql or compiler
+        let relevant = ltm.find_relevant_insights("prevent sql injection in auth", 3);
+        assert!(!relevant.is_empty());
+        assert_eq!(relevant[0].category, InsightCategory::Architecture);
     }
 
     #[test]
